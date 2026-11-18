@@ -86,6 +86,25 @@ class CliTests(unittest.TestCase):
             self.assertIn("PROBLEM", bad.stdout)
 
 
+class FleetLaneLayoutTests(CliTests):
+    """Fleet lanes write to <state>/macos-fleet/<lane>/, beside <state>/macos."""
+
+    def test_refusal_in_a_fleet_lane_directory_is_a_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c.json")
+            with open(cache, "w") as f:
+                json.dump({"latest": "2.338.2", "fetched_at": 4e9}, f)
+            lane = os.path.join(d, "state", "macos-fleet", "pulp-gate")
+            os.makedirs(lane)
+            os.makedirs(os.path.join(d, "state", "macos"))
+            with open(os.path.join(lane, "vm-1.actions-runner.log"), "w") as f:
+                f.write(MSG)
+            bad = self.run_cli("check", "--pinned", "2.336.0", "--cache", cache,
+                               "--state-dir", os.path.join(d, "state", "macos"))
+            self.assertEqual(bad.returncode, 1, bad.stdout)
+            self.assertIn("PROBLEM", bad.stdout)
+
+
 class LaneWiringTests(unittest.TestCase):
     """The lane must name the event and back off, not loop on fresh VMs."""
 

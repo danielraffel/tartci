@@ -3541,11 +3541,13 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
   not install or update the runner.
 - **Where it shows.** `tartci doctor runner-age [--json]` (exit 1 on `fail`), a
   section in bare `tartci doctor`, and the tool-freshness refresh the launchd
-  watchdog runs. `warn` and `fail` join the tool-freshness problem, which
-  reaches `tartci doctor fleet` as `tool_freshness_stale` and the watchdog
-  WARN. `unknown` is shown by doctor and is never a problem, so a host with no
-  record or no route to GitHub does not alert. The problem text names only the
-  installed version, so neither the clock nor a new upstream release changes it.
+  watchdog runs.
+- **What alerts.** Only `fail`, a live refusal. It joins the tool-freshness
+  problem, which reaches `tartci doctor fleet` as `tool_freshness_stale` and the
+  watchdog WARN. `warn` and `unknown` are doctor output and never a problem: a
+  lag warning would fire on every host whenever upstream ships two releases,
+  its text would change with each release, and it depends on a release lookup
+  that can be stale. The problem text names only the refused version.
 - **Setting** in `~/.config/tartci/tool-freshness.toml`:
 
       [runner_age]

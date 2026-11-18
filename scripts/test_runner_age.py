@@ -6,6 +6,8 @@ from __future__ import annotations
 import testing_support  # noqa: E402,F401
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -61,13 +63,16 @@ class PolicyTests(unittest.TestCase):
     def test_unreadable_latest_is_unknown(self):
         self.assertEqual(ra.classify("2.336.0", None)["verdict"], "unknown")
 
-    def test_problem_text_survives_a_new_upstream_release(self):
-        # The text is an alert's identity: same host state, same text.
-        before = ra.problems([dict(ra.classify("2.336.0", "2.338.2"), golden="g")])
-        after = ra.problems([dict(ra.classify("2.336.0", "2.339.0"), golden="g")])
+    def test_lag_is_shown_but_is_not_a_problem(self):
+        row = dict(ra.classify("2.330.0", "2.338.2"), golden="g")
+        self.assertEqual(row["verdict"], "warn")
+        self.assertEqual(ra.problems([row]), [])
+
+    def test_refusal_problem_text_names_only_the_refused_version(self):
+        before = ra.problems([dict(ra.classify("2.336.0", "2.338.2", {"2.336.0"}), golden="g")])
+        after = ra.problems([dict(ra.classify("2.336.0", "2.341.0", {"2.336.0"}), golden="g")])
         self.assertEqual(before, after)
-        self.assertEqual(before, ["g: WARN: runner v2.336.0 is 2 or more minor versions "
-                                  "behind the latest release"])
+        self.assertEqual(before, ["g: FAIL: GitHub refuses runner v2.336.0 as deprecated"])
 
     def test_agrees_with_the_pin_rule(self):
         names = {"problem": "fail", "warn": "warn", "ok": "ok", "unknown": "unknown"}
@@ -98,13 +103,11 @@ class ProblemTests(unittest.TestCase):
         self.assertEqual([r["verdict"] for r in rows], ["unknown", "unknown"])
         self.assertEqual(ra.problems(rows), [])
 
-    def test_behind_and_refused_are_problems(self):
+    def test_only_the_refusal_is_a_problem(self):
         rows = [dict(ra.classify("2.336.0", "2.338.2"), golden="a"),
                 dict(ra.classify(None, None, refused={"2.336.0"}), golden="b")]
         self.assertEqual(ra.problems(rows),
-                         ["a: WARN: runner v2.336.0 is 2 or more minor versions behind "
-                          "the latest release",
-                          "b: FAIL: GitHub refuses runner v2.336.0 as deprecated"])
+                         ["b: FAIL: GitHub refuses runner v2.336.0 as deprecated"])
 
 
 class CollectTests(unittest.TestCase):
@@ -337,10 +340,10 @@ class SurfaceTests(unittest.TestCase):
         self.assertIn("runner age pulp-linux-build: FAIL: GitHub refuses runner v2.336.0",
                       summary["problem"])
 
-    def test_tool_freshness_behind_is_a_problem_with_stable_text(self):
-        first = self.summary_after_refresh("2.338.2", recorded="2.336.0")["problem"]
-        self.assertIn("runner age pulp-linux-build: WARN: runner v2.336.0 is 2 or more "
-                      "minor versions behind the latest release", first)
+    def test_tool_freshness_behind_is_shown_but_not_a_problem(self):
+        summary = self.summary_after_refresh("2.338.2", recorded="2.336.0")
+        self.assertIsNone(summary["problem"])
+        self.assertIn("runner age pulp-linux-build: WARN", "\n".join(summary["lines"]))
 
     def test_measure_failure_is_unknown_not_a_problem(self):
         with mock.patch.object(ra, "collect", side_effect=OSError("boom")):
@@ -348,13 +351,30 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(rows[0]["verdict"], "unknown")
         self.assertEqual(ra.problems(rows), [])
 
-    def test_fleet_reason_names_the_record_command(self):
-        reasons = json.loads((HERE / "fleet_reasons.json").read_text())
-        text = json.dumps(reasons)
-        self.assertIn("python3 scripts/runner_age.py record --golden", text)
-        self.assertIn("--source operator", text)
-        self.assertIn("tool-freshness --refresh", text)
-        self.assertIn("DEFAULT_RUNNER_VERSION", text)
+    def test_the_documented_remedy_commands_run(self):
+        # Run the record command exactly as fleet_reasons.json prints it, from
+        # the checkout root, and check it clears a remembered refusal.
+        remedy = json.loads((HERE / "fleet_reasons.json").read_text())[
+            "reasons"]["tool_freshness_stale"]["remedy"]
+        match = re.search(r"`(python3 scripts/runner_age\.py record [^`]+)`", remedy)
+        self.assertIsNotNone(match, remedy)
+        command = match.group(1).replace("<name>", "pulp-linux-build").replace(
+            "<version>", "2.338.2")
+        self.assertNotIn("<", command)
+        ra.remember_refused("pulp-linux-build", {"2.336.0": NOW - 3600})
+        done = subprocess.run(command, shell=True, cwd=str(HERE.parent),
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(ra.read_record("pulp-linux-build"), "2.338.2")
+        rows = ra.collect(("pulp-linux-build",), NOW, latest="2.338.2", persist=True,
+                          present=lambda: {"pulp-linux-build"})
+        self.assertEqual(rows[0]["verdict"], "ok")
+        self.assertIn("`tartci fleet-macos tool-freshness --refresh`", remedy)
+        dispatcher = (HERE.parent / "tartci").read_text()
+        self.assertIn("tool-freshness", dispatcher)
+        self.assertIn("DEFAULT_RUNNER_VERSION=",
+                      (HERE.parent / "providers/tart-macos/runner.sh").read_text())
+        self.assertIn("DEFAULT_RUNNER_VERSION", remedy)
 
 
 class SupervisorTests(unittest.TestCase):
@@ -363,11 +383,33 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("is deprecated and cannot receive messages", text)
         self.assertIn("runner_version_deprecated:", text)
 
-    def test_linux_runner_checks_the_log_whatever_the_exit_status(self):
+    def refusal_block(self) -> str:
+        """The supervisor's refusal check, cut out of runner.sh to be run."""
         text = (HERE.parent / "providers/tart-linux/runner.sh").read_text()
-        branch = text.index('elif [ "$run_status" -ne 0 ]; then')
-        closed = text.index("\n  fi\n", branch)
-        self.assertGreater(text.index("is deprecated and cannot receive messages"), closed)
+        start = text.index("  # Checked whatever the exit status")
+        end = text.index("\n  fi\n", start) + len("\n  fi\n")
+        return text[start:end]
+
+    def run_block(self, log_text: str, run_status: int) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "runner-output.log").write_text(log_text)
+            script = ('set -euo pipefail\nnote(){ printf "%s\\n" "$*"; }\n'
+                      f'i=7; logdir="{tmp}"; run_status={run_status}\n' + self.refusal_block())
+            done = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout
+
+    def test_linux_runner_names_the_refusal_when_the_runner_exits_zero(self):
+        # The runner's wrapper can exit 0 after the listener reports retirement.
+        for status in (0, 1):
+            with self.subTest(run_status=status):
+                self.assertIn("[7] runner_version_deprecated:", self.run_block(REFUSAL, status))
+
+    def test_linux_runner_says_nothing_for_an_ordinary_log(self):
+        self.assertEqual(self.run_block("Listening for Jobs\n", 1), "")
+
+    def test_linux_refusal_check_does_not_depend_on_the_exit_status(self):
+        self.assertNotIn("run_status", self.refusal_block())
 
     def test_supervisor_wording_matches_the_log_pattern(self):
         self.assertEqual(rv.find_deprecated(REFUSAL), "2.336.0")

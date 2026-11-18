@@ -12,7 +12,7 @@ Per golden this reports one of:
            remembered and clears only when the version changes, so the alert
            outlives the log and a lane that has stopped trying
   warn     the version trails the latest release by
-           `runner_version.WARN_MINOR_LAG` minor versions or more
+           `runner_version.WARN_MINOR_LAG` minor versions or more (doctor only)
   ok       the version is known and within that lag
   unknown  the version or the latest release could not be read
 
@@ -21,9 +21,10 @@ check already uses, so the two cannot disagree about how far behind is too
 far. Refusals are read from every lane's runner logs, including the fleet
 lanes' own state directories.
 
-`warn` and `fail` are problems for the watchdog. `unknown` is shown by doctor
-and is neither ok nor an alert: a host that has never recorded its golden, or
-cannot reach GitHub, must not page anyone.
+Only `fail` is a problem for the watchdog: GitHub is refusing the runner now.
+`warn` and `unknown` are doctor output. A lag warning would fire on every host
+each time upstream ships two releases, and a host that has never recorded its
+golden, or cannot reach GitHub, must not page anyone.
 
 Where the version comes from. Nothing here boots a VM.
   Linux golden   a record written by `record` (provision.sh writes one when the
@@ -178,11 +179,10 @@ def present_goldens() -> Optional[set]:
 def log_globs(golden: str, home: Optional[Path] = None) -> list:
     """Where the lanes that clone `golden` keep each runner's output."""
     if base_name(golden) in PINNED_GOLDENS:
-        state = tartci_home(home) / "state"
-        roots = [str(state / "macos"), str(state / "macos-fleet" / "*")]
+        patterns = rv.lane_log_globs(str(tartci_home(home) / "state" / "macos"))
         if os.environ.get("TARTCI_STATE_DIR"):
-            roots.append(os.environ["TARTCI_STATE_DIR"])
-        return [os.path.join(root, "*.actions-runner.log") for root in roots]
+            patterns += rv.lane_log_globs(os.environ["TARTCI_STATE_DIR"])
+        return sorted(set(patterns))
     root = (os.environ.get("TARTCI_LINUX_LOGS") or os.environ.get("PULP_LINUX_LOGS")
             or str((home or Path.home()) / "VMs" / "logs" / "tartci-linux"))
     return [os.path.join(root, "*", "runner-output.log")]
@@ -323,19 +323,9 @@ def render(row: dict) -> str:
 
 
 def problems(rows: list) -> list:
-    """Only a version known to be too old, or refused by GitHub, is a problem.
-
-    The text is an alert's identity, so it names the installed version only: a
-    new upstream release must not turn one standing problem into a new one.
-    """
-    out = []
-    for row in rows:
-        if row.get("verdict") == "fail":
-            out.append(render(row))
-        elif row.get("verdict") == "warn":
-            out.append(f"{row.get('golden', '?')}: WARN: runner v{row.get('installed')} is "
-                       f"{rv.WARN_MINOR_LAG} or more minor versions behind the latest release")
-    return out
+    """Only a live refusal is a problem. Its text names the refused version and
+    nothing that moves with the clock or with upstream releases."""
+    return [render(row) for row in rows if row.get("verdict") == "fail"]
 
 
 def main(argv: Optional[list] = None) -> int:
