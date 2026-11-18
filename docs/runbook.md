@@ -3506,6 +3506,53 @@ arrive, and a host that did not get it is loud:
 3. On the new machine: install, then `tartci fleet-macos self-update --peers`
    to see every peer it will check and the target it resolves to.
 
+### Runner agent age in the goldens (`tartci doctor runner-age`)
+
+Every job VM is cloned from a golden that carries the GitHub Actions runner
+agent at `~/actions-runner`. GitHub retires a runner version 30 days after a
+newer release; a retired agent registers, prints `Runner version vX is
+deprecated and cannot receive messages` and exits, so every clone of a golden
+that carries it fails the same way. A Linux pool stopped for 13 days this way
+with nothing alerting.
+
+- **What it reports.** Per golden on this host (`pulp-build-runner`,
+  `pulp-linux-build`): the installed runner version, the latest `actions/runner`
+  release with its publish date, and a verdict. `fail`: the first release newer
+  than the installed one is more than 30 days old, or the installed version is
+  below the configured minimum. `warn`: that deadline is at most 10 days away.
+  `ok` otherwise, and always `ok` when installed equals latest. `unknown`: the
+  installed version has no record, or the release feed could not be read. It is
+  its own state and never counts as ok.
+- **Where the installed version comes from.** A record written when the golden
+  is provisioned (`~/.tartci/state/golden-runner/<golden>.json`;
+  `providers/tart-linux/provision.sh` writes it). Nothing boots a golden to read
+  it. A golden with no record is `unknown`; record an existing one by hand with
+  `scripts/runner_age.py record --golden NAME --version V`, using the version
+  printed by `~/actions-runner/bin/Runner.Listener --version` inside that golden.
+  The macOS lane also installs its pinned runner into each VM
+  (`providers/tart-macos/runner.sh`, checked by `check_runner_version`), so a
+  stale macOS golden is replaced per job; the Linux lane runs the golden's agent
+  as it is. Proxmox goldens are not covered: their version lives in the Proxmox
+  bake receipt, which is a different read path.
+- **Where it shows.** `tartci doctor runner-age [--json]`, a section in bare
+  `tartci doctor`, and the tool-freshness refresh (every watchdog pass), which
+  adds each non-ok golden to the tool-freshness problem. That reaches `tartci
+  doctor fleet` as `tool_freshness_stale` and the launchd watchdog WARN, so
+  nobody has to run doctor by hand.
+- **Settings** in `~/.config/tartci/tool-freshness.toml`:
+
+      [runner_age]
+      goldens = ["pulp-build-runner", "pulp-linux-build"]
+      warn_days = 10
+      minimum = "2.330.0"      # optional; below this is a fail
+
+- **Runtime symptom.** The macOS supervisor already backs off and records
+  `runner_version_deprecated` when a listener says it is retired. The Linux
+  supervisor now logs a named `runner_version_deprecated:` line for the same
+  output instead of a generic non-zero exit.
+- **Remedy.** Refresh the golden so it carries a current runner agent, then
+  re-provision (which records the new version). Doctor never refreshes a golden.
+
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
 The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane
