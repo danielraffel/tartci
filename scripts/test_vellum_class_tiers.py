@@ -124,6 +124,7 @@ class SelectionTests(unittest.TestCase):
             f"{STERILE}) echo {sterile} ;; "
             f"{MERGE_GROUP}) echo {merge_group} ;; {PR_HEAD}) echo {pr_head} ;; esac; }}\n"
             "queued_work(){ echo 0; }\n"
+            + runner_function("tier_workflow_args") + "\n"
             + runner_function("select_work") + "\nselect_work\n"
         )
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
@@ -174,6 +175,7 @@ class RefreshAfterServeTests(unittest.TestCase):
             f"{MERGE_GROUP}) [ \"$2\" = 1 ] && echo 1 || echo 0 ;; {PR_HEAD}) echo 2 ;; esac; }}\n"
             "queued_work(){ echo 0; }\n"
             "tartci_assignment_v2_select(){ echo \"v2|force=${1:-0}|0\"; }\n"
+            + runner_function("tier_workflow_args") + "\n"
             + runner_function("select_work") + "\n"
             + runner_function("refresh_after_serve") + "\n"
             + runner_function("next_selection") + "\n"
@@ -252,6 +254,7 @@ class RefreshAfterEveryServeTests(unittest.TestCase):
             f"{MERGE_GROUP}) echo 0 ;; {PR_HEAD}) echo 2 ;; esac; }}\n"
             "queued_work(){ echo 0; }\n"
             "tartci_assignment_v2_select(){ echo \"v2|force=${1:-0}|0\"; }\n"
+            + runner_function("tier_workflow_args") + "\n"
             + runner_function("select_work") + "\n"
             + runner_function("refresh_after_serve") + "\n"
             + runner_function("next_selection") + "\n"
@@ -287,6 +290,50 @@ class RefreshAfterEveryServeTests(unittest.TestCase):
     def test_the_runner_reads_the_rendered_flag(self) -> None:
         self.assertIn('"${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1',
                       runner_function("refresh_after_serve"))
+
+class ForcedRefreshBudgetTests(unittest.TestCase):
+    """A forced selection spends one uncached discovery per workflow set.
+
+    queue_scan.py shares one discovery snapshot per repository and workflow
+    set across labels, and a forced scan publishes it. Forcing every tier
+    would repeat the same uncached discovery once per class, three times a
+    selection on the Vellum lanes, after every served job.
+    """
+
+    def calls(self, tiers: list[tuple[str, str]], force: str) -> list[str]:
+        workflow_tiers = "\\n".join(f"{label}|{workflow}" for label, workflow in tiers)
+        labels = "\\n".join(dict.fromkeys(label for label, _ in tiers))
+        script = (
+            "set -u\n"
+            "ASSIGNMENT_MODE=legacy\nLABELS=self-hosted,macOS,ARM64,vellum-host-m5\n"
+            f"WORKFLOW_TIERS=$'{workflow_tiers}'\n"
+            f"TIER_LABELS_CONFIG=$'{labels}'\n"
+            "tier_queued_work(){ echo \"$1 force=$2\" >&2; echo 0; }\n"
+            "queued_work(){ echo 0; }\n"
+            + runner_function("tier_workflow_args") + "\n"
+            + runner_function("select_work") + "\n"
+            + f"SCAN_FORCE_REFRESH={force} select_work >/dev/null\n"
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stderr.splitlines()
+
+    def test_one_workflow_is_forced_once_for_all_three_classes(self) -> None:
+        tiers = [(STERILE, WORKFLOW), (MERGE_GROUP, WORKFLOW), (PR_HEAD, WORKFLOW)]
+        self.assertEqual(self.calls(tiers, "1"),
+                         [f"{STERILE} force=1", f"{MERGE_GROUP} force=0", f"{PR_HEAD} force=0"])
+
+    def test_an_unforced_selection_forces_nothing(self) -> None:
+        tiers = [(STERILE, WORKFLOW), (MERGE_GROUP, WORKFLOW), (PR_HEAD, WORKFLOW)]
+        self.assertEqual(self.calls(tiers, "0"),
+                         [f"{STERILE} force=0", f"{MERGE_GROUP} force=0", f"{PR_HEAD} force=0"])
+
+    def test_each_distinct_workflow_set_is_forced_once(self) -> None:
+        # A set that is a prefix of another is still its own set.
+        tiers = [("a", "Release CLI"), ("a", "Sign and Release"), ("b", "Release CLI"),
+                 ("c", "Release CLI"), ("d", "Release CLI"), ("d", "Sign and Release")]
+        self.assertEqual(self.calls(tiers, "1"),
+                         ["a force=1", "b force=1", "c force=0", "d force=0"])
 
 if __name__ == "__main__":
     unittest.main()

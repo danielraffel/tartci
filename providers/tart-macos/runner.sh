@@ -1450,9 +1450,24 @@ select_work(){
     printf '%s|%s|0\n' "$q" "$LABELS"
     return 0
   fi
+  # A forced refresh bypasses the cache once per workflow set, not once per
+  # tier. queue_scan.py shares one discovery snapshot per repository and
+  # workflow set across labels, and a forced scan publishes it, so a later
+  # tier of the same workflows reads that fresh snapshot instead of spending
+  # another uncached discovery on the fleet's API budget.
+  local force forced_sets="" workflow_set
   while IFS= read -r tier_labels; do
     [ -n "$tier_labels" ] || continue
-    if ! q="$(tier_queued_work "$tier_labels" "${SCAN_FORCE_REFRESH:-0}")"; then
+    force=0
+    if [ "${SCAN_FORCE_REFRESH:-0}" = 1 ]; then
+      # One line per set already forced; workflow names hold no newline.
+      workflow_set="$(tier_workflow_args "$tier_labels" | sort | tr '\n' '|')"
+      case $'\n'"$forced_sets" in
+        *$'\n'"$workflow_set"$'\n'*) ;;
+        *) force=1; forced_sets="$forced_sets$workflow_set"$'\n' ;;
+      esac
+    fi
+    if ! q="$(tier_queued_work "$tier_labels" "$force")"; then
       printf 'ERR|%s|%s\n' "$LABELS" "$tier"
       return 0
     fi
