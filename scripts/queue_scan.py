@@ -912,6 +912,13 @@ def parse_args() -> argparse.Namespace:
     # operator traffic instead of consuming the installation's full allowance.
     parser.add_argument("--fleet-api-budget-per-hour", type=int, default=int(os.environ.get("TARTCI_QUEUE_FLEET_API_BUDGET_PER_HOUR", "4000")))
     parser.add_argument("--stagger-max-seconds", type=int, default=int(os.environ.get("TARTCI_QUEUE_STAGGER_MAX_SECS", "4")))
+    parser.add_argument(
+        "--forced-discoveries-per-hour",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR", "0")),
+        help="fleet-wide uncached discoveries an hour outside the TTL cadence "
+        "(post-serve refreshes), counted in the fleet API budget check",
+    )
     parser.add_argument("--negative-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEGATIVE_TTL_SECS", "30")))
     parser.add_argument("--max-age-seconds", type=int, default=0)
     parser.add_argument(
@@ -954,6 +961,8 @@ def parse_args() -> argparse.Namespace:
         or args.observation_lock_timeout <= 0
     ):
         parser.error("--observation-lock-timeout must be positive")
+    if args.forced_discoveries_per_hour < 0:
+        parser.error("--forced-discoveries-per-hour must be non-negative")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     if args.observation_backoff_file is None:
@@ -983,6 +992,9 @@ def parse_args() -> argparse.Namespace:
         * maximum_calls
         * args.expected_fleet_hosts
         * args.expected_discovery_namespaces
+        # Uncached discoveries outside the TTL cadence (a lane's post-serve
+        # refresh), fleet-wide, each a full discovery.
+        + args.forced_discoveries_per_hour * maximum_calls
     )
     if fleet_calls_per_hour > args.fleet_api_budget_per_hour:
         parser.error(

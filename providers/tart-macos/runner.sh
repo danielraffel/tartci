@@ -1517,7 +1517,12 @@ select_work(){
 refresh_after_serve(){
   if [ "${1:-0}" = 1 ] && [ -n "${2:-}" ]; then
     case ",${2:-}," in *-merge-group,*) printf '%s\n' 1; return 0 ;; esac
-    [ "${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1 ] && { printf '%s\n' 1; return 0; }
+    # Not after the lane's first class: that class is what the refresh looks
+    # for, and nothing is created when one of its jobs ends.
+    if [ "${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1 ] \
+       && [ "${2##*,}" != "$(printf '%s\n' "$TIER_LABELS_CONFIG" | sed -n '1p')" ]; then
+      printf '%s\n' 1; return 0
+    fi
   fi
   printf '%s\n' 0
 }

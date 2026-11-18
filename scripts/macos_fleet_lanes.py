@@ -3270,6 +3270,11 @@ def lane_plist(
         # runner.sh refresh_after_serve: after any served job, not only a
         # merge-group one, the next selection rescans uncached once.
         env["TARTCI_REFRESH_AFTER_EVERY_SERVE"] = "1"
+        # Counted in queue_scan.py's fleet API budget check: one uncached
+        # discovery per served non-first-class job, fleet-wide. Vellum served
+        # about 130 proofs a day over 2026-11-15..17, under 6 an hour; 8 leaves
+        # headroom and keeps the check within its 4,000 calls/hour budget.
+        env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"] = "8"
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
     if "vm_cores_from" in lane:

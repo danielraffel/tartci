@@ -774,8 +774,16 @@ reservation and the rotating slot keep theirs.
 
 Cost: a forced selection spends one uncached discovery per workflow set, not
 one per tier. Lower tiers of the same workflows read the snapshot the forced
-scan just published. That is about 5 to 14 API calls per served job and
-changes no priority.
+scan just published. That is about 5 to 14 API calls per served job.
+
+There is no refresh after a job of the lane's first class: that class is what
+the refresh looks for, and nothing is queued when one of its jobs ends. The
+lane renders `TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR` (fleet-wide, 8 for
+Vellum), and `queue_scan.py` adds those discoveries to its fleet API budget
+check.
+
+The refresh reorders nothing: the tier order, the merge-group quota and the
+oldest-run reservation are the same as on an unforced scan.
 
 `refresh_after_every_serve` is valid only on a legacy `[[lane.tier]]` lane
 with `min_queued_age_seconds = 0`, and the validator refuses it elsewhere:

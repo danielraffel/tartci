@@ -111,6 +111,24 @@ class ServedRunFirstTests(unittest.TestCase):
         self.assertEqual(self._scan(MERGE_CLASS, refreshes=6), [1] * 6)
         self.assertEqual(self._scan(MERGE_CLASS, refreshes=6, priority_run=SERVED), [1] * 6)
 
+    def test_forced_discoveries_count_in_the_fleet_budget(self) -> None:
+        import sys
+        import queue_scan
+        argv = ["queue_scan.py", "--repo", "o/r", "--labels", "a", "--state-file", "/tmp/x",
+                "--provider", "p", "--lane-id", "l", "--workflow", "w"]
+        for forced, ok in (("0", True), ("8", True), ("20", False)):
+            with self.subTest(forced=forced):
+                old_argv = sys.argv
+                sys.argv = [*argv, "--forced-discoveries-per-hour", forced]
+                try:
+                    if ok:
+                        queue_scan.parse_args()
+                    else:
+                        with self.assertRaises(SystemExit):
+                            queue_scan.parse_args()
+                finally:
+                    sys.argv = old_argv
+
     def test_an_unknown_served_run_changes_nothing(self) -> None:
         self.assertEqual(self._scan(PR_CLASS, refreshes=3, priority_run=1),
                          self._scan(PR_CLASS, refreshes=3))
@@ -144,6 +162,58 @@ class ServedRunFirstTests(unittest.TestCase):
         self.assertEqual(ids, [SERVED, 1, 2, 107, 106])
         self.assertIn("107", state["oldest_reserved_at"])
 
+
+class ServedRunPropertyTests(unittest.TestCase):
+    """Random queues and settings: --priority-run only moves the served run.
+
+    For every case: the cap holds, no run is read twice, the served run is
+    first, every merge-group run the quota reads without the flag is still
+    read with it, and the oldest-run reservation's target is still read.
+    """
+
+    def test_random_queues(self) -> None:
+        import argparse
+        import random
+        import queue_scan
+
+        rng = random.Random(20261118)
+        now = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        for case in range(3000):
+            cap = rng.randint(2, 7)
+            newest_quota = rng.randint(1, cap - 1)
+            runs = []
+            for index in range(rng.randint(1, 14)):
+                event = rng.choice(("pull_request", "pull_request", "merge_group", "push"))
+                runs.append(_run(1000 + index, now - timedelta(minutes=rng.randint(1, 600)),
+                                 event, rng.choice(("queued", "in_progress"))))
+            served = rng.choice(runs)["id"]
+
+            def scanner(priority: int) -> Any:
+                value = object.__new__(queue_scan.QueueScanner)
+                value.args = argparse.Namespace(
+                    newest_quota=newest_quota, max_job_fetches=cap, page_offset_cap=64,
+                    merge_group_quota=rng_quota, negative_ttl=30,
+                    oldest_reserve_max_age=0, priority_run=priority)
+                value.now = int(now.timestamp())
+                return value
+
+            rng_quota = rng.randint(0, 3)
+            with self.subTest(case=case):
+                base_state: dict[str, Any] = {}
+                base, _ = scanner(0)._candidate_runs([dict(r) for r in runs], base_state)
+                state: dict[str, Any] = {}
+                got, _ = scanner(served)._candidate_runs([dict(r) for r in runs], state)
+                ids = [int(r["id"]) for r in got]
+                self.assertLessEqual(len(ids), cap)
+                self.assertEqual(len(ids), len(set(ids)))
+                self.assertEqual(ids[0], served)
+                newest = sorted(runs, key=lambda r: r["created_at"], reverse=True)
+                quota_runs = [int(r["id"]) for r in newest if r["event"] == "merge_group"]
+                bound = max(0, cap - newest_quota - (1 if base_state.get("oldest_reserved_at") else 0) - 1)
+                for run_id in quota_runs[:min(rng_quota, bound)]:
+                    self.assertIn(run_id, ids)
+                for run_id in base_state.get("oldest_reserved_at") or {}:
+                    self.assertIn(int(run_id), ids)
 
 if __name__ == "__main__":
     unittest.main()

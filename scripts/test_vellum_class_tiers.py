@@ -293,6 +293,23 @@ class RefreshAfterEveryServeTests(unittest.TestCase):
             "TARTCI_REFRESH_AFTER_EVERY_SERVE=1 "
             f"refresh_after_serve 1 \"$LABELS,{PR_HEAD}\""), "1")
 
+    def test_no_refresh_after_the_first_class(self) -> None:
+        """A served journey queues nothing: its refresh would be wasted."""
+        self.assertEqual(self.run_bash(
+            "TARTCI_REFRESH_AFTER_EVERY_SERVE=1 "
+            f"refresh_after_serve 1 \"$LABELS,{STERILE}\""), "0")
+        self.assertEqual(self.run_bash(
+            "TARTCI_REFRESH_AFTER_EVERY_SERVE=1 "
+            f"refresh_after_serve 1 \"$LABELS,{MERGE_GROUP}\""), "1")
+
+    def test_the_rendered_lane_counts_its_forced_discoveries(self) -> None:
+        import plistlib
+        for host in REFRESH_HOSTS:
+            env = next(plistlib.loads(body)["EnvironmentVariables"]
+                       for name, body in fleet.rendered_plists(fleet.load(PROFILES[host])).items()
+                       if name.endswith(".vellum-gate.plist"))
+            self.assertEqual(env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"], "8", host)
+
     def test_off_by_default_and_never_without_a_served_job(self) -> None:
         self.assertEqual(self.run_bash(f"refresh_after_serve 1 \"$LABELS,{PR_HEAD}\""), "0")
         self.assertEqual(self.run_bash(
