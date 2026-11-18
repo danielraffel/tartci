@@ -400,6 +400,12 @@ class HealTests(unittest.TestCase):
             "escaped separator": f"echo \\; {v1}\necho \\; {v2}\n" + old,
             "bang or brace argument": f"echo would run ! {v1}\necho {{ {v2}\n" + old,
             "array storage": f"a=({v1})\nb=( {v2} )\n" + old,
+            "heredoc with a redirect": f"cat <<EOF>/dev/null\n{v1}\n{v2}\nEOF\n" + old,
+            "quoted heredoc with a redirect": f"cat <<'EOF'>/dev/null\n{v1}\n{v2}\nEOF\n" + old,
+            "heredoc tag with a dash": f"cat <<EOF-X\n{v1}\n{v2}\nEOF-X\n" + old,
+            "heredoc tag with dots": f"cat <<E.O.F\n{v1}\n{v2}\nE.O.F\n" + old,
+            "multi-line array": f"a=(\n  {v1}\n  {v2}\n)\n" + old,
+            "appended array": f"a+=(\n  {v1}\n  {v2}\n)\n" + old,
             "inside a quoted $( )": f"x='$({v1})'\ny='$({v2})'\n" + old,
         }
         for name, body in not_executed.items():
@@ -411,6 +417,9 @@ class HealTests(unittest.TestCase):
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
         # A here-string is not a here-document: the calls after it still run.
         self.wrapper.write_text(f'#!/bin/bash\ntr a b <<<"$x"\n{v1}\n{v2}\n')
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+        # An array that closes does not end command position for what follows.
+        self.wrapper.write_text(f"#!/bin/bash\na=(\n  x\n)\n{v1}\n{v2}\n")
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
         # `!` and a `{ }` group still run their command.
         self.wrapper.write_text(f"#!/bin/bash\n! {v1}\n{{ {v2}; }}\n")

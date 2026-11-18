@@ -904,7 +904,7 @@ def wrapper_sends_sigkill(wrapper: str) -> bool:
 _KILL_WORD = '"$KILLALL"'
 _LEADER_KEYWORDS = frozenset({"exec", "then", "do", "else", "elif"})
 _WORD = re.compile(r"[A-Za-z_]\w*(?=[\s;&|)]|$)")
-_HEREDOC = re.compile(r"<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|\\?(\w+))(?=[\s;&|)]|$)")
+_HEREDOC = re.compile(r"""<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([^\s;&|()<>'"\\]+))(?=[\s;&|)<>]|$)""")
 
 
 def kill_vectors(text: str) -> list[str]:
@@ -923,6 +923,7 @@ def kill_vectors(text: str) -> list[str]:
     stack = ["code"]  # "code", "paren" (code inside $( )), "dq", "sq"
     pending: list[tuple[str, bool]] = []  # here-document (tag, tab-stripping)
     cmd = True  # the next word is at a command position
+    arrays = 0  # open `name=( ... )`: its words are values, even across lines
     n, i = len(text), 0
     while i < n:
         c, top = text[i], stack[-1]
@@ -943,7 +944,7 @@ def kill_vectors(text: str) -> list[str]:
             i += 1
             continue
         if c == "\n":
-            cmd = True
+            cmd = arrays == 0
             i += 1
             while pending and i <= n:  # bodies start on the next line
                 tag, dash = pending[0]
@@ -987,11 +988,16 @@ def kill_vectors(text: str) -> list[str]:
             cmd = False
             i += 1
         elif c in ";|" or (c == "&" and text[i - 1:i] not in ("<", ">") and text[i + 1:i + 2] != ">"):
-            cmd = True
+            cmd = arrays == 0
             i += 1
         elif c == "(":
             # A subshell at a command position; otherwise an array assignment
             # or arithmetic, whose words are not commands.
+            arrays += 0 if cmd else 1
+            i += 1
+        elif c == ")" and arrays:
+            arrays -= 1
+            cmd = False
             i += 1
         elif text.startswith("<<<", i):
             i += 3
@@ -1001,7 +1007,7 @@ def kill_vectors(text: str) -> list[str]:
                 pending.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
                 i = m.end()
             else:
-                i += 2
+                break  # an unparsable here-document: the rest is not counted
         elif c in "<>&":
             i += 1
         elif cmd and c in "!{" and text[i + 1:i + 2] in (" ", "\t"):
