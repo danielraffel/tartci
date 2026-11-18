@@ -134,7 +134,7 @@ def rollout(settings: dict) -> dict:
         value = published.get("tool_rollout")
     if not isinstance(value, dict) or not isinstance(value.get("canary"), str) \
             or not value["canary"]:
-        return {"canary": None, "steward_hosts": [],
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
                 "error": f"no tool_rollout canary in {PUBLISHED}"}
     rows = published.get("hosts")
     known = {row["host_id"] for row in rows
@@ -145,10 +145,18 @@ def rollout(settings: dict) -> dict:
     # a required steward and let a release pass after only the canary soak.
     if value["canary"] not in known or not isinstance(hosts, list) or not hosts \
             or any(not isinstance(h, str) or h not in known for h in hosts):
-        return {"canary": None, "steward_hosts": [],
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
                 "error": f"invalid tool_rollout in {PUBLISHED}: canary and a non-empty "
                          "steward_hosts list must name published hosts"}
-    return {"canary": value["canary"], "steward_hosts": hosts, "error": None}
+    # A former canary still applies first while the fleet's TartCI generations
+    # catch up with a canary move: an older generation on a steward host waits
+    # for it, and if it waited in turn for that steward host, neither would
+    # move until TartCI itself had rolled out. Readers wait only for `canary`.
+    former = value.get("former_canaries")
+    former = [h for h in former if isinstance(h, str) and h in known] \
+        if isinstance(former, list) else []
+    return {"canary": value["canary"], "steward_hosts": hosts, "former_canaries": former,
+            "error": None}
 
 
 def self_host_id(home: Path, settings: dict) -> str | None:
@@ -284,6 +292,8 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
                       "or set host_class in tool-freshness.toml)")
     if me == canary:
         return newest, f"canary {canary}: applies first"
+    if me in roles["former_canaries"]:
+        return newest, f"former canary {me}: applies first until every host reads canary {canary}"
     # (host, needs a clean steward tick): the canary, then for a tool with a
     # steward check every steward host other than this one.
     # A canary that is also a published steward host must show a clean steward

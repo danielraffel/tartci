@@ -1,4 +1,5 @@
 {
   "canary": "m5studio",
+  "former_canaries": ["m5"],
   "steward_hosts": ["studio"]
 }

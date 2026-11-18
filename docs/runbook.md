@@ -3330,6 +3330,12 @@ arrive, and a host that did not get it is loud:
   stage fleet-wide), and `tool-freshness.toml` cannot set either. A missing or
   unreadable role list fails closed: no host applies. To move the canary,
   edit `fleet/tool-rollout.json`, regenerate the published file and merge.
+  List the old canary in `former_canaries` there until every host runs a
+  TartCI generation that names the new one: a former canary still applies
+  first, so a host on the older generation, which waits for it, is never left
+  waiting on a host that in turn waits for it. Readers wait only for
+  `canary`. Remove the entry once `tartci fleet-macos self-update --plan`
+  reports every host current.
   The canary applies a release at 30 minutes, as above. Every other host
   applies it only once the canary's `events.jsonl` shows a `tool_deployed` for
   the tool's CLI with `to` equal to the release and `verify` current or behind,

@@ -227,6 +227,25 @@ class CanaryGateTests(_Fleet):
         self.refresh(host, "studio")
         self.assertEqual(host.fleet_updates(), ["v0.221.1"])
 
+    def test_a_former_canary_still_applies_first_while_readers_wait_for_the_new_one(self) -> None:
+        # Moving the canary from m5 to m5studio: a steward host still on the
+        # older TartCI generation waits for m5, so m5 must not wait for that
+        # steward host in turn, or neither moves until TartCI has rolled out.
+        roles = {"canary": "m5studio", "steward_hosts": ["studio"], "former_canaries": ["m5"]}
+        former = self.behind(canary_events())
+        row = self.refresh(former, "m5", tool_rollout=roles)["tools"]["shipyard"]
+        self.assertEqual(former.fleet_updates(), ["v0.221.1"])
+        self.assertIn("former canary m5: applies first", row["canary"])
+        self.assertFalse(any(c[0] == "ssh" for c in former.calls))
+        # A reader on the new generation waits for the new canary, not the former.
+        self.switch_host()
+        reader = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 3 * HOUR))})
+        row = self.refresh(reader, "studio", tool_rollout=roles,
+                           ssh_targets={"m5studio": "m5s", "m5": "m5", "studio": "m3"})
+        self.assertEqual(reader.fleet_updates(), [])
+        self.assertIn("waiting for canary m5studio", row["tools"]["shipyard"]["apply"])
+
     def test_shipyard_soaks_half_an_hour_pulp_two_and_a_host_setting_wins(self) -> None:
         # v0.444.0 took 4 h 15 min to reach every host, 2 h of it the canary
         # soak, with nothing on the canary able to fail the release meanwhile.
@@ -419,9 +438,11 @@ class CanaryGateTests(_Fleet):
         published = json.loads(canary.PUBLISHED.read_text())["tool_rollout"]
         self.assertEqual(canary.rollout({}), {"canary": published["canary"],
                                               "steward_hosts": published["steward_hosts"],
+                                              "former_canaries": ["m5"],
                                               "error": None})
         # m5studio is always on; the m5 laptop canary stalled every host while it slept.
-        self.assertEqual(published, {"canary": "m5studio", "steward_hosts": ["studio"]})
+        self.assertEqual(published, {"canary": "m5studio", "steward_hosts": ["studio"],
+                                     "former_canaries": ["m5"]})
         with mock.patch.object(canary, "PUBLISHED", Path(self.tmp.name) / "missing.json"):
             self.assertIsNotNone(canary.rollout({})["error"])
             host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
@@ -1062,8 +1083,21 @@ class PublishedRolloutTests(unittest.TestCase):
             path.write_text(json.dumps({"canary": "m5", "steward_hosts": ["studio"]}))
             self.assertEqual(fleet.tool_rollout(path, hosts),
                              {"canary": "m5", "steward_hosts": ["studio"]})
+            for bad in ({"canary": "m5", "steward_hosts": ["studio"], "former_canaries": ["m5"]},
+                        {"canary": "m5", "steward_hosts": ["studio"], "former_canaries": ["m9"]},
+                        {"canary": "m5", "steward_hosts": ["studio"], "former_canaries": "m1"}):
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    fleet.tool_rollout(path, hosts)
+            path.write_text(json.dumps({"canary": "m5", "steward_hosts": ["studio"],
+                                        "former_canaries": ["m1"]}))
+            self.assertEqual(fleet.tool_rollout(path, hosts),
+                             {"canary": "m5", "steward_hosts": ["studio"],
+                              "former_canaries": ["m1"]})
         published = fleet.published_snapshot()
-        self.assertEqual(published["tool_rollout"], {"canary": "m5studio", "steward_hosts": ["studio"]})
+        self.assertEqual(published["tool_rollout"], {"canary": "m5studio",
+                                                     "steward_hosts": ["studio"],
+                                                     "former_canaries": ["m5"]})
 
 
 if __name__ == "__main__":
