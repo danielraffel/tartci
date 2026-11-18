@@ -385,6 +385,13 @@ class CheckClassTests(LeaseCliTestCase):
         self.assertEqual(build.returncode, 75, build.stdout)
         self.assertEqual(json.loads(build.stdout)["reason"], "memory_exceeded")
 
+    def test_a_check_lease_cannot_be_resized(self) -> None:
+        self.assertEqual(self.floor_acquire("check-1", 8, check_class=True).returncode, 0)
+        resized = self.run_cli("resize", "--id", "check-1", "--cores", "4",
+                               "--capacity", "26", "--capacity-mem-mb", "0", check=False)
+        self.assertEqual(resized.returncode, 64, resized.stdout)
+        self.assertEqual(json.loads(resized.stdout)["reason"], "check_lease_not_resizable")
+
     def test_vm_requests_never_take_a_check_lease(self) -> None:
         self.acquire("gate", 26, capacity=26, reserved=14, priority="gate")
         vm = self.floor_acquire("vm-1", 4, check_class=True, kind="tart-macos-vm")

@@ -2400,6 +2400,12 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             return {"ok": False, "reason": "unknown_lease", "id": args.id,
                     "reaped": reaped_summary(reaped),
                     "problems": problem_summary(problems)}, 1
+        if is_check(record):
+            # Its core is uncharged and its pool is fixed: a check stays 1 core.
+            write_records(store_dir, active)
+            return {"ok": False, "reason": "check_lease_not_resizable", "id": args.id,
+                    "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems)}, 64
         if getattr(args, "priority", None) is not None:
             priority, priority_class = parse_priority(args.priority)
         else:
