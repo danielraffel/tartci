@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run one build command under a tartci core lease instead of a load-average gate.
 #
-#   leased-build.sh [--cores N] [--wait-secs S] [--class background|interactive] -- <command...>
+#   leased-build.sh [--cores N] [--wait-secs S] [--class background|interactive|check] -- <command...>
 #
 # The lease queues: it waits up to --wait-secs (default 3600) for cores rather
 # than refusing, so callers need no retry loop. The command runs with
@@ -11,6 +11,9 @@
 # yields to gate VMs. The lease is heartbeated, bound to this process and
 # released on exit, including on error or interrupt. Commands that take their
 # own lease (pulp build, governed-build.sh) and nested calls run as is.
+#
+# --class check is for git/Python checks: it takes 1 core from the host's small
+# check pool and never queues behind compiles. It ignores --cores.
 #
 # Use --class interactive (or LEASED_BUILD_CLASS=interactive) for critical-path
 # work only. tartci does not order waiting builds; a waiting acquire retries
@@ -29,9 +32,9 @@ while [ "$#" -gt 0 ]; do
     *) break ;;
   esac
 done
-[ "$#" -gt 0 ] || { echo "leased-build: usage: leased-build.sh [--cores N] [--wait-secs S] [--class background|interactive] -- <command...>" >&2; exit 2; }
+[ "$#" -gt 0 ] || { echo "leased-build: usage: leased-build.sh [--cores N] [--wait-secs S] [--class background|interactive|check] -- <command...>" >&2; exit 2; }
 
-case "$class" in background|interactive) ;; *) echo "leased-build: --class must be background or interactive" >&2; exit 2 ;; esac
+case "$class" in background|interactive|check) ;; *) echo "leased-build: --class must be background, interactive or check" >&2; exit 2 ;; esac
 
 # Never nest leases: a command that takes its own tartci lease, or a call made
 # inside another leased-build, runs as is. A lease inside a lease double-counts
@@ -49,8 +52,10 @@ tartci="$(command -v tartci || true)"
 # Interactive builds get the larger interactive share at default QoS and can
 # borrow idle gate reserve; use it for critical-path work only.
 floor_arg=""; [ "$class" = background ] && floor_arg="--allow-floor"
+min_cores=2
+if [ "$class" = check ]; then cores=1; min_cores=1; fi
 id="leased-build-$(hostname -s)-$$-$(date +%s)"
-out="$("$tartci" leases acquire --id "$id" --cores "$cores" --min-cores 2 \
+out="$("$tartci" leases acquire --id "$id" --cores "$cores" --min-cores "$min_cores" \
   --priority build --class "$class" $floor_arg --kind agent-build --owner "${USER:-agent}" \
   --label "$(basename "$PWD")" --pid "$$" --wait-secs "$wait_secs" --json 2>/dev/null)" || true
 granted="$(printf '%s' "$out" | python3 -c 'import json,sys
@@ -64,8 +69,9 @@ if ! [[ "$granted" =~ ^[0-9]+$ ]] || [ "$granted" -lt 1 ]; then
   "$tartci" leases release --id "$id" --json >/dev/null 2>&1 || true
   exit 75
 fi
-# Heartbeat so a long build is not reported as a stale lease.
-( while kill -0 "$$" 2>/dev/null; do sleep 60; "$tartci" leases heartbeat --id "$id" --json >/dev/null 2>&1 || true; done ) &
+# Heartbeat so a long build is not reported as a stale lease. Its output is
+# detached so a caller capturing ours does not wait for the loop to exit.
+( while kill -0 "$$" 2>/dev/null; do sleep 60; "$tartci" leases heartbeat --id "$id" --json >/dev/null 2>&1 || true; done ) >/dev/null 2>&1 &
 hb=$!
 trap 'kill "$hb" 2>/dev/null || true; "$tartci" leases release --id "$id" --json >/dev/null 2>&1 || true' EXIT
 echo "leased-build: lease $id granted $granted cores ($mode)" >&2
