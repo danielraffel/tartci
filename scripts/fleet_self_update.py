@@ -628,7 +628,7 @@ def guard_receipt_ts(state_dir: Path) -> float | None:
     return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None
 
 
-def stall_since(state_dir: Path) -> str | None:
+def stall_since(state_dir: Path, now: float | None = None) -> str | None:
     """The start of the launchd timer-stall episode the interval guard has
     open, or None when there is none, or the receipt is missing, stale or
     unreadable.
@@ -640,7 +640,7 @@ def stall_since(state_dir: Path) -> str | None:
     no guard writes, and the receipt goes stale."""
     try:
         import launchd_interval_guard as guard  # noqa: PLC0415 - sibling module
-        value = guard.status(guard_dir(state_dir))
+        value = guard.status(guard_dir(state_dir), now=now)
     except Exception:  # noqa: BLE001 - an unreadable guard reports no stall
         return None
     if value.get("state") != "stalled":
@@ -2550,18 +2550,29 @@ def close_launcher_probe_alert(cfg: Config) -> None:
 
 
 def lane_spawn_alert(cfg: Config, me: str, target: str, failures: list[str], *,
-                     rolled_back: bool, lanes_down: bool, now: float) -> None:
+                     rolled_back: bool, pool_state: str, now: float) -> None:
     """One issue when an update during a launchd timer stall could not bring
-    its lanes back with demand spawns. Best effort: never raises."""
+    its lanes (or the interval guard) back with demand spawns, or left the
+    host off, where nothing retries. Best effort: never raises."""
     if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
         return
     try:
         import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
         since = _iso(now)
-        if lanes_down:
+        if pool_state == LANES_DOWN:
             title = f"[tartci] {me}: lanes NOT RUNNING after a self-update during a launchd stall"
             outcome = ("The pool is on but at least one lane is not running, and the rollback "
                        "could not start it either.")
+        elif pool_state == GUARD_DOWN:
+            title = (f"[tartci] {me}: interval guard NOT RUNNING after a self-update during a "
+                     "launchd stall")
+            outcome = ("The lanes run, but no supervisor is running the interval guard, so "
+                       "nothing will restart a lane or timer that stops.")
+        elif pool_state not in ("on", "undrained"):
+            title = f"[tartci] {me} left {pool_state.upper()} by a self-update during a launchd stall"
+            outcome = ("Nothing retries `pool on` by itself: with the pool off no supervisor "
+                       "runs the guard, and launchd starts neither the watchdog nor self-update. "
+                       "Run `tartci pool on` on the host.")
         elif rolled_back:
             title = f"[tartci] {me}: self-update rolled back, lanes did not start during a launchd stall"
             outcome = (f"Self-update rolled back from {target[:12]}; the previous generation's "
@@ -2572,8 +2583,8 @@ def lane_spawn_alert(cfg: Config, me: str, target: str, failures: list[str], *,
         body = "\n".join([
             "## What happened",
             f"`{me}`'s launchd is in a timer stall: it starts no job on its own, only "
-            "`launchctl kickstart`. Self-update turned the pool on and kickstarted every lane, "
-            f"and a lane did not run within {LANE_SPAWN_TIMEOUT_SECONDS} s. {outcome}", "",
+            "`launchctl kickstart`. Self-update did not get the host back to serving with "
+            f"its lanes and guard running. {outcome}", "",
             "## Evidence",
             *[f"- {failure[:400]}" for failure in failures[-3:]],
             "- the self-update receipt's `demand-spawn` steps under "
@@ -4295,11 +4306,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
 # The pool is on but its lanes did not start: a launchd stall refused them and
 # demand spawns did not bring them back within LANE_SPAWN_TIMEOUT_SECONDS.
 LANES_DOWN = "on-lanes-not-running"
+# The pool is on and its lanes run, but no supervisor runs the interval guard,
+# so in the stall nothing would restart a lane or a timer that stops.
+GUARD_DOWN = "on-guard-not-running"
 
 
 def _state_words(state: str) -> str:
     return {"on": "on", "undrained": "serving again (undrained)",
-            LANES_DOWN: "ON but its lanes are NOT RUNNING"}.get(state, state.upper())
+            LANES_DOWN: "ON but its lanes are NOT RUNNING",
+            GUARD_DOWN: "ON but its interval guard is NOT RUNNING"}.get(state, state.upper())
 
 
 def _same_source_bytes(cfg: Config) -> bool:
@@ -4621,10 +4636,16 @@ class Run:
         # Latched: once a launchd timer stall is seen, every pool on in this
         # run (forward, rollback, recovery) demand-spawns its lanes. The guard
         # stops writing at pool off, so a later read would find no stall.
-        self.stall: str | None = stall_since(cfg.state_dir)
+        self.stall: str | None = stall_since(cfg.state_dir, sys_.now())
         self.stopped_lanes: list[str] = []
+        # Why the last pool on's lanes or guard did not come back, and which
+        # pool state that leaves (LANES_DOWN or GUARD_DOWN).
         self.spawn_failure: str | None = None
+        self.spawn_state: str | None = None
         self.spawn_failures: list[str] = []
+        # Set once launchd's SIGKILL is pending: demand spawns kick once and
+        # never wait.
+        self.terminating = False
         receipt.value.update(approval=str(approval) if approval else None,
                              pin_path=str(self.pin_path) if self.pin_path else None)
 
@@ -4767,7 +4788,7 @@ class Run:
         self.phase = "off"
         self._latch_stall()
         off = tartci(cfg, sys_, "pool", "off", *self.flag)
-        self._record_stopped(off.text)
+        self._record_stopped(off.out)
         if off.rc in POOL_OFF_REFUSALS:
             # pool off checked a precondition and stopped nothing (on m3 the
             # capacity census timed out). The drain is undone by the recovery,
@@ -4798,7 +4819,9 @@ class Run:
         self.phase = "pool-on"
         if not self._pool_on():
             if self.spawn_failure:
-                raise Failed(f"lanes did not start after pool on: {self.spawn_failure}")
+                what = ("the interval guard did not come back" if self.spawn_state == GUARD_DOWN
+                        else "lanes did not start")
+                raise Failed(f"{what} after pool on: {self.spawn_failure}")
             if self.approval is not None and LAUNCH_PROBE_FAILED.search(
                     getattr(self, "pool_on_text", "") or ""):
                 raise LauncherConsent(self.pool_on_text)
@@ -5105,7 +5128,7 @@ class Run:
         seen running. False when pool on failed, or when it succeeded and the
         lanes did not start: then `spawn_failure` says why and pool on is not
         retried (the pool is on; reinstalling would not start a lane)."""
-        self.spawn_failure = None
+        self.spawn_failure = self.spawn_state = None
         for attempt in range(1, self.POOL_ON_ATTEMPTS + 1):
             args = ["pool", "on"]
             if restore_receipt:
@@ -5117,10 +5140,12 @@ class Run:
                                   ("; restored prior receipted serving set without fresh relay proof"
                                    if restore_receipt else ""))
                 if self.stall:
-                    failure = self._demand_spawn(on.text)
+                    # stdout: Result.text is stderr whenever stderr is not
+                    # empty, and the lane lines are on stdout.
+                    failure = self._demand_spawn(on.out)
                     if failure:
-                        self.spawn_failure = failure
-                        self.spawn_failures.append(failure)
+                        self.spawn_failure, self.spawn_state = failure
+                        self.spawn_failures.append(self.spawn_failure)
                         return False
                 return True
             self.receipt.step("pool-on", f"attempt {attempt} failed (exit {on.rc}): {on.text[:300]}",
@@ -5133,7 +5158,7 @@ class Run:
     def _latch_stall(self) -> None:
         """Read the stall again right before a pool off, while the guard runs."""
         if not self.stall:
-            self.stall = stall_since(self.cfg.state_dir)
+            self.stall = stall_since(self.cfg.state_dir, self.sys.now())
         if self.stall and not self.receipt.value.get("launchd_stall"):
             self.receipt.value["launchd_stall"] = self.stall
             self.receipt.step("launchd-stall", f"launchd timer stall open since {self.stall}: "
@@ -5156,20 +5181,26 @@ class Run:
         runs = fields.get("runs", "")
         return running, int(runs) if runs.isdigit() else None
 
-    def _demand_spawn(self, on_text: str) -> str | None:
+    def _demand_spawn(self, on_out: str) -> tuple[str, str] | None:
         """Start every lane `pool on` enabled with `launchctl kickstart` and
-        wait until each runs (pid present, or its run count moved), then until
-        the interval guard, which lives in the lane supervisors, writes a pass
-        again. None on success, else why not.
+        wait until each is running, then until the interval guard, which lives
+        in the lane supervisors, writes a pass again. None on success, else
+        (why not, the pool state that leaves: LANES_DOWN or GUARD_DOWN).
 
-        Plain `kickstart`, never `-k`: it is a no-op on a lane already running
-        and never kills one mid-job.
+        A lane counts only while it runs (a pid): a supervisor that started
+        and exited serves nothing, and in the stall its respawn pends, so it
+        is kicked again on every poll. Plain `kickstart`, never `-k`: it is a
+        no-op on a lane already running and never kills one mid-job. Once
+        launchd's SIGKILL is pending (`terminating`) each lane is kicked once
+        and nothing is waited for.
         """
-        enabled = list(dict.fromkeys(_ENABLED.findall(on_text or "")))
+        enabled = list(dict.fromkeys(_ENABLED.findall(on_out or "")))
         if not enabled:
             if self.stopped_lanes:
-                return (f"pool on named no lane it enabled, but this update stopped "
-                        f"{len(self.stopped_lanes)}: {', '.join(self.stopped_lanes)}")
+                failure = (f"pool on named no lane it enabled, but this update stopped "
+                           f"{len(self.stopped_lanes)}: {', '.join(self.stopped_lanes)}")
+                self.receipt.step("demand-spawn", failure, ok=False)
+                return failure, LANES_DOWN
             self.receipt.step("demand-spawn", "pool on enabled no lane and none was stopped")
             return None
         skipped = [label for label in self.stopped_lanes if label not in enabled]
@@ -5178,38 +5209,50 @@ class Run:
                               f"pool on (left as it is): {', '.join(skipped)}")
         started = self.sys.now()
         guard_before = guard_receipt_ts(self.cfg.state_dir)
-        first: dict[str, int | None] = {}
-        pending = list(enabled)
         kicks: dict[str, int] = {}
         kick_errors: dict[str, str] = {}
+
+        def kick(label: str) -> None:
+            result = self.sys.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
+                                  timeout=15)
+            kicks[label] = kicks.get(label, 0) + 1
+            if result.rc != 0:
+                kick_errors[label] = f"exit {result.rc}: {result.text.strip()[:120]}"
+
+        if self.terminating:
+            for label in enabled:
+                kick(label)
+            self.receipt.step("demand-spawn", f"kicked {len(enabled)} lanes once; not verified "
+                              "(terminated, launchd's SIGKILL is pending)",
+                              ok=not kick_errors)
+            return None
+        pending = list(enabled)
+        exited: dict[str, int] = {}
         deadline = started + LANE_SPAWN_TIMEOUT_SECONDS
         while True:
             still = []
             for label in pending:
                 running, runs = self._lane_state(label)
-                first.setdefault(label, runs)
-                base = first[label]
-                if running or (runs is not None and base is not None and runs > base):
+                if running:
                     continue
+                if runs is not None:
+                    exited[label] = runs
                 still.append(label)
             pending = still
             if not pending or self.sys.now() >= deadline:
                 break
             for label in pending:
-                kick = self.sys.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
-                                    timeout=15)
-                kicks[label] = kicks.get(label, 0) + 1
-                if kick.rc != 0:
-                    kick_errors[label] = f"exit {kick.rc}: {kick.text.strip()[:120]}"
+                kick(label)
             self.sys.sleep(LANE_SPAWN_POLL_SECONDS)
         if pending:
             detail = "; ".join(f"{label} ({kicks.get(label, 0)} kicks"
+                               + (f", runs {exited[label]}" if label in exited else "")
                                + (f", last {kick_errors[label]}" if label in kick_errors else "")
                                + ")" for label in pending)
             failure = (f"{len(pending)} of {len(enabled)} lanes not running "
                        f"{LANE_SPAWN_TIMEOUT_SECONDS} s after demand spawns: {detail}")
             self.receipt.step("demand-spawn", failure, ok=False)
-            return failure
+            return failure, LANES_DOWN
         self.receipt.step("demand-spawn", f"{len(enabled)} lanes running after pool on "
                           f"({sum(kicks.values())} kickstarts)")
         if guard_before is None:
@@ -5228,7 +5271,7 @@ class Run:
                            f"{GUARD_BACK_TIMEOUT_SECONDS} s of the lanes starting (last pass "
                            f"{_iso(ts) if ts else 'never'}): no lane supervisor is running it")
                 self.receipt.step("demand-spawn", failure, ok=False)
-                return failure
+                return failure, GUARD_DOWN
             self.sys.sleep(GUARD_BACK_POLL_SECONDS)
 
     def _reinstall_previous(self, *, failed_source_env: dict[str, str | None] | None = None) -> None:
@@ -5314,9 +5357,10 @@ class Run:
         if self._pool_on(restore_receipt=restore_receipt):
             return "on"
         if self.spawn_failure:
-            # The pool is on; its lanes did not start. A reinstall would not
-            # start them either, so the host is reported as it is and alerted.
-            return LANES_DOWN
+            # The pool is on; its lanes or guard did not come back. A reinstall
+            # would not start them either, so the host is reported as it is
+            # and alerted.
+            return self.spawn_state or LANES_DOWN
         state = self._pool_state()
         if not allow_reinstall:
             return self._undrain_or(state)
@@ -5354,7 +5398,7 @@ class Run:
             return self._pool_state()
         if self._pool_on(restore_receipt=restore_receipt):
             return "on"
-        return LANES_DOWN if self.spawn_failure else self._pool_state()
+        return (self.spawn_state or LANES_DOWN) if self.spawn_failure else self._pool_state()
 
     def _undrain_or(self, state: str) -> str:
         if state != "draining":
@@ -5378,6 +5422,7 @@ class Run:
             return self._recover(reason, **kwargs)
         except BaseException as exc:  # noqa: BLE001
             on = False
+            self.terminating = True
             try:
                 self._repin_to_live()
                 if self._running() == self.previous:
@@ -5385,7 +5430,9 @@ class Run:
                 on = self._pool_on()
             except BaseException:  # noqa: BLE001
                 pass
-            return self._terminal("failed", pool_state="on" if on else self._pool_state_quiet(), message=f"{reason}; RECOVERY INTERRUPTED "
+            state = ("on" if on else (self.spawn_state or LANES_DOWN) if self.spawn_failure
+                     else self._pool_state_quiet())
+            return self._terminal("failed", pool_state=state, message=f"{reason}; RECOVERY INTERRUPTED "
                                   f"({type(exc).__name__}: {exc}); host is "
                                   f"{'on' if on else 'possibly OFF'} running "
                                   f"{str(self._running())[:12]}; run tartci fleet-macos "
@@ -5497,6 +5544,7 @@ class Run:
         if terminated:
             # launchd will SIGKILL soon: no reinstall, no rollback. Get the
             # host serving and say exactly what it runs.
+            self.terminating = True
             self._repin_to_live()
             state = self._ensure_on(allow_reinstall=False)
             return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
@@ -5538,7 +5586,7 @@ class Run:
             self._wait_idle()
             self._latch_stall()
             off = tartci(cfg, sys_, "pool", "off", *self.flag)
-            self._record_stopped(off.text)
+            self._record_stopped(off.out)
             if off.rc != 0:
                 raise Failed(f"pool off for rollback failed: {off.text}")
             self._reinstall_previous()
@@ -5546,6 +5594,9 @@ class Run:
             rollback_pin_ok = True
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
             if not self._pool_on(restore_receipt=True):
+                if self.spawn_failure:
+                    raise Failed("the rollback's pool on succeeded but its lanes did not come "
+                                 f"back: {self.spawn_failure}")
                 raise Failed("pool on after rollback failed")
             rollback_pool_on_ok = True
             verify(cfg, sys_, self.previous, self.receipt)
@@ -5553,8 +5604,15 @@ class Run:
             # Whatever the rollback's own failure, capacity comes back: a
             # failed verification is never a reason to leave the host out.
             self._repin_to_live()
-            state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated),
-                                    restore_receipt=True)
+            if isinstance(exc, Terminated):
+                self.terminating = True
+            if self.spawn_failure and isinstance(exc, Failed) and rollback_install_ok:
+                # The rollback's pool on ran and its demand spawns already
+                # waited their full bound: another pool on would wait again.
+                state = self.spawn_state or LANES_DOWN
+            else:
+                state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated),
+                                        restore_receipt=True)
             rollback_verify_timeout = (
                 isinstance(exc, Failed)
                 and "verification of" in str(exc)
@@ -5572,11 +5630,19 @@ class Run:
 
     def _terminal(self, status: str, message: str, *, pool_state: str = "on") -> int:
         self.receipt.value["pool_state"] = pool_state
-        self.receipt.value["host_off"] = pool_state not in ("on", "undrained", LANES_DOWN)
-        if self.spawn_failures:
-            self.receipt.value["lanes_not_started"] = self.spawn_failures[-1]
-            lane_spawn_alert(self.cfg, self.me, self.target, self.spawn_failures,
-                             rolled_back=status == "rolled_back", lanes_down=pool_state == LANES_DOWN,
+        self.receipt.value["host_off"] = pool_state not in ("on", "undrained", LANES_DOWN,
+                                                            GUARD_DOWN)
+        if self.stall and self.receipt.value["host_off"]:
+            # No supervisor runs with the pool off, so no guard either, and in
+            # a stall launchd starts neither the watchdog nor self-update:
+            # nothing will retry pool on by itself.
+            message = (f"{message}; launchd timers are STALLED (since {self.stall}), so nothing "
+                       "retries pool on by itself: run `tartci pool on` on the host")
+        if self.spawn_failures or (self.stall and self.receipt.value["host_off"]):
+            if self.spawn_failures:
+                self.receipt.value["lanes_not_started"] = self.spawn_failures[-1]
+            lane_spawn_alert(self.cfg, self.me, self.target, self.spawn_failures or [message],
+                             rolled_back=status == "rolled_back", pool_state=pool_state,
                              now=self.sys.now())
         self.receipt.step(status, message, ok=False)
         self.receipt.finish(status, message)

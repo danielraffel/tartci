@@ -3148,11 +3148,14 @@ LANES = ("com.danielraffel.tartci.tart-runner-macos-fleet.pulp-gate-01",
 class StalledLaunchdSystem(FakeSystem):
     """FakeSystem over a launchd gui domain in a timer stall (m3, 2026-11-18).
 
-    The lanes are a small job table. `pool off` boots them out; `pool on`
-    loads them again, and in a stalled domain that load is a non-demand spawn
-    that never starts, the way `pended nondemand spawn` agents sat on m3. Only
-    `launchctl kickstart`, a demand spawn, starts a lane. A started lane's
-    supervisor runs the interval guard, which writes a pass.
+    The lanes are a small job table. `pool off` boots them out. `pool on`
+    loads them and kickstarts each, as cmd_pool does; the new supervisor then
+    exits 75 once (its restart contract) and in a stalled domain that KeepAlive
+    respawn is a non-demand spawn that never starts, the way `pended
+    nondemand spawn` agents sat on m3. Only `launchctl kickstart`, a demand
+    spawn, starts a lane again. A running lane's supervisor runs the interval
+    guard, which writes a pass. A lane in `kick_fails` starts and exits at
+    once on every kick: its run count moves, it never stays running.
     """
 
     def __init__(self, home: Path, *, guard_dir: Path, **kw) -> None:
@@ -3165,6 +3168,15 @@ class StalledLaunchdSystem(FakeSystem):
         self.kick_fails: dict[str, set[str]] = {}
         self.kickstarts: list[str] = []
         self.guard_runs = True     # a started supervisor runs the guard
+        self.on_stderr = ""        # what a successful pool on/off also writes to stderr
+
+    def _kick(self, label: str) -> None:
+        generation = "previous" if self.running() == INSTALLED else "target"
+        lane = self.lanes[label]
+        if generation in self.kick_fails.get(label, set()):
+            lane.update(runs=lane["runs"] + 1, running=False, pid=None)  # ran and exited
+        else:
+            self._start(label)
 
     def _start(self, label: str) -> None:
         lane = self.lanes[label]
@@ -3197,11 +3209,8 @@ class StalledLaunchdSystem(FakeSystem):
             self.kickstarts.append(label)
             if label not in self.lanes or not self.lanes[label]["loaded"]:
                 return su.Result(113, "", "Could not find service")
-            generation = "previous" if self.running() == INSTALLED else "target"
-            if generation in self.kick_fails.get(label, set()):
-                return ok()  # accepted, and the lane exits before it runs
             if not self.lanes[label]["running"]:
-                self._start(label)
+                self._kick(label)
             return ok()
         result = super().run(argv, cwd=cwd, env=env, timeout=timeout)
         if a[:3] == ["./tartci", "pool", "off"] and "--plan" not in a and result.rc == 0:
@@ -3210,14 +3219,18 @@ class StalledLaunchdSystem(FakeSystem):
                 if lane["loaded"]:
                     text.append(f"  booted out {label}")
                 lane.update(loaded=False, running=False, pid=None)
-            return su.Result(0, "\n".join(text + [result.out]))
+            return su.Result(0, "\n".join(text + [result.out]), self.on_stderr)
         if a[0].endswith(".local/bin/tartci") and a[1:3] == ["pool", "on"] and result.rc == 0:
             for label, lane in self.lanes.items():
                 lane["loaded"] = True
-                if not self.stalled and not lane["running"]:
-                    self._start(label)  # a healthy domain starts a loaded KeepAlive job
+                if lane["running"]:
+                    continue
+                # pool on's own kickstart; the supervisor exits 75 once.
+                lane.update(runs=lane["runs"] + 1, running=False, pid=None)
+                if not self.stalled:
+                    self._kick(label)  # a healthy domain respawns a KeepAlive job
             return su.Result(0, "\n".join(f"  enabled {label}" for label in self.lanes)
-                             + "\nstate: on; participation: 1\nopted IN")
+                             + "\nstate: on; participation: 1\nopted IN", self.on_stderr)
         return result
 
 
@@ -3233,10 +3246,11 @@ class StallSafeUpdateTests(Base):
         self.sys = StalledLaunchdSystem(self.home, guard_dir=self.guard_path)
 
     def guard(self, *, active=True, age=60, directory=None):
+        # On the fake clock, which the run reads the guard with.
         directory = directory or self.guard_path
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "status.json").write_text(json.dumps({
-            "ts": time.time() - age, "agents_checked": 18, "errors": [], "kicked": [],
+            "ts": self.sys.clock - age, "agents_checked": 18, "errors": [], "kicked": [],
             "stalled": [{"label": self.SELF, "interval": 1800}], "paused": [],
             "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
 
@@ -3314,12 +3328,6 @@ class StallSafeUpdateTests(Base):
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertTrue(any("lanes NOT RUNNING" in t for t in opened), self.issues)
 
-    def test_a_guard_that_does_not_come_back_fails_the_update(self):
-        self.guard()
-        self.sys.guard_runs = False
-        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
-        self.assertIn("interval guard wrote no pass", self.last()["error"])
-
     def test_pool_on_naming_no_lane_after_pool_off_stopped_some_fails_closed(self):
         self.guard()
         original = self.sys.run
@@ -3357,19 +3365,72 @@ class StallSafeUpdateTests(Base):
         self.assertNotIn("self_update_paused", fleet_doctor.load_reasons())
 
     def test_stall_since_reads_only_a_live_episode(self):
-        self.assertIsNone(su.stall_since(self.cfg.state_dir))
+        now = self.sys.clock
+        self.assertIsNone(su.stall_since(self.cfg.state_dir, now))
         for name, kwargs, want in (("live", {}, su._iso(self.STARTED)),
                                    ("no active episode", {"active": False}, None),
                                    ("stale guard receipt", {"age": 10 * 3600}, None)):
             with self.subTest(case=name):
                 self.guard(**kwargs)
-                self.assertEqual(su.stall_since(self.cfg.state_dir), want)
+                self.assertEqual(su.stall_since(self.cfg.state_dir, now), want)
         other = self.home / "guard-elsewhere"
         self.guard(directory=other)
         (self.guard_path / "status.json").unlink()
         with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
-            self.assertIsNotNone(su.stall_since(self.cfg.state_dir))
-        self.assertIsNone(su.stall_since(self.cfg.state_dir))
+            self.assertIsNotNone(su.stall_since(self.cfg.state_dir, now))
+        self.assertIsNone(su.stall_since(self.cfg.state_dir, now))
+
+    def test_stderr_from_a_successful_pool_on_and_off_does_not_hide_the_lanes(self):
+        # Result.text is stderr whenever there is any; the lane lines are on
+        # stdout. A warning on stderr must neither skip the demand spawns nor
+        # fail a good update.
+        self.guard()
+        self.sys.on_stderr = "warning: something unrelated\n"
+        self.assertUpdated(self.scheduled())
+        self.assertLanesRunning()
+        self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
+
+    def test_a_terminated_run_kicks_each_lane_once_and_does_not_wait(self):
+        # launchd SIGKILLs 120 s (ExitTimeOut) after its SIGTERM; recovery
+        # must not spend that on the spawn and guard waits.
+        self.guard()
+        self.sys.guard_runs = False
+        state = {}
+
+        def on_sleep(seconds) -> None:
+            attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+            steps = json.loads(attempts[-1].read_text()).get("steps", []) if attempts else []
+            if "at" not in state and any(step.get("step") == "demand-spawn" for step in steps):
+                # Inside the guard wait, after the lanes were seen running.
+                state["at"] = self.sys.clock
+                raise su.Terminated("SIGTERM")
+        self.sys.on_sleep = on_sleep
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        self.assertLess(self.sys.clock - state["at"], 30)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertIn("not verified (terminated", " ".join(
+            step["detail"] for step in receipt["steps"] if step["step"] == "demand-spawn"))
+
+    def test_a_host_left_off_during_a_stall_says_nothing_retries(self):
+        self.guard()
+        self.sys.install_rcs = [1]
+        self.sys.on_rc = 1
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        self.assertIn("HOST LEFT OFF", self.last()["error"])
+        self.assertIn("nothing retries pool on by itself", self.last()["error"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("during a launchd stall" in t for t in opened), self.issues)
+
+    def test_a_guard_that_does_not_come_back_is_reported_as_the_guard(self):
+        self.guard()
+        self.sys.guard_runs = False
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        last = self.last()
+        self.assertEqual(last["pool_state"], su.GUARD_DOWN)
+        self.assertIn("interval guard is NOT RUNNING", last["error"])
+        self.assertLanesRunning()
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("interval guard NOT RUNNING" in t for t in opened), self.issues)
 
 
 class AgentTemplateTests(unittest.TestCase):

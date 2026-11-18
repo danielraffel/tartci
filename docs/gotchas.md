@@ -92,12 +92,17 @@ launchd would pend. That left m3 not updating for days (from 2026-10-05, 44
 commits behind; again from 2026-11-18T07:11Z), with a reboot as the only
 remedy. Now an update reads the stall before its `pool off` and keeps that
 answer for the whole run: after every `pool on` (forward, rollback, recovery)
-it kickstarts each lane `pool on` enabled, waits up to 120 s for each to run
-(a pid, or its run count moving), re-kicking one that has not, and then waits
-for the interval guard to write a pass again. A lane that does not start fails
-the update and rolls back through the same path; if the rollback's lanes do
-not start either, the host is left with its pool on, reported as lanes not
-running, and an issue opens (`self_update_lanes_not_started`). The receipt's
+it kickstarts each lane `pool on` enabled, waits up to 120 s for each to be
+running (a pid; a supervisor that started and exited 75 pends again and is
+re-kicked), and then waits up to 180 s for the interval guard to write a pass
+again. A lane or guard that does not come back fails the update and rolls back
+through the same path; if the rollback's do not come back either, the host is
+left with its pool on, reported as `on-lanes-not-running` or
+`on-guard-not-running` (never reinstalled for it), and an issue opens
+(event `self_update_lanes_not_started`). A run that leaves the pool OFF during
+a stall says that nothing will retry `pool on` (no supervisor, so no guard, and
+launchd starts neither the watchdog nor self-update) and opens the same issue.
+A terminated run kicks each lane once and does not wait. The receipt's
 `launchd-stall` and `demand-spawn` steps show each step.
 
 **Remedy: nothing; the host heals itself.** The guard keeps every timer

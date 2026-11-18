@@ -226,9 +226,10 @@ def alert_text(peer: str, target: str, me: str, info: Dict[str, Any],
         f"{peer}'s launchd has not started its timer jobs on its own since {verdict['since']} "
         f"({verdict['hours']} h). "
         + (f"The guard lists self-update as paused: {peer} runs a tartci from before "
-           "self-update was made stall-safe, so it is not updating. One "
-           f"`launchctl kickstart gui/$(id -u)/com.danielraffel.tartci.self-update` on {peer} "
-           "starts the update that installs the fix."
+           "self-update was made stall-safe, so it is not updating. On a sealed-launcher host "
+           "one `launchctl kickstart gui/$(id -u)/com.danielraffel.tartci.self-update` starts "
+           "a run that hands off to main's code and installs the fix; elsewhere run "
+           "`tartci fleet-macos self-update --apply` there by hand."
            if held else "The guard is starting the timers, self-update included."),
         f"Run: ssh {target} 'tartci doctor fleet'",
         "Fix: nothing; it heals itself. The guard keeps every timer running for as long as "
