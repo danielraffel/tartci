@@ -3184,8 +3184,12 @@ class StalledLaunchdSystem(FakeSystem):
         if self.guard_runs:
             self.guard_dir.mkdir(parents=True, exist_ok=True)
             receipt = self.guard_dir / "status.json"
-            value = json.loads(receipt.read_text()) if receipt.exists() else {}
+            try:
+                value = json.loads(receipt.read_text())
+            except (OSError, ValueError):
+                value = {}
             value["ts"] = self.clock
+            value["owner_pid"] = lane["pid"]
             receipt.write_text(json.dumps(value))
 
     def run(self, argv, *, cwd=None, env=None, timeout=900):
@@ -3251,6 +3255,7 @@ class StallSafeUpdateTests(Base):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "status.json").write_text(json.dumps({
             "ts": self.sys.clock - age, "agents_checked": 18, "errors": [], "kicked": [],
+            "owner_pid": 100,
             "stalled": [{"label": self.SELF, "interval": 1800}], "paused": [],
             "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
 
@@ -3295,6 +3300,46 @@ class StallSafeUpdateTests(Base):
         self.assertUpdated(self.scheduled())
         self.assertLanesRunning()
         self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
+
+    def assertUnknownGuardDemandSpawns(
+            self, guard_step: str = "interval guard running again") -> None:
+        self.assertUpdated(self.scheduled())
+        self.assertLanesRunning()
+        self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
+        self.assertIn(guard_step, " ".join(
+            step["detail"] for step in self.steps("demand-spawn")))
+
+    def test_missing_guard_demand_spawns_after_pool_on(self):
+        # No guard receipt before pool off (guard disabled or never deployed):
+        # lanes are still demand-spawned, and there is no guard to wait for.
+        self.assertUnknownGuardDemandSpawns("guard check skipped")
+
+    def test_unreadable_guard_demand_spawns_after_pool_on(self):
+        self.guard_path.mkdir(parents=True, exist_ok=True)
+        (self.guard_path / "status.json").write_text("{broken")
+        self.assertUnknownGuardDemandSpawns("guard check skipped")
+
+    def test_stale_guard_demand_spawns_after_pool_on(self):
+        self.guard(age=10 * 3600)
+        self.assertUnknownGuardDemandSpawns()
+
+    def test_old_guard_pass_after_pool_on_does_not_verify_new_supervisors(self):
+        self.guard()
+        self.sys.guard_runs = False
+        original = self.sys.run
+
+        def run(argv, **kw):
+            result = original(argv, **kw)
+            if argv[0].endswith(".local/bin/tartci") and argv[1:3] == ["pool", "on"]:
+                # The old guard can finish a pass after pool on while its
+                # stopped supervisor is exiting.
+                self.guard(age=0)
+            return result
+
+        self.sys.run = run
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["pool_state"], su.GUARD_DOWN)
+        self.assertIn("interval guard is NOT RUNNING", self.last()["error"])
 
     def test_a_lane_that_will_not_start_rolls_back_through_the_same_path_and_alerts(self):
         # The new generation's lane exits before it runs; the previous one's
@@ -3366,10 +3411,10 @@ class StallSafeUpdateTests(Base):
 
     def test_stall_since_reads_only_a_live_episode(self):
         now = self.sys.clock
-        self.assertIsNone(su.stall_since(self.cfg.state_dir, now))
+        self.assertEqual(su.stall_since(self.cfg.state_dir, now), "unknown")
         for name, kwargs, want in (("live", {}, su._iso(self.STARTED)),
                                    ("no active episode", {"active": False}, None),
-                                   ("stale guard receipt", {"age": 10 * 3600}, None)):
+                                   ("stale guard receipt", {"age": 10 * 3600}, "unknown")):
             with self.subTest(case=name):
                 self.guard(**kwargs)
                 self.assertEqual(su.stall_since(self.cfg.state_dir, now), want)
@@ -3378,7 +3423,7 @@ class StallSafeUpdateTests(Base):
         (self.guard_path / "status.json").unlink()
         with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
             self.assertIsNotNone(su.stall_since(self.cfg.state_dir, now))
-        self.assertIsNone(su.stall_since(self.cfg.state_dir, now))
+        self.assertEqual(su.stall_since(self.cfg.state_dir, now), "unknown")
 
     def test_stderr_from_a_successful_pool_on_and_off_does_not_hide_the_lanes(self):
         # Result.text is stderr whenever there is any; the lane lines are on
@@ -3431,6 +3476,16 @@ class StallSafeUpdateTests(Base):
         self.assertLanesRunning()
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertTrue(any("interval guard NOT RUNNING" in t for t in opened), self.issues)
+
+    def test_repeated_lane_failures_keep_one_alert_episode(self):
+        failures = ["lane did not start"]
+        su.lane_spawn_alert(self.cfg, "m1", T_OLD, failures, rolled_back=False,
+                            pool_state=su.LANES_DOWN, now=NOW)
+        su.lane_spawn_alert(self.cfg, "m1", T_OLD, failures, rolled_back=False,
+                            pool_state=su.LANES_DOWN, now=NOW + 3600)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        alert = json.loads((self.cfg.state_dir / "lane-spawn-alert.json").read_text())
+        self.assertEqual(alert["since"], su._iso(NOW))
 
 
 class AgentTemplateTests(unittest.TestCase):
