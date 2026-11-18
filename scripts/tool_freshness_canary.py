@@ -25,8 +25,9 @@ shows it landed and stayed healthy:
     from it;
   - then a health signal. When the canary runs the merge steward (its deploy
     event carries `steward_host: true`), a `tool_steward_verified` for the
-    release recorded after that deploy. Otherwise `canary_soak_hours` (2) on
-    the canary's clock since the deploy.
+    release recorded after that deploy. Otherwise `canary_soak_hours` on
+    the canary's clock since the deploy: the tool's own value (Shipyard 0.5,
+    since its steward stage follows), else 2.
 
 For a tool with a steward check (Shipyard), a host that is neither the canary
 nor a steward host also waits for every published steward host to have
@@ -133,7 +134,7 @@ def rollout(settings: dict) -> dict:
         value = published.get("tool_rollout")
     if not isinstance(value, dict) or not isinstance(value.get("canary"), str) \
             or not value["canary"]:
-        return {"canary": None, "steward_hosts": [],
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
                 "error": f"no tool_rollout canary in {PUBLISHED}"}
     rows = published.get("hosts")
     known = {row["host_id"] for row in rows
@@ -144,10 +145,23 @@ def rollout(settings: dict) -> dict:
     # a required steward and let a release pass after only the canary soak.
     if value["canary"] not in known or not isinstance(hosts, list) or not hosts \
             or any(not isinstance(h, str) or h not in known for h in hosts):
-        return {"canary": None, "steward_hosts": [],
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
                 "error": f"invalid tool_rollout in {PUBLISHED}: canary and a non-empty "
                          "steward_hosts list must name published hosts"}
-    return {"canary": value["canary"], "steward_hosts": hosts, "error": None}
+    # A former canary still applies first while the fleet's TartCI generations
+    # catch up with a canary move: an older generation on a steward host waits
+    # for it, and if it waited in turn for that steward host, neither would
+    # move until TartCI itself had rolled out. Readers wait only for `canary`.
+    former = value.get("former_canaries", [])
+    if not isinstance(former, list) or any(
+            not isinstance(h, str) or h not in known or h == value["canary"] for h in former):
+        # Fail closed like the other roles: dropping a former canary mid-move
+        # would leave a steward host waiting on a canary that waits on it.
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
+                "error": f"invalid tool_rollout in {PUBLISHED}: former_canaries must list "
+                         "published hosts other than the canary"}
+    return {"canary": value["canary"], "steward_hosts": hosts, "former_canaries": former,
+            "error": None}
 
 
 def self_host_id(home: Path, settings: dict) -> str | None:
@@ -221,6 +235,35 @@ def read_host(host_id: str, me: str | None, settings: dict, state: Path, now: fl
     return {"events": _parse_events(rest), "clock": float(first.strip())}
 
 
+def recorded_failure(events: list[dict], tool: str, version: str,
+                     since: float = 0.0) -> str | None:
+    """Why `version` of `tool` failed on this host at or after `since`, or None."""
+    for event in events:
+        at = _epoch(event.get("at"))
+        if event.get("tool") != tool or at is None or at < since:
+            continue
+        kind = event.get("event")
+        if kind == "tool_apply_failed" and event.get("target") == version:
+            return f"recorded tool_apply_failed for {version} at {event['at']}"
+        if kind in ("tool_rolled_back", "tool_steward_failed") and version in (
+                event.get("from"), event.get("version")):
+            return f"recorded {kind} for {version} at {event['at']}"
+        if (kind == "tool_deployed" and event.get("from") == version
+                and event.get("downgrade")):
+            return f"moved back from {version} to {event.get('to')} at {event['at']}"
+    return None
+
+
+def newest_deploy_at(events: list[dict], tool: str, version: str) -> float:
+    """When this host last verifiably moved up to `version` (0 when it never
+    did). An unverified redeploy does not wipe out an earlier failure."""
+    times = [_epoch(e.get("at")) or 0.0 for e in events
+             if e.get("event") == "tool_deployed" and e.get("tool") == tool
+             and e.get("component", "cli") == "cli" and e.get("to") == version
+             and e.get("verify") in ("current", "behind") and not e.get("downgrade")]
+    return max(times, default=0.0)
+
+
 def clearance(events: list[dict], clock: float, tool: str, version: str,
               soak_hours: float, require_steward: bool = False) -> tuple[bool, str]:
     """(whether a host's events clear `version` of `tool`, why).
@@ -237,19 +280,9 @@ def clearance(events: list[dict], clock: float, tool: str, version: str,
     # by the deploy that first moved up to it, so that one starts the clock.
     deploy = ([e for e in deploys if not e.get("downgrade")] or deploys)[-1]
     since = _epoch(deploy["at"]) or 0.0
-    for event in events:
-        at = _epoch(event.get("at"))
-        if event.get("tool") != tool or at is None or at < since:
-            continue
-        kind = event.get("event")
-        if kind == "tool_apply_failed" and event.get("target") == version:
-            return False, f"recorded tool_apply_failed for {version} at {event['at']}"
-        if kind in ("tool_rolled_back", "tool_steward_failed") and version in (
-                event.get("from"), event.get("version")):
-            return False, f"recorded {kind} for {version} at {event['at']}"
-        if (kind == "tool_deployed" and event.get("from") == version
-                and event.get("downgrade")):
-            return False, f"moved back from {version} to {event.get('to')} at {event['at']}"
+    failure = recorded_failure(events, tool, version, since)
+    if failure:
+        return False, failure
     if deploy.get("steward_host") or require_steward:
         for event in events:
             if (event.get("event") == "tool_steward_verified" and event.get("tool") == tool
@@ -283,36 +316,67 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
                       "or set host_class in tool-freshness.toml)")
     if me == canary:
         return newest, f"canary {canary}: applies first"
-    # (host, needs a clean steward tick): the canary, then for a tool with a
-    # steward check every steward host other than this one.
-    # A canary that is also a published steward host must show a clean steward
-    # tick, whatever its own deploy event says: that flag is written by the
-    # canary's checkout, and a stale one there would weaken every reader's gate.
-    required = [(canary, bool(tool.get("steward_check"))
-                 and canary in roles["steward_hosts"])]
-    if tool.get("steward_check"):
-        required += [(host, True) for host in roles["steward_hosts"]
-                     if host not in (me, canary)]
+    if me in roles["former_canaries"]:
+        # Deliberately not gated on the new canary: a host still on the older
+        # generation (the new canary included) waits for this one, so waiting
+        # here could deadlock until TartCI itself rolls out. This is exactly
+        # how the former canary behaved before the move, the steward stage
+        # still guards every host behind it, and while the entry is listed a
+        # rollout pause holds both canaries (docs/runbook.md).
+        return newest, f"former canary {me}: applies first until every host reads canary {canary}"
+    # Each slot is (role, hosts that can clear it). The canary slot comes
+    # first, then for a tool with a steward check every steward host other
+    # than this one. A host needs a clean steward tick when it is a published
+    # steward host, whatever its own deploy event says: that flag is written by
+    # its checkout, and a stale one there would weaken every reader's gate.
+    # While former_canaries is listed, a former canary's deploy clears the
+    # canary slot too: a new canary still on the older TartCI generation waits
+    # for the former canary and for the steward host, so a steward host on the
+    # new generation that waited only for the new canary would wait for a host
+    # waiting on it.
+    stewards = roles["steward_hosts"] if tool.get("steward_check") else []
+    slots = [("canary", [canary] + [h for h in roles["former_canaries"] if h != me])]
+    slots += [("steward host", [host]) for host in stewards if host not in (me, canary)]
     reads = context.setdefault("reads", {})
-    soak = float(settings.get("canary_soak_hours", CANARY_SOAK_HOURS))
-    for host, _ in required:
-        if host not in reads:
-            reads[host] = read_host(host, me, settings, state, now, run)
-        if "error" in reads[host]:
-            role = "canary" if host == canary else "steward host"
-            return None, f"waiting for {role} {host}: unreadable ({reads[host]['error']})"
+    # A host's tool-freshness.toml value wins, then the tool's own default.
+    soak = float(settings.get("canary_soak_hours",
+                              tool.get("canary_soak_hours", CANARY_SOAK_HOURS)))
+    for role, hosts in slots:
+        for host in hosts:
+            if host not in reads:
+                reads[host] = read_host(host, me, settings, state, now, run)
+        if all("error" in reads[host] for host in hosts):
+            return None, (f"waiting for {role} {hosts[0]}: unreadable "
+                          f"({reads[hosts[0]]['error']})")
     why = ""
     for candidate in reversed(soaked):
         version = str(candidate.get("version"))
         notes, blocked = [], None
-        for host, steward in required:
-            ok, why_one = clearance(reads[host]["events"], reads[host]["clock"], name, version,
-                                    soak, require_steward=steward)
-            role = "canary" if host == canary else "steward host"
-            if not ok:
-                blocked = f"{role} {host}: {candidate.get('tag')} {why_one}"
+        for role, hosts in slots:
+            first = None
+            # A former canary stands in only for a current canary that is
+            # unreadable or has not proved the release yet. A failure recorded
+            # on the current canary blocks, whatever the former one shows.
+            current = reads[hosts[0]]
+            failed = None if len(hosts) == 1 or "error" in current else recorded_failure(
+                current["events"], name, version,
+                newest_deploy_at(current["events"], name, version))
+            if failed:
+                blocked = f"{role} {hosts[0]}: {candidate.get('tag')} {failed}"
                 break
-            notes.append(f"{role} {host}: {why_one}")
+            for host in hosts:
+                if "error" in reads[host]:
+                    continue
+                ok, why_one = clearance(reads[host]["events"], reads[host]["clock"], name,
+                                        version, soak, require_steward=host in stewards)
+                label = role if host == hosts[0] else "former canary"
+                if ok:
+                    notes.append(f"{label} {host}: {why_one}")
+                    break
+                first = first or f"{label} {host}: {candidate.get('tag')} {why_one}"
+            else:
+                blocked = first or f"{role} {hosts[0]}: unreadable"
+                break
         if blocked is None:
             return candidate, "cleared by " + "; ".join(notes)
         if candidate is newest:

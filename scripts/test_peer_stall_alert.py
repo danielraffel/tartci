@@ -627,7 +627,7 @@ def freshness(state: str = "behind", releases: int = 3, behind_since: str = "202
 
 
 class ShipyardDrift(unittest.TestCase):
-    """A host more than one release or 6 h behind the latest Shipyard is reported."""
+    """A host more than one release or 3 h behind the latest Shipyard is reported."""
 
     setUp = PeerStall.setUp
     issue = PeerStall.issue
@@ -655,10 +655,11 @@ class ShipyardDrift(unittest.TestCase):
         self.assertIn("waiting for steward host studio", body)
         self.assertIn("Run: ssh m1 'tartci fleet-macos tool-freshness --refresh;", body)
 
-    # The threshold: more than one release, or more than six hours.
+    # The threshold: more than one release, or more than three hours (a
+    # healthy rollout reaches every host in under two).
 
-    def test_one_release_behind_for_under_six_hours_is_quiet(self):
-        since = psa.iso(DRIFT_CLOCK - 5.9 * 3600)
+    def test_one_release_behind_for_under_three_hours_is_quiet(self):
+        since = psa.iso(DRIFT_CLOCK - 2.9 * 3600)
         verdict = self.drift(freshness(releases=1, behind_since=since))
         self.assertFalse(verdict["active"])
         self.assertEqual(self.titles(), [])
@@ -668,19 +669,36 @@ class ShipyardDrift(unittest.TestCase):
         self.assertTrue(self.drift(freshness(releases=2, behind_since=since))["active"])
         self.assertEqual(len(self.titles()), 1)
 
-    def test_one_release_behind_for_over_six_hours_pages(self):
-        since = psa.iso(DRIFT_CLOCK - 6.1 * 3600)
+    def test_one_release_behind_for_over_three_hours_pages(self):
+        # v0.444.0 sat 4 h 15 min short of m5s with the old 6 h limit quiet.
+        since = psa.iso(DRIFT_CLOCK - 3.1 * 3600)
         self.assertTrue(self.drift(freshness(releases=1, behind_since=since))["active"])
         self.assertEqual(len(self.titles()), 1)
 
+    def test_the_draft_window_does_not_count_toward_drift(self):
+        # The tag (behind_since) is 3.5 h old, but the release was published, and
+        # first seen by the peer, 1 h ago: the rollout is inside its bound.
+        value = freshness(releases=1, behind_since=psa.iso(DRIFT_CLOCK - 3.5 * 3600))
+        value["tools"]["shipyard"]["behind_published_since"] = psa.iso(DRIFT_CLOCK - 3600)
+        self.assertFalse(self.drift(value)["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_drift_since_names_the_first_published_time(self):
+        published = psa.iso(DRIFT_CLOCK - 3.2 * 3600)
+        value = freshness(releases=1, behind_since=psa.iso(DRIFT_CLOCK - 5 * 3600))
+        value["tools"]["shipyard"]["behind_published_since"] = published
+        self.assertTrue(self.drift(value)["active"])
+        self.assertEqual(self.titles(), [
+            f"[tartci] m1 Shipyard behind the latest release since {published}"])
+
     def test_the_limits_come_from_the_environment(self):
-        since = psa.iso(DRIFT_CLOCK - 6.1 * 3600)
+        since = psa.iso(DRIFT_CLOCK - 3.1 * 3600)
         with mock.patch.dict(os.environ, {"TARTCI_SHIPYARD_DRIFT_HOURS": "8"}):
             self.assertFalse(self.drift(freshness(releases=1, behind_since=since))["active"])
 
     def test_a_host_that_stopped_measuring_pages(self):
-        # Its watchdog stopped: the last reading says current, 7 h ago.
-        old = psa.iso(DRIFT_CLOCK - 7 * 3600)
+        # Its watchdog stopped: the last reading says current, 4 h ago.
+        old = psa.iso(DRIFT_CLOCK - 4 * 3600)
         verdict = self.drift(freshness(state="current", releases=0, measured_at=old))
         self.assertTrue(verdict["active"])
         self.assertEqual(verdict["state"], "unmeasured")

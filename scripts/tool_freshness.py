@@ -8,7 +8,8 @@ its releases before anyone looked. This module gives each of them one line in
 tartci pool status, a finding in tartci doctor fleet, and a WARN in the
 launchd watchdog, and optionally applies the update itself:
 
-  refresh   (the watchdog, at most every 30 minutes) reads the installed
+  refresh   (the watchdog, at most every 30 minutes, every 5 while a release
+            is in motion on the host) reads the installed
             version by running the tool, and the published releases from
             the repository's public Atom feed (no REST quota). A tool whose
             installed version is older than the newest release is `behind`
@@ -115,6 +116,14 @@ APPLY_AFTER_MINUTES = 30.0
 APPLY_RETRY_HOURS = 6.0
 HOLD_MAX_HOURS = 168.0
 REFRESH_INTERVAL_S = 1800
+# While a release is moving through this host (a tool waits for its apply age,
+# the canary or a steward host, or a steward verdict is pending here), the
+# refresh runs on every watchdog pass, down to this interval, so each host
+# acts on its gate within minutes instead of a 30-minute pass per hop. Below
+# the watchdog's 300 s StartInterval: the cached time is stamped after the
+# variable work earlier in a pass, so ages straddle 300 s and an interval of
+# exactly 300 skipped every other pass.
+ROLLOUT_REFRESH_INTERVAL_S = 240
 COMMAND_TIMEOUT_S = 30
 APPLY_TIMEOUT_S = 300
 FEED_TIMEOUT_S = 15
@@ -144,6 +153,11 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
         # host that runs the merge steward judges the swap by its next tick.
         "canary_gate": True,
         "steward_check": True,
+        # The canary soak here is only a short wait for a fast failure on the
+        # canary: the real health check is the steward host's next tick, which
+        # every later host waits for anyway. 2 h of soak kept the fleet behind
+        # each release for over 4 h (v0.444.0: 13:40Z to 17:55Z).
+        "canary_soak_hours": 0.5,
     },
     "pulp": {
         "repo": "Generous-Corp/pulp",
@@ -592,6 +606,10 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
                                     list[tuple[tuple[int, int, int], str, float]]] | None = None
             ) -> dict:
     row: dict[str, Any] = {"tool": name, "repo": tool.get("repo"), "measured_at": _iso(now)}
+    if tool.get("release_assets") and isinstance((previous or {}).get("published_seen"), dict):
+        # Kept through an unreadable pass (unknown, not installed), so the
+        # next good one still knows when each release was first seen.
+        row["published_seen"] = dict(previous["published_seen"])  # type: ignore[index]
     versions = read_versions(tool, home, run)
     rc, out, installed = versions["rc"], versions["out"], versions["installed"]
     row["installed"] = _vstr(installed)
@@ -624,8 +642,31 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     latest, latest_tag, latest_at = releases[-1]
     row.update(latest=_vstr(latest), latest_tag=latest_tag, latest_published_at=_iso(latest_at))
     newer = [release for release in releases if release[0] > installed]
+    # The feed dates a release by its tag, and a Shipyard tag sits in draft
+    # until its macOS assets are uploaded. Record when this host first saw each
+    # newer release ready (published_releases, or the injected probe, passed),
+    # so the fleet's drift alert measures the rollout, not the draft window.
+    # The map is written even while current, so the next release is dated from
+    # the pass that first saw it. A row without the map (written before it
+    # existed, or a re-measure right after an apply) falls back to the tag
+    # time: never later than the truth, so no alert is lost.
+    published_seen: dict[str, str] | None = None
+    carried = False
+    if tool.get("release_assets"):
+        prior_seen = (previous or {}).get("published_seen")
+        carried = isinstance(prior_seen, dict)
+        published_seen = {key: value for key, value in (prior_seen or {}).items()
+                          if isinstance(key, str) and isinstance(value, str)}
+    if published_seen is not None:
+        # Keep a sighting of every release newer than what runs here, even one
+        # a failed asset probe dropped from this pass's list, so a transient
+        # probe failure does not restart its drift clock.
+        published_seen = {key: value for key, value in published_seen.items()
+                          if (_version(key) or (0, 0, 0)) > installed}
     if not newer:
         row["state"] = "current"
+        if published_seen is not None:
+            row["published_seen"] = published_seen
         return row
     behind_since = newer[0][2]
     # The feed holds only the newest releases, so an install older than all of
@@ -638,6 +679,19 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
             behind_since = earlier
             lower_bound = bool(previous.get("behind_since_lower_bound"))
     hours = max(0.0, (now - behind_since) / 3600)
+    if published_seen is not None:
+        row["published_seen"] = dict(published_seen, **{
+            _vstr(version): published_seen.get(_vstr(version)) or _iso(now if carried else at)
+            for version, _, at in newer})
+        first = row["published_seen"][_vstr(newer[0][0])]
+        # Like behind_since: once the oldest newer release leaves the bounded
+        # feed, keep the earliest time recorded for this installed version.
+        if previous and (previous.get("effective") or previous.get("installed")) \
+                == row["effective"]:
+            earlier = _epoch(previous.get("behind_published_since"))
+            if earlier is not None and earlier < (_epoch(first) or earlier):
+                first = _iso(earlier)
+        row["behind_published_since"] = first
     row.update(state="behind", releases_behind=len(newer), behind_since=_iso(behind_since),
                behind_since_lower_bound=lower_bound, behind_hours=round(hours, 1),
                stale=hours > stale_hours,
@@ -920,6 +974,34 @@ def _rollback(tool: dict, home: Path, settings: dict, tag: str,
             not landed and rc == NOT_READY_EXIT)
 
 
+def _seen_only(row: dict) -> dict | None:
+    """The part of a row a re-measure after an apply or rollback carries over:
+    when each release was first seen published. Nothing else, so the re-read
+    version is judged afresh."""
+    seen = row.get("published_seen")
+    return {"published_seen": seen} if isinstance(seen, dict) else None
+
+
+def rollout_in_motion(cached: dict, steward: dict) -> bool:
+    """Whether the last pass left a release in motion on this host: a tool
+    waiting for its apply age, the canary, a steward host or a steward verdict,
+    or a steward verdict pending here, or a release that is not ready yet (a
+    download failed or an asset is missing), or an older release that just
+    landed while a newer one is still to come. A hold, a spent attempt or a rejected
+    release is not motion; those keep the normal interval."""
+    if any(isinstance(entry, dict) and not entry.get("gave_up")
+           for entry in steward.values()):
+        return True
+    tools = cached.get("tools")
+    return isinstance(tools, dict) and any(
+        isinstance(row, dict) and row.get("state") == "behind"
+        and (str(row.get("apply") or "").startswith("waiting") or bool(row.get("not_ready"))
+             # An older release just landed and a newer one is still to come.
+             or (str(row.get("apply") or "").startswith("applied ")
+                 and str(row.get("apply")).endswith(": ok")))
+        for row in tools.values())
+
+
 def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             settings: dict | None = None,
             run: Callable[[list[str], float], tuple[int, str]] = run_command,
@@ -938,14 +1020,16 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
     settings = settings or load_settings(home)
     state = state_dir_for(home)
     cached = _read_json(state / "state.json") or {}
+    steward = _read_json(state / "steward.json") or {}
     if if_older and cached.get("measured_at"):
         age = now - (_epoch(cached["measured_at"]) or 0)
-        if age < if_older:
+        interval = min(if_older, ROLLOUT_REFRESH_INTERVAL_S) \
+            if rollout_in_motion(cached, steward) else if_older
+        if age < interval:
             return cached
     previous = cached.get("tools") or {}
     attempts = _read_json(state / "attempts.json") or {}
     pending = _read_json(state / "pending.json") or {}
-    steward = _read_json(state / "steward.json") or {}
     unverified = _read_json(state / "unverified.json") or {}
     gate: dict[str, Any] = {"notes": []}
 
@@ -980,7 +1064,7 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             applied = None
             before = {key: row.get(key) for key in ("installed", "generation")}
             problem = row.get("steward_problem")
-            row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]),
+            row = measure(name, tool, home, now, _seen_only(row), run, feed, float(settings["stale_hours"]),
                           publication_filter)
             row.update(steward_problem=problem, apply=f"rolled back: {problem}")
             by = "steward_rollback"
@@ -1000,7 +1084,7 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             before_effective = row.get("effective")
             swapped_at = clock()  # type: ignore[misc]
             notes = {key: row[key] for key in ("apply", "canary") if key in row}
-            row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]),
+            row = measure(name, tool, home, now, _seen_only(row), run, feed, float(settings["stale_hours"]),
                           publication_filter)
             row.update(notes)
         verified_states = ("current", "behind")

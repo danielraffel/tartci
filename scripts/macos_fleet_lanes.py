@@ -3658,11 +3658,17 @@ def tool_rollout(path: Path, hosts: set[str]) -> dict | None:
         value = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"{path}: unreadable: {exc}") from exc
-    if not isinstance(value, dict) or set(value) - {"canary", "steward_hosts"}:
-        raise ValueError(f"{path}: must be an object with canary and steward_hosts only")
+    if not isinstance(value, dict) or set(value) - {"canary", "steward_hosts",
+                                                    "former_canaries"}:
+        raise ValueError(f"{path}: must be an object with canary, steward_hosts and "
+                         "optional former_canaries only")
     canary, stewards = value.get("canary"), value.get("steward_hosts", [])
     if canary not in hosts:
         raise ValueError(f"{path}: canary {canary!r} is not a published host ({sorted(hosts)})")
+    former = value.get("former_canaries", [])
+    if not isinstance(former, list) or any(h not in hosts or h == canary for h in former):
+        raise ValueError(f"{path}: former_canaries {former!r} must list published hosts "
+                         "other than the canary")
     if not isinstance(stewards, list) or any(h not in hosts for h in stewards):
         raise ValueError(f"{path}: steward_hosts {stewards!r} must list published hosts")
     if not stewards:
@@ -3671,7 +3677,10 @@ def tool_rollout(path: Path, hosts: set[str]) -> dict | None:
         # host after the canary's soak. Name the host that runs the steward.
         raise ValueError(f"{path}: steward_hosts must name at least one host that runs "
                          "the merge steward")
-    return {"canary": canary, "steward_hosts": list(stewards)}
+    roles = {"canary": canary, "steward_hosts": list(stewards)}
+    if former:
+        roles["former_canaries"] = list(former)
+    return roles
 
 
 def render_published(snapshot: dict) -> str:
