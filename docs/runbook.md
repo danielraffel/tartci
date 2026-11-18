@@ -3201,7 +3201,8 @@ fleet`), and check GitHub's job history against it with
   with an exit code; only a slow volume reaches the deadline, and the error
   says so.
 - **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
-  every 30 min, `--apply --scheduled` with a per-host stagger, ExitTimeOut 120)
+  every 30 min, `--apply --scheduled` with a per-host stagger of at most 2 min,
+  ExitTimeOut 120)
   is not installed by default: `scripts/install_self_update_agent.sh` prints
   the plan and the resolved peers, and `--install` loads it.
 

@@ -2830,7 +2830,15 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float, *,
     return EXIT_REFUSED
 
 
-def stagger_seconds(host_id: str, window: int = 600) -> int:
+# Two minutes. The stagger predates the update queue and the announce
+# protocol, which now decide who goes and settle near-simultaneous starts; it
+# only spreads the hosts' reads a little. At 600 s m3 ("studio") hashed to
+# 596 s and slept almost 10 min in every scheduled attempt, between its peer
+# survey and its checkout (the "checkout 9.9 min" in its receipts).
+STAGGER_WINDOW_SECONDS = 120
+
+
+def stagger_seconds(host_id: str, window: int = STAGGER_WINDOW_SECONDS) -> int:
     """A stable per-host offset so scheduled runs on different hosts spread out."""
     return int(hashlib.sha256(host_id.encode()).hexdigest(), 16) % window
 
