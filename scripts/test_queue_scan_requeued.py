@@ -245,14 +245,15 @@ class RequeuedRankingTests(unittest.TestCase):
         state: dict[str, Any] = {}
         scanner._candidate_runs([run, other, *prs], state)
         # Two refreshes, 160 s apart, that do not list its page.
+        reads = 0
         for _ in range(2):
             scanner.now += 160
             later, _ = scanner._candidate_runs([other, *prs], state)
-            self.assertEqual(int(later[0]["id"]), 7)
-        # Listed again with the same, now old, update: still ahead of run 8.
-        scanner.now += 160
-        listed, _ = scanner._candidate_runs([run, other, *prs], state)
-        self.assertEqual(int(listed[0]["id"]), 7)
+            # Only memory can bring the unlisted run back (it shares the
+            # running groups' turns with run 8).
+            reads += 7 in [int(r["id"]) for r in later]
+        self.assertGreaterEqual(reads, 1)
+        self.assertIn("7", state["requeued_runs"])
 
     def test_a_hosted_queued_job_does_not_keep_a_run(self) -> None:
         now = datetime.now(timezone.utc)
@@ -330,15 +331,17 @@ class RequeuedRankingTests(unittest.TestCase):
         running = [_run(5 + i, now - timedelta(minutes=20 - i), "merge_group", "in_progress")
                    for i in range(2)]
         counts = self.reads([a, c, *running, *self.backlog(now)])
-        self.assertGreaterEqual(counts.get(1, 0), 6)
-        self.assertGreaterEqual(counts.get(3, 0), 6)
+        # One slot: the two waiting groups share it, and each running group
+        # gets a turn once it has waited REQUEUE_TURN_AFTER_SECONDS.
+        self.assertGreaterEqual(counts.get(1, 0), 5, counts)
+        self.assertGreaterEqual(counts.get(3, 0), 5, counts)
 
     def test_requeued_pr_runs_wait_behind_merge_groups_but_are_read(self) -> None:
         now = datetime.now(timezone.utc)
         r1 = _run(1, now - timedelta(hours=4), "pull_request", "queued", now - timedelta(minutes=9))
         c = _run(3, now - timedelta(minutes=40), "merge_group", "queued")
         counts = self.reads([r1, c, *self.backlog(now)])
-        self.assertEqual(counts.get(3, 0), 12)
+        self.assertGreaterEqual(counts.get(3, 0), 10, counts)
         self.assertGreaterEqual(counts.get(1, 0), 2)
 
     def test_a_group_whose_job_just_started_does_not_take_the_turn(self) -> None:
@@ -348,7 +351,10 @@ class RequeuedRankingTests(unittest.TestCase):
         b = _run(2, now - timedelta(minutes=19), "merge_group", "in_progress",
                  now - timedelta(seconds=20))
         counts = self.reads([a, b, *self.backlog(now)])
-        self.assertEqual(counts.get(1, 0), 12, counts)
+        # The waiting group keeps the slot; the running one gets a turn only
+        # after waiting REQUEUE_TURN_AFTER_SECONDS (once in these 12).
+        self.assertGreaterEqual(counts.get(1, 0), 11, counts)
+        self.assertGreaterEqual(counts.get(2, 0), 1, counts)
 
     def test_three_requeued_groups_are_all_read(self) -> None:
         now = datetime.now(timezone.utc)
@@ -516,6 +522,114 @@ class RequeuedRankingTests(unittest.TestCase):
                                                       "6": {"updated_at": "y", "at": scanner.now}}}
         scanner._with_remembered([], state)
         self.assertEqual(set(state["requeued_cleared"]), {"6"})
+
+    def test_a_page_of_only_priority_picks_takes_no_rotating_turn(self) -> None:
+        now = datetime.now(timezone.utc)
+        running = _run(9, now - timedelta(minutes=50), "merge_group", "in_progress")
+        running["_page_key"] = "in_progress:1"
+        queue = [running, *self.backlog(now)]
+        for run in queue[1:]:
+            run["_page_key"] = "queued:1"
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        sizes = []
+        for _ in range(20):
+            sizes.append(len(scanner._candidate_runs([dict(r) for r in queue], state)[0]))
+            state = json.loads(json.dumps(state))
+            scanner.now += 160
+        self.assertEqual(sizes, [5] * 20)
+
+    def test_a_running_group_gets_a_turn_while_waiting_groups_hold_the_slot(self) -> None:
+        now = datetime.now(timezone.utc)
+        waiting = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        running = _run(2, now - timedelta(minutes=50), "merge_group", "in_progress")
+        counts = self.reads([waiting, running, *self.backlog(now)], refreshes=24)
+        # The rotation alone reads it about 3 times in 24; its turn adds more.
+        self.assertGreaterEqual(counts.get(2, 0), 5, counts)
+        self.assertGreaterEqual(counts.get(1, 0), 20, counts)
+
+    def test_a_group_read_as_newest_takes_no_priority_turn(self) -> None:
+        now = datetime.now(timezone.utc)
+        old = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        newest = _run(3, now - timedelta(seconds=30), "merge_group", "queued")
+        counts = self.reads([old, newest, *self.backlog(now)], refreshes=20)
+        self.assertEqual(counts.get(3, 0), 20)
+        self.assertGreaterEqual(counts.get(1, 0), 19, counts)
+
+    def test_pending_is_a_waiting_status(self) -> None:
+        now = datetime.now(timezone.utc)
+        a = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        # Fresh, `pending`, behind two newer running groups.
+        c = _run(3, now - timedelta(minutes=40), "merge_group", "pending")
+        running = [_run(5 + i, now - timedelta(minutes=20 - i), "merge_group", "in_progress")
+                   for i in range(2)]
+        counts = self.reads([a, c, *running, *self.backlog(now)])
+        self.assertGreaterEqual(counts.get(3, 0), 5, counts)
+
+    def test_the_reservation_still_takes_its_slot(self) -> None:
+        """Priority never spends the reservation's slot: with it due, the
+        oldest backlog run is read alongside the priority pick."""
+        now = datetime.now(timezone.utc)
+        a = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        b = _run(2, now - timedelta(hours=2, minutes=30), "merge_group", "queued", now - timedelta(minutes=8))
+        state: dict[str, Any] = {}
+        ids = [int(r["id"]) for r in self.scanner()._candidate_runs([a, b, *self.backlog(now)], state)[0]]
+        self.assertIn(50, ids)
+        self.assertIn("50", state["oldest_reserved_at"])
+
+    def test_off_pins_main_selection(self) -> None:
+        """Quota 0 against a fixed listing: the ids origin/main selects."""
+        now = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        runs = [_run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9)),
+                _run(2, now - timedelta(minutes=50), "merge_group", "in_progress"),
+                _run(3, now - timedelta(minutes=40), "merge_group", "queued"),
+                *[_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+                  for i in range(1, 9)]]
+        scanner = self.scanner(requeued_quota=0)
+        scanner.now = int(now.timestamp())
+        # Computed with origin/main's queue_scan.py on 2026-11-18.
+        self.assertEqual([int(r["id"]) for r in scanner._candidate_runs(runs, {})[0]],
+                         [3, 101, 102, 1, 2])
+
+    def test_a_deleted_remembered_run_is_forgotten(self) -> None:
+        tests = IncidentShapeTests()
+        queued, in_progress, jobs = tests._queue()
+        state_dir = tempfile.mkdtemp()
+        deleted = {"on": False}
+
+        def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return helpers.AUTHENTICATED_RATE_LIMIT
+            if path.endswith("/actions/workflows?per_page=100"):
+                return {"workflows": [{"id": 99, "name": WORKFLOW}]}
+            if "status=queued" in path:
+                return {"workflow_runs": [r for r in queued if not deleted["on"] or r["id"] != INCIDENT]}
+            if "status=in_progress" in path:
+                return {"workflow_runs": in_progress}
+            if "status=pending" in path:
+                return {"workflow_runs": []}
+            if deleted["on"] and f"/actions/runs/{INCIDENT}/jobs?" in path:
+                # The scanner's own module (the helper loads it from its path).
+                raise helpers.queue_scan.GitHubApiError(path, 1, "HTTP 404: Not Found")
+            for run_id, run_jobs in jobs.items():
+                if f"/actions/runs/{run_id}/jobs?" in path:
+                    return {"jobs": run_jobs}
+            raise AssertionError(path)
+
+        options = {"force_refresh": True, "workflow": WORKFLOW, "labels": MERGE_CLASS,
+                   "negative_ttl": 30, "merge_group_quota": 2,
+                   "oldest_reserve_max_age": 172800, "requeued_quota": 2}
+
+        def scan() -> dict[str, Any]:
+            scanner = helpers.PaginatedQueueScanTests()._scanner(
+                "tart-macos-tier", Path(state_dir) / "state.json", api, **options)
+            scanner.scan()
+            return json.loads(scanner.discovery_path.read_text())
+
+        self.assertIn(str(INCIDENT), scan()["requeued_runs"])
+        deleted["on"] = True
+        self.assertNotIn(str(INCIDENT), scan()["requeued_runs"])
+        scan()
 
     def test_off_writes_no_requeued_state(self) -> None:
         scanner = self.scanner(requeued_quota=0)

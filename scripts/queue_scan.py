@@ -68,6 +68,9 @@ REQUEUE_MAX_AGE_SECONDS = 6 * 3600
 REQUEUE_MEMORY_MAX = 16
 # Runs a job fetch showed need no fleet runner, remembered across pages.
 REQUEUE_CLEARED_MAX = 256
+# A running merge group or other requeued run unread this long takes the next
+# priority slot ahead of the waiting groups (six 160 s refreshes).
+REQUEUE_TURN_AFTER_SECONDS = 960
 
 
 def _seconds_between(start: str, end: str) -> float:
@@ -721,26 +724,39 @@ class QueueScanner:
             if not self._requeued_quota():
                 # Off: exactly the newest merge groups, as before.
                 return merge[:slots]
-            ordered = groups
-            if len(groups) > slots:
-                ordered = sorted(groups, key=lambda run: read_at.get(str(int(run["id"])), 0))
-            chosen = ordered[:slots] + running[: max(0, slots - len(groups))]
-            return chosen + others[: max(0, slots - len(chosen))]
+            def lru(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return sorted(items, key=lambda run: read_at.get(str(int(run["id"])), 0))
+
+            # Waiting groups first, least recently read first. A running group
+            # or other requeued run that has not been read for
+            # REQUEUE_TURN_AFTER_SECONDS goes ahead of them once, so neither
+            # class is starved when waiting groups hold every slot.
+            now = int(getattr(self, "now", 0) or 0)
+            tail = lru(running) + lru(others)
+            # First seen counts as read: the wait starts now.
+            for run in tail:
+                read_at.setdefault(str(int(run["id"])), now)
+            overdue = [run for run in tail
+                       if now - read_at.get(str(int(run["id"])), 0) >= REQUEUE_TURN_AFTER_SECONDS][:1]
+            rest = [run for run in lru(groups) + tail if run not in overdue]
+            return (overdue + rest)[:slots]
 
         base = max(0, self.args.max_job_fetches - self.args.newest_quota - 1)
         reservation = 1 if self._reservation_fires(newest, state) else 0
         priority = fit(max(0, base - reservation))
-        if self._requeued_quota():
-            now = int(getattr(self, "now", 0) or 0)
-            group_ids = {str(int(run["id"])) for run in groups}
-            for run in priority:
-                if str(int(run["id"])) in group_ids:
-                    read_at[str(int(run["id"]))] = now
-            state["requeued_read_at"] = {k: v for k, v in read_at.items() if k in group_ids}
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
         ][: self.args.newest_quota]
+        if self._requeued_quota():
+            # Stamped for every read, priority or newest, so a group the newest
+            # quota already reads does not also take a priority turn.
+            now = int(getattr(self, "now", 0) or 0)
+            tracked = {str(int(run["id"])) for run in groups + running + others}
+            for run in latency:
+                if str(int(run["id"])) in tracked:
+                    read_at[str(int(run["id"]))] = now
+            state["requeued_read_at"] = {k: v for k, v in read_at.items() if k in tracked}
         latency_ids = {int(run["id"]) for run in latency}
         backlog = [
             run for run in runs if int(run["id"]) not in latency_ids
@@ -774,6 +790,12 @@ class QueueScanner:
             groups.setdefault(key, []).append(run)
         for group in groups.values():
             group.sort(key=_created_key)
+        # A page group holding only priority picks would take a rotating turn
+        # and read nothing.
+        groups = {key: group for key, group in groups.items()
+                  if any(int(run["id"]) not in priority_ids for run in group)}
+        if not groups:
+            return latency, []
 
         offsets_raw = state.get("run_item_offsets")
         offsets = offsets_raw if isinstance(offsets_raw, dict) else {}
@@ -926,10 +948,20 @@ class QueueScanner:
             discovered: list[dict[str, Any]] = []
             for run in candidates[: self.args.max_job_fetches]:
                 run_id = int(run["id"])
-                jobs = self._gh(
-                    f"repos/{self.args.repo}/actions/runs/{run_id}"
-                    "/jobs?filter=latest&per_page=100"
-                ).get("jobs", [])
+                try:
+                    jobs = self._gh(
+                        f"repos/{self.args.repo}/actions/runs/{run_id}"
+                        "/jobs?filter=latest&per_page=100"
+                    ).get("jobs", [])
+                except GitHubApiError as error:
+                    # A remembered run no page listed may have been deleted:
+                    # forget it instead of failing every refresh for 6 h.
+                    if error.status == 404 and run.get("_remembered") and "_page_key" not in run:
+                        memory = discovery.get("requeued_runs")
+                        if isinstance(memory, dict):
+                            memory.pop(str(run_id), None)
+                        continue
+                    raise
                 if not isinstance(jobs, list):
                     raise ValueError(f"jobs is not a list for run {run_id}")
                 self._forget_served(discovery, run_id, jobs, str(run.get("updated_at") or ""))

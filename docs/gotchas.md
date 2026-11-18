@@ -1185,12 +1185,19 @@ not permission to force-remove a worktree.
   probably just started a job (run 44317241223's `updated_at` moved when its
   job was picked up), so it goes with the running groups after them. Running
   groups get priority only on a lane with `--merge-group-quota` above 0, and
-  so do other requeued runs. A requeued PR run never displaces a merge group,
-  and a Pulp-style PR backlog keeps its rotation. At the production cadence
+  so do other requeued runs. A requeued PR run never displaces a merge group.
+  A running group or other requeued run unread for 16 min takes one slot
+  ahead of the waiting groups, so no class is starved. Every read counts as a
+  turn, including a read through the newest quota. At the production cadence
   the oldest-run reservation fires on most refreshes, leaving one or two
-  priority slots. These reads come from the same slots as
-  `--merge-group-quota`. The newest quota, the reservation and one rotating
-  slot keep theirs, so the job-fetch cap and the API budget are
+  priority slots, taken from the same slots as `--merge-group-quota`. On a
+  lane with no merge-group quota (Pulp), a waiting merge group's read comes
+  out of the rotation instead. Measured with 250 queued runs, the longest gap
+  for a deep-page run went from 4.4 h to 8.9 h. That is the price of reading
+  Pulp's merge groups, which main never read by quota. Set
+  `queue_requeued_quota = 0` on a lane that cannot afford it. The newest
+  quota, the reservation and one rotating slot keep their slots, and the
+  job-fetch cap and API budget are
   unchanged. `0` restores the old selection. A lane can set it with the profile key
   `queue_requeued_quota`.
 
@@ -1206,4 +1213,7 @@ not permission to force-remove a worktree.
   60 s earlier records nothing, because the dependent job may not exist yet
   in that second. While the priority picks turn, the rotating lists are built
   from the listing minus only the newest picks, and priority picks are
-  skipped in place, so the rotation still reaches every run.
+  skipped in place, so the rotation still reaches every run. A page holding
+  only priority picks takes no rotating turn. A remembered run that no page
+  lists and whose job fetch returns 404 (deleted) is forgotten instead of
+  failing every refresh.
