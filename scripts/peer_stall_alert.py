@@ -63,8 +63,11 @@ VITALS_SEPARATOR = "--- host-vitals ---"
 FRESHNESS_SEPARATOR = "--- tool-freshness ---"
 # A host more than this many Shipyard releases, or this many hours, behind the
 # newest release is reported (tool-freshness state.json, read on the peer).
+# A healthy rollout puts every host on a release in under 2 h (canary at 30
+# minutes, its 30-minute soak, the steward host's verdict, then the rest, each
+# acted on within a 5-minute watchdog pass), so 3 h is a missed bound.
 SHIPYARD_DRIFT_RELEASES = 1
-SHIPYARD_DRIFT_HOURS = 6
+SHIPYARD_DRIFT_HOURS = 3
 HOST_VITALS_STALE_SECS = 5 * 60
 # Printed by the peer: its clock, its guard receipt, then its own last
 # peer-stall pass (each empty when absent).

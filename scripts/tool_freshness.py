@@ -8,7 +8,8 @@ its releases before anyone looked. This module gives each of them one line in
 tartci pool status, a finding in tartci doctor fleet, and a WARN in the
 launchd watchdog, and optionally applies the update itself:
 
-  refresh   (the watchdog, at most every 30 minutes) reads the installed
+  refresh   (the watchdog, at most every 30 minutes, every 5 while a release
+            is in motion on the host) reads the installed
             version by running the tool, and the published releases from
             the repository's public Atom feed (no REST quota). A tool whose
             installed version is older than the newest release is `behind`
@@ -115,6 +116,11 @@ APPLY_AFTER_MINUTES = 30.0
 APPLY_RETRY_HOURS = 6.0
 HOLD_MAX_HOURS = 168.0
 REFRESH_INTERVAL_S = 1800
+# While a release is moving through this host (a tool waits for its apply age,
+# the canary or a steward host, or a steward verdict is pending here), the
+# refresh runs on every watchdog pass, down to this interval, so each host
+# acts on its gate within minutes instead of a 30-minute pass per hop.
+ROLLOUT_REFRESH_INTERVAL_S = 300
 COMMAND_TIMEOUT_S = 30
 APPLY_TIMEOUT_S = 300
 FEED_TIMEOUT_S = 15
@@ -144,6 +150,11 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
         # host that runs the merge steward judges the swap by its next tick.
         "canary_gate": True,
         "steward_check": True,
+        # The canary soak here is only a short wait for a fast failure on the
+        # canary: the real health check is the steward host's next tick, which
+        # every later host waits for anyway. 2 h of soak kept the fleet behind
+        # each release for over 4 h (v0.444.0: 13:40Z to 17:55Z).
+        "canary_soak_hours": 0.5,
     },
     "pulp": {
         "repo": "Generous-Corp/pulp",
@@ -920,6 +931,21 @@ def _rollback(tool: dict, home: Path, settings: dict, tag: str,
             not landed and rc == NOT_READY_EXIT)
 
 
+def rollout_in_motion(cached: dict, steward: dict) -> bool:
+    """Whether the last pass left a release in motion on this host: a tool
+    waiting for its apply age, the canary, a steward host or a steward verdict,
+    or a steward verdict pending here. A hold, a spent attempt or a rejected
+    release is not motion; those keep the normal interval."""
+    if any(isinstance(entry, dict) and not entry.get("gave_up")
+           for entry in steward.values()):
+        return True
+    tools = cached.get("tools")
+    return isinstance(tools, dict) and any(
+        isinstance(row, dict) and row.get("state") == "behind"
+        and str(row.get("apply") or "").startswith("waiting")
+        for row in tools.values())
+
+
 def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             settings: dict | None = None,
             run: Callable[[list[str], float], tuple[int, str]] = run_command,
@@ -938,14 +964,16 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
     settings = settings or load_settings(home)
     state = state_dir_for(home)
     cached = _read_json(state / "state.json") or {}
+    steward = _read_json(state / "steward.json") or {}
     if if_older and cached.get("measured_at"):
         age = now - (_epoch(cached["measured_at"]) or 0)
-        if age < if_older:
+        interval = min(if_older, ROLLOUT_REFRESH_INTERVAL_S) \
+            if rollout_in_motion(cached, steward) else if_older
+        if age < interval:
             return cached
     previous = cached.get("tools") or {}
     attempts = _read_json(state / "attempts.json") or {}
     pending = _read_json(state / "pending.json") or {}
-    steward = _read_json(state / "steward.json") or {}
     unverified = _read_json(state / "unverified.json") or {}
     gate: dict[str, Any] = {"notes": []}
 

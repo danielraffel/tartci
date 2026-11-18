@@ -161,12 +161,14 @@ class CanaryGateTests(_Fleet):
     # ── canary verified and healthy releases the others ──
 
     def test_a_canary_deploy_healthy_for_the_soak_releases_the_others(self) -> None:
-        young = self.behind(canary_events(deployed("0.221.1", NOW - 1 * HOUR)))
+        # Shipyard soaks 30 minutes on the canary: the steward host's tick, which
+        # every later host also waits for, is its real health check.
+        young = self.behind(canary_events(deployed("0.221.1", NOW - 20 * MIN)))
         row = self.refresh(young, "studio")["tools"]["shipyard"]
         self.assertEqual(young.fleet_updates(), [])
-        self.assertIn("deployed 0.221.1 1.0 h ago; healthy once 2 h pass", row["apply"])
+        self.assertIn("deployed 0.221.1 0.3 h ago; healthy once 0.5 h pass", row["apply"])
 
-        soaked = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
+        soaked = self.behind(canary_events(deployed("0.221.1", NOW - 40 * MIN)))
         row = self.refresh(soaked, "studio")["tools"]["shipyard"]
         self.assertEqual(soaked.fleet_updates(), ["v0.221.1"])
         self.assertIn("cleared by canary m5", row["canary"])
@@ -221,9 +223,35 @@ class CanaryGateTests(_Fleet):
         self.feeds["danielraffel/Shipyard"] = feed(
             ("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 6 * HOUR), ("v0.221.2", NOW - HOUR))
         host = self.behind(canary_events(deployed("0.221.1", NOW - 5 * HOUR),
-                                         deployed("0.221.2", NOW - 0.5 * HOUR, **{"from": "0.221.1"})))
+                                         deployed("0.221.2", NOW - 0.2 * HOUR, **{"from": "0.221.1"})))
         self.refresh(host, "studio")
         self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+
+    def test_shipyard_soaks_half_an_hour_pulp_two_and_a_host_setting_wins(self) -> None:
+        # v0.444.0 took 4 h 15 min to reach every host, 2 h of it the canary
+        # soak, with nothing on the canary able to fail the release meanwhile.
+        self.assertEqual(tf.DEFAULT_TOOLS["shipyard"]["canary_soak_hours"], 0.5)
+        self.assertNotIn("canary_soak_hours", tf.DEFAULT_TOOLS["pulp"])
+        events = canary_events(deployed("0.221.1", NOW - 45 * MIN))
+        host = self.behind(events)
+        self.refresh(host, "studio")
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        # tool-freshness.toml's canary_soak_hours still overrides the tool's own value.
+        self.switch_host()
+        held = self.behind(events)
+        row = self.refresh(held, "studio", canary_soak_hours=2.0)
+        self.assertEqual(held.fleet_updates(), [])
+        self.assertIn("healthy once 2 h pass", row["tools"]["shipyard"]["apply"])
+        # pulp keeps the 2 h soak (it has no steward stage after the canary).
+        pulp = {"event": "tool_deployed", "tool": "pulp", "component": "cli",
+                "at": iso(NOW - 45 * MIN), "from": "0.877.2", "to": "0.877.3",
+                "by": "auto_apply", "downgrade": False, "verify": "current"}
+        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.2", NOW - 30 * HOUR),
+                                                ("v0.877.3", NOW - 2 * HOUR))
+        self.switch_host()
+        pulp_host = self.behind(canary_events(pulp))
+        row = self.refresh(pulp_host, "studio")
+        self.assertIn("healthy once 2 h pass", row["tools"]["pulp"]["apply"])
 
     # ── canary rollback blocks them ──
 
@@ -392,7 +420,8 @@ class CanaryGateTests(_Fleet):
         self.assertEqual(canary.rollout({}), {"canary": published["canary"],
                                               "steward_hosts": published["steward_hosts"],
                                               "error": None})
-        self.assertEqual(published, {"canary": "m5", "steward_hosts": ["studio"]})
+        # m5studio is always on; the m5 laptop canary stalled every host while it slept.
+        self.assertEqual(published, {"canary": "m5studio", "steward_hosts": ["studio"]})
         with mock.patch.object(canary, "PUBLISHED", Path(self.tmp.name) / "missing.json"):
             self.assertIsNotNone(canary.rollout({})["error"])
             host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
@@ -1034,7 +1063,7 @@ class PublishedRolloutTests(unittest.TestCase):
             self.assertEqual(fleet.tool_rollout(path, hosts),
                              {"canary": "m5", "steward_hosts": ["studio"]})
         published = fleet.published_snapshot()
-        self.assertEqual(published["tool_rollout"], {"canary": "m5", "steward_hosts": ["studio"]})
+        self.assertEqual(published["tool_rollout"], {"canary": "m5studio", "steward_hosts": ["studio"]})
 
 
 if __name__ == "__main__":

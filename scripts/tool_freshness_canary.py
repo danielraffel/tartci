@@ -25,8 +25,9 @@ shows it landed and stayed healthy:
     from it;
   - then a health signal. When the canary runs the merge steward (its deploy
     event carries `steward_host: true`), a `tool_steward_verified` for the
-    release recorded after that deploy. Otherwise `canary_soak_hours` (2) on
-    the canary's clock since the deploy.
+    release recorded after that deploy. Otherwise `canary_soak_hours` on
+    the canary's clock since the deploy: the tool's own value (Shipyard 0.5,
+    since its steward stage follows), else 2.
 
 For a tool with a steward check (Shipyard), a host that is neither the canary
 nor a steward host also waits for every published steward host to have
@@ -294,7 +295,9 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
         required += [(host, True) for host in roles["steward_hosts"]
                      if host not in (me, canary)]
     reads = context.setdefault("reads", {})
-    soak = float(settings.get("canary_soak_hours", CANARY_SOAK_HOURS))
+    # A host's tool-freshness.toml value wins, then the tool's own default.
+    soak = float(settings.get("canary_soak_hours",
+                              tool.get("canary_soak_hours", CANARY_SOAK_HOURS)))
     for host, _ in required:
         if host not in reads:
             reads[host] = read_host(host, me, settings, state, now, run)

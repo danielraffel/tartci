@@ -822,6 +822,47 @@ class ToolFreshnessTests(unittest.TestCase):
                 mock.patch.object(tf, "fetch_feed", side_effect=AssertionError("fetched")):
             self.assertEqual(len(tf.summary(self.home)["lines"]), 3)
 
+    def test_a_release_in_motion_refreshes_every_watchdog_pass(self) -> None:
+        # Four hosts in a row each waiting up to a 30-minute pass for its gate
+        # kept every Shipyard release more than 4 h from the last host.
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        self.feeds["danielraffel/Shipyard"] = feed(("v0.221.0", NOW - 30 * HOUR),
+                                                   ("v0.221.1", NOW - 10 * 60))
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertTrue(row["apply"].startswith("waiting"), row["apply"])
+        before = len(host.calls)
+        self.refresh(host, NOW + 120, if_older=1800)
+        self.assertEqual(len(host.calls), before, "inside the rollout interval: cached")
+        self.refresh(host, NOW + 310, if_older=1800)
+        self.assertGreater(len(host.calls), before, "a waiting release refreshes at 5 min")
+
+    def test_a_pending_steward_verdict_refreshes_every_watchdog_pass(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(host)
+        before = len(host.calls)
+        self.refresh(host, NOW + 310, if_older=1800)
+        self.assertEqual(len(host.calls), before, "current and nothing pending: 30 min")
+        state = tf.state_dir_for(self.home)
+        (state / "steward.json").write_text(json.dumps(
+            {"shipyard": {"version": "0.221.1", "deployed_at": tf._iso(NOW)}}))
+        self.refresh(host, NOW + 320, if_older=1800)
+        self.assertGreater(len(host.calls), before)
+        before = len(host.calls)
+        (state / "steward.json").write_text(json.dumps(
+            {"shipyard": {"version": "0.221.1", "gave_up": True}}))
+        self.refresh(host, NOW + 640, if_older=1800)
+        self.assertEqual(len(host.calls), before, "a rollback given up on is not motion")
+
+    def test_held_or_spent_releases_keep_the_normal_interval(self) -> None:
+        for apply in ("HELD: auto_apply = false in x until y",
+                      "already attempted v0.221.1 at t: FAILED",
+                      "not retrying v0.221.1 here: rejected"):
+            cached = {"tools": {"shipyard": {"state": "behind", "apply": apply}}}
+            self.assertFalse(tf.rollout_in_motion(cached, {}), apply)
+        self.assertTrue(tf.rollout_in_motion(
+            {"tools": {"shipyard": {"state": "behind", "apply": "waiting for canary m5studio"}}},
+            {}))
+
     def test_a_disabled_tool_is_neither_run_nor_reported(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.305.0"})
         tools = dict(tf.DEFAULT_TOOLS)
