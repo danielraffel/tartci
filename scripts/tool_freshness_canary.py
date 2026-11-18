@@ -152,9 +152,14 @@ def rollout(settings: dict) -> dict:
     # catch up with a canary move: an older generation on a steward host waits
     # for it, and if it waited in turn for that steward host, neither would
     # move until TartCI itself had rolled out. Readers wait only for `canary`.
-    former = value.get("former_canaries")
-    former = [h for h in former if isinstance(h, str) and h in known] \
-        if isinstance(former, list) else []
+    former = value.get("former_canaries", [])
+    if not isinstance(former, list) or any(
+            not isinstance(h, str) or h not in known or h == value["canary"] for h in former):
+        # Fail closed like the other roles: dropping a former canary mid-move
+        # would leave a steward host waiting on a canary that waits on it.
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
+                "error": f"invalid tool_rollout in {PUBLISHED}: former_canaries must list "
+                         "published hosts other than the canary"}
     return {"canary": value["canary"], "steward_hosts": hosts, "former_canaries": former,
             "error": None}
 

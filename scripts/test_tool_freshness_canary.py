@@ -238,6 +238,16 @@ class CanaryGateTests(_Fleet):
         self.assertIn("former canary m5: applies first", row["canary"])
         self.assertFalse(any(c[0] == "ssh" for c in former.calls))
 
+    def test_a_malformed_former_canary_list_fails_closed(self) -> None:
+        for former in ("m5", ["m9"], ["m5studio"], [None]):
+            roles = canary.rollout({"tool_rollout": {
+                "canary": "m5studio", "steward_hosts": ["studio"], "former_canaries": former}})
+            self.assertIsNone(roles["canary"], former)
+            self.assertIn("former_canaries", roles["error"])
+        roles = canary.rollout({"tool_rollout": {"canary": "m5studio",
+                                                 "steward_hosts": ["studio"]}})
+        self.assertEqual(roles["former_canaries"], [])
+
     def test_a_former_canary_deploy_clears_the_canary_slot_while_listed(self) -> None:
         # m3 on the new generation, m5studio still on the old one: m5studio waits
         # for m5 and for m3's steward verdict, so m3 must not wait for m5studio.
