@@ -169,6 +169,21 @@ class ReplayTests(Fleet):
         self.assertFalse((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).exists())
         self.assertEqual(json.loads((self.cfg.state_dir / "waiting.json").read_text())["since"], NOW)
 
+    def test_after_the_exclusion_an_older_published_ticket_still_goes_first(self) -> None:
+        # m5studio excluded m5 first, deferred on a readable busy peer, and so
+        # published its kept 08:32 place again. m1, excluding m5 later, must
+        # yield to that ticket rather than jump it.
+        self.replay_until_the_bound()
+        self.sys.peer_waiting["m5s"] = {"host_id": "m5studio", "since": at("08:32"),
+                                        "ts": at("14:10")}
+        self.corroborate("m5", at("11:12"))
+        self.attempt("14:14")
+        self.assertIn("yielding the update turn to a host that has waited longer: m5studio",
+                      self.reason())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertTrue((self.cfg.state_dir / "waiting.json").exists())
+        self.assertFalse((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).exists())
+
     def test_under_the_old_rule_the_same_day_never_moves(self) -> None:
         with mock.patch.object(su, "PEER_UNREACHABLE_EXCLUDE_SECONDS", float("inf")):
             self.replay_until_the_bound()
