@@ -66,6 +66,8 @@ REQUEUE_MAX_AGE_SECONDS = 6 * 3600
 # Requeued runs remembered between refreshes, for when the page that listed
 # them is not read again (each refresh reads page 1 plus one rotating page).
 REQUEUE_MEMORY_MAX = 16
+# Runs a job fetch showed need no fleet runner, remembered across pages.
+REQUEUE_CLEARED_MAX = 256
 
 
 def _seconds_between(start: str, end: str) -> float:
@@ -532,12 +534,19 @@ class QueueScanner:
             raw = state.get(key)
             return dict(raw) if isinstance(raw, dict) else {}
 
-        cleared = {key: str(value) for key, value in load("requeued_cleared").items()
-                   if key.isdigit() and int(key) in listed}
+        # Kept across page rotation, bounded by age and count.
+        now = int(getattr(self, "now", 0) or 0)
+        cleared = {
+            key: value for key, value in load("requeued_cleared").items()
+            if isinstance(value, dict) and isinstance(value.get("at"), int)
+            and (not now or now - value["at"] <= REQUEUE_MAX_AGE_SECONDS)
+        }
+        cleared = dict(sorted(cleared.items(), key=lambda item: item[1]["at"])[-REQUEUE_CLEARED_MAX:])
         state["requeued_cleared"] = cleared
 
         def is_cleared(run: dict[str, Any]) -> bool:
-            return cleared.get(str(int(run["id"]))) == str(run.get("updated_at") or "")
+            entry = cleared.get(str(int(run["id"])))
+            return bool(entry) and entry.get("updated_at") == str(run.get("updated_at") or "")
 
         memory = {key: value for key, value in load("requeued_runs").items()
                   if isinstance(value, dict) and isinstance(value.get("id"), int)}
@@ -574,7 +583,10 @@ class QueueScanner:
             gone = memory.pop(str(run_id), None) or {}
             cleared = state.setdefault("requeued_cleared", {})
             if isinstance(cleared, dict):
-                cleared[str(run_id)] = str(updated_at or gone.get("updated_at") or "")
+                cleared[str(run_id)] = {
+                    "updated_at": str(updated_at or gone.get("updated_at") or ""),
+                    "at": int(getattr(self, "now", 0) or 0),
+                }
 
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         now = int(getattr(self, "now", 0) or 0)

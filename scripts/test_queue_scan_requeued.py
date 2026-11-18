@@ -233,9 +233,10 @@ class RequeuedRankingTests(unittest.TestCase):
         scanner._forget_served(state, 8, [{"status": "queued", "labels": ["ubuntu-24.04"]}],
                                run["updated_at"])
         self.assertNotIn("8", state["requeued_runs"])
-        # Listed again unchanged: no priority slot, on this or later refreshes.
-        for _ in range(3):
-            again, _ = scanner._candidate_runs([run, *prs], state)
+        # Listed again unchanged, also after a refresh that read another page:
+        # no priority slot.
+        for listing in ([run, *prs], list(prs), [run, *prs]):
+            again, _ = scanner._candidate_runs(listing, state)
             self.assertNotEqual(int(again[0]["id"]), 8)
         # Once the run changes (a new job queued), it is requeued again.
         changed = {**run, "updated_at": _stamp(now - timedelta(minutes=1))}
