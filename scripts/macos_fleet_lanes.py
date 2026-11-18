@@ -97,6 +97,7 @@ HOST_KEYS = {
     "job_claim_max_age_seconds",
     "home_volume_floor_mode",
     "vm_dhcp_breaker",
+    "external_root", "external_only_mode",
 }
 SCAN_APP_REPO_PREFIX = "Generous-Corp/"
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
@@ -610,6 +611,20 @@ def load(path: Path) -> dict:
     floor_mode = host.get("home_volume_floor_mode")
     if floor_mode is not None and floor_mode not in ("report", "refuse"):
         fail('host.home_volume_floor_mode must be "report" or "refuse"')
+    external_root = host.get("external_root")
+    if external_root is not None:
+        if (not isinstance(external_root, str) or not external_root.startswith("/Volumes/")
+                or external_root.endswith("/") or "//" in external_root
+                or "/../" in external_root + "/"):
+            fail("host.external_root must be a normalized /Volumes/<name> path")
+        if not (host["tart_home"] + "/").startswith(external_root + "/"):
+            fail("host.external_root must contain host.tart_home: an external-only host "
+                 "keeps its Tart store on the external volume")
+    only_mode = host.get("external_only_mode")
+    if only_mode is not None and only_mode != "report":
+        fail('host.external_only_mode must be "report" (refuse mode is not enabled yet)')
+    if only_mode is not None and external_root is None:
+        fail("host.external_only_mode needs host.external_root")
     agent_floor_pool = host.get("agent_floor_pool_cores")
     if agent_floor_pool is not None:
         if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:

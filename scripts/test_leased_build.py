@@ -10,6 +10,7 @@ SCRIPT = Path(__file__).resolve().parent / "leased-build"
 FAKE_TARTCI = r"""#!/bin/bash
 if [ "$2" = acquire ]; then
   printf '%s\n' "$*" >> "$FAKE_TARTCI_LOG"
+  [ -z "${FAKE_ACQUIRE_STDERR:-}" ] || printf '%s\n' "$FAKE_ACQUIRE_STDERR" >&2
   printf '{"ok": true, "lease": {"lease_size_cores": %s}}' "${FAKE_GRANT:-1}"
 fi
 exit 0
@@ -43,6 +44,14 @@ class LeasedBuildTests(unittest.TestCase):
         self.assertIn("--cores 1 --min-cores 1", line)
         self.assertIn("--class check", line)
         self.assertNotIn("--allow-floor", line)
+
+    def test_acquire_warnings_reach_the_agent_on_stderr(self) -> None:
+        # Report-mode policy warnings are printed by `leases acquire` on stderr.
+        warning = "tartci (external_only_mode=report, would refuse): path on the internal volume"
+        result = self.run_wrapper("--", "true", FAKE_ACQUIRE_STDERR=warning)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(warning, result.stderr)
+        self.assertNotIn(warning, result.stdout)
 
     def test_background_class_keeps_its_two_core_floor(self) -> None:
         result = self.run_wrapper("--", "true", FAKE_GRANT="4")

@@ -14,6 +14,16 @@ on:
 permissions:
   contents: read
 
+# Tests commit in temp repos; a commit forks a detached `git maintenance run
+# --auto` that keeps writing into .git while the test's temp dir is removed.
+# Keep this in step with GIT_CONFIG_* in scripts/prepush.sh.
+env:
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: maintenance.auto
+  GIT_CONFIG_VALUE_0: "false"
+  GIT_CONFIG_KEY_1: gc.auto
+  GIT_CONFIG_VALUE_1: "0"
+
 # A new push to a pull request supersedes the run for its previous head, so
 # that run is cancelled. Every other event gets a group of its own (keyed by
 # run id): a group holds at most one pending run and drops older pending ones

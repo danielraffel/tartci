@@ -107,8 +107,12 @@ class LauncherBuildTests(unittest.TestCase):
         )
         subprocess.run(["git", "-C", str(source), "add", "."], check=True)
         subprocess.run(
+            # A commit otherwise forks a detached `git maintenance run --auto`
+            # (a repack) that keeps writing into .git while the temp directory
+            # is removed, so cleanup fails with "Directory not empty".
             ["git", "-C", str(source), "-c", "user.name=Test", "-c",
-             "user.email=test@example.invalid", "commit", "-qm", "fixture"],
+             "user.email=test@example.invalid", "-c", "maintenance.auto=false",
+             "-c", "gc.auto=0", "commit", "-qm", "fixture"],
             check=True,
         )
         manifest = root / ".tartci-support-manifest.json"

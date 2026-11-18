@@ -11,6 +11,7 @@ import platform
 import plistlib
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -579,6 +580,31 @@ def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
     return value if value in AGENT_FLOOR_QOS_VALUES else AGENT_FLOOR_QOS_DEFAULT
 
 
+def external_root_setting(fleet_profile: str | None = None) -> str | None:
+    """`[host] external_root` of the fleet profile, or None for an internal-disk host.
+
+    A host that sets it is external-only: builds and caches must not resolve to
+    the internal data volume (scripts/external_only_policy.py). Unreadable or
+    malformed means None, because this runs on every lease admission.
+    """
+    try:
+        value = _parse_host_str(
+            fleet_profile_path(fleet_profile).read_text(encoding="utf-8"), "external_root"
+        )
+    except OSError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - e.g. a non-UTF-8 profile; admit, never fail a lease
+        print(f"tartci: external_root not read ({type(exc).__name__}); policy off", file=sys.stderr)
+        return None
+    return value if value and value.startswith("/") else None
+
+
+def external_only_mode_setting(fleet_profile: str | None = None) -> str:
+    """The external-only mode. Always "report" until refuse mode is reachable from
+    config: a profile value of "refuse" is rejected by the validator and ignored here."""
+    return "report"
+
+
 # --- VM lease waiter ranking ---------------------------------------------------
 #
 # Opt-in `[leases]` table of the fleet profile. With rank_vm_waiters on, a VM
@@ -1017,6 +1043,8 @@ def build_profile(
         "agent_floor_pool_cores": agent_floor_pool,
         "agent_floor_qos": agent_floor_qos_setting(fleet_profile),
         "agent_floor_source": floor_source,
+        "external_root": external_root_setting(fleet_profile),
+        "external_only_mode": external_only_mode_setting(fleet_profile),
         **lease_policy_settings(fleet_profile),
         **guest_network_settings(fleet_profile),
         **classes,
