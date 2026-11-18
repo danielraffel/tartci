@@ -17,7 +17,7 @@
 # route.
 
 name = "normal-local-fast"
-description = "Fast PRs on local disposable ARM64 and Mac Pro Linux x64 capacity with hosted fallback."
+description = "Fast PRs on local disposable ARM64 capacity with hosted fallback. Mac Pro x64 targets are retired."
 
 # Fleet-wide naming posture: target IDs and host/lane/slot IDs are stable
 # operator vocabulary. GitHub registration names are unique per boot for every
@@ -212,6 +212,9 @@ arch = "arm64"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 
 [targets."macpro.linux-x64-pr-safe-vm"]
+# macpro was retired from CI and powered off on 2026-11-18. The target stays
+# listed and is never selected; delete `retired` if the host comes back.
+retired = "2026-11-18"
 description = "Mac Pro PR-safe disposable Linux x64 pool; same-repository unprivileged PR code only."
 provider = "proxmox"
 host = "macpro"
@@ -224,6 +227,9 @@ workflow_access = ["Generous-Corp/pulp/.github/workflows/pr-safe-linux.yml@refs/
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-pr-safe-linux-x64"]
 
 [targets."macpro.linux-x64-trusted-vm"]
+# macpro was retired from CI and powered off on 2026-11-18. The target stays
+# listed and is never selected; delete `retired` if the host comes back.
+retired = "2026-11-18"
 description = "Mac Pro protected-main disposable Linux x64 pool for merge-group and trusted checks."
 provider = "proxmox"
 host = "macpro"
@@ -322,6 +328,9 @@ runs_on_json = "windows-latest"
 authoritative_for = ["windows-x64"]
 
 [targets."macpro.vellum-linux-x64-pr-safe"]
+# macpro was retired from CI and powered off on 2026-11-18. The target stays
+# listed and is never selected; delete `retired` if the host comes back.
+retired = "2026-11-18"
 description = "Mac Pro disposable Vellum Linux x64 PR-safe pool; unprivileged same-repository jobs only."
 provider = "proxmox"
 host = "macpro"
@@ -334,6 +343,9 @@ workflow_access = ["Generous-Corp/vellum/.github/workflows/product-quality.yml@r
 runs_on_json = ["self-hosted", "Linux", "X64", "vellum-build-linux-x64", "vellum-host-macpro", "vellum-pr-safe-linux-x64"]
 
 [targets."macpro.vellum-linux-x64-release"]
+# macpro was retired from CI and powered off on 2026-11-18. The target stays
+# listed and is never selected; delete `retired` if the host comes back.
+retired = "2026-11-18"
 description = "Mac Pro disposable Vellum Linux x64 release-build pool; signing and publication remain hosted."
 provider = "proxmox"
 host = "macpro"
@@ -423,6 +435,9 @@ runner_group = "vellum-macos-intel"
 runs_on_json = ["self-hosted", "macOS", "X64", "vellum-build-macos-intel", "vellum-host-macmini"]
 
 [targets."macpro.vellum-windows-x64-qemu"]
+# macpro was retired from CI and powered off on 2026-11-18. The target stays
+# listed and is never selected; delete `retired` if the host comes back.
+retired = "2026-11-18"
 description = "Mac Pro Proxmox Windows x64 Vellum canary candidate; requires a Vellum golden and native proof before enablement."
 provider = "proxmox"
 host = "macpro"
