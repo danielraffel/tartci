@@ -57,6 +57,20 @@ def _created_key(run: dict[str, Any]) -> str:
     return str(run.get("created_at") or "")
 
 
+# A run counts as requeued once it was last updated at least this long after it
+# was created: a run that is queued again after a job of it ran.
+REQUEUE_AFTER_SECONDS = 60
+
+
+def _seconds_between(start: str, end: str) -> float:
+    try:
+        a = dt.datetime.fromisoformat(start.replace("Z", "+00:00"))
+        b = dt.datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return (b - a).total_seconds()
+
+
 def _fresh(timestamp: str, max_age_seconds: int) -> bool:
     if max_age_seconds <= 0:
         return True
@@ -448,6 +462,44 @@ class QueueScanner:
         # keep the historical selection.
         return max(0, int(getattr(self.args, "merge_group_quota", 0) or 0))
 
+    def _requeued_quota(self) -> int:
+        return max(0, int(getattr(self.args, "requeued_quota", 0) or 0))
+
+    def _requeued_runs(self, runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Old runs that have queued a job since they started, best first.
+
+        A run whose first job ran and whose dependent job is now queued (Vellum's
+        sterile-consumer, queued when its GPU proof ends) is listed `queued`
+        again with `updated_at` long after `created_at`. Newer runs outrank it
+        by age, so the newest and merge-group quotas miss it and the rotation
+        reaches it only once per sweep. An `in_progress` run updated since the
+        previous discovery may also have queued one. Merge-group runs first,
+        then requeued before merely updated, oldest first within each.
+        """
+        now = int(getattr(self, "now", 0) or 0)
+        window = int(getattr(self.args, "discovery_ttl", 0) or 0)
+        ranked = []
+        for run in runs:
+            status = str(run.get("status") or str(run.get("_page_key", "")).split(":")[0])
+            created = _created_key(run)
+            updated = str(run.get("updated_at") or "")
+            if not created or not updated:
+                continue
+            if status in ("queued", "pending"):
+                if _seconds_between(created, updated) < REQUEUE_AFTER_SECONDS:
+                    continue
+                kind = 0
+            elif status == "in_progress":
+                if not now or not window or _age_seconds(updated, now) > window \
+                        or _seconds_between(created, updated) < REQUEUE_AFTER_SECONDS:
+                    continue
+                kind = 1
+            else:
+                continue
+            ranked.append((run.get("event") != "merge_group", kind, created, run))
+        ranked.sort(key=lambda item: item[:3])
+        return [item[3] for item in ranked]
+
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         now = int(getattr(self, "now", 0) or 0)
         max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
@@ -490,12 +542,17 @@ class QueueScanner:
         # (Pulp builds up to five groups) cannot starve the PR backlog. When the
         # oldest-run reservation will fire this sweep it costs a slot too.
         reservation = 1 if self._reservation_fires(newest, state) else 0
-        merge_quota = min(
-            self._merge_group_quota(),
-            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
-        )
-        priority = [
-            run for run in newest if run.get("event") == "merge_group"
+        slots = max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1)
+        # Requeued runs (an old run whose dependent job is now queued) come
+        # first, from the same slots as the merge-group quota, so every
+        # refresh reads them whatever their age; the newest quota, the
+        # oldest-run reservation and one rotating slot keep theirs.
+        requeued = self._requeued_runs(runs)[: min(self._requeued_quota(), slots)]
+        requeued_ids = {int(run["id"]) for run in requeued}
+        merge_quota = min(self._merge_group_quota(), slots - len(requeued))
+        priority = requeued + [
+            run for run in newest
+            if run.get("event") == "merge_group" and int(run["id"]) not in requeued_ids
         ][:merge_quota]
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
@@ -866,6 +923,13 @@ def parse_args() -> argparse.Namespace:
         "from --max-job-fetches (0, the default, keeps the newest-then-rotation order)",
     )
     parser.add_argument(
+        "--requeued-quota",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_REQUEUED_QUOTA", "2")),
+        help="old runs that queued a job since they started (merge_group first, "
+        "oldest first) read on every refresh, from --max-job-fetches (0 disables)",
+    )
+    parser.add_argument(
         "--oldest-reserve-max-age",
         type=int,
         default=int(os.environ.get("TARTCI_QUEUE_OLDEST_RESERVE_MAX_AGE_SECS", "172800")),
@@ -931,6 +995,8 @@ def parse_args() -> argparse.Namespace:
         or args.observation_lock_timeout <= 0
     ):
         parser.error("--observation-lock-timeout must be positive")
+    if args.requeued_quota < 0:
+        parser.error("--requeued-quota must be non-negative")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     if args.observation_backoff_file is None:

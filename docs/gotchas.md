@@ -1161,3 +1161,23 @@ not permission to force-remove a worktree.
   → *Diagnose:*
   the lane's `queue-scan.<hash>.json` `negative` map lists only runs that scan
   evaluated; the merge-group run's id is absent while its job sits `queued`.
+- **A merge group older than the quota is invisible again** (2026-11-18).
+  Vellum merge-group run 44294314185 was created at 11:23Z. Its GPU proof
+  ended at 12:52Z and queued `sterile-consumer`, and the run went back to
+  `queued`. From 13:18Z to 13:22Z, m3, m5studio and m1 each booted a PR-class
+  VM while counting merge-group demand as 0. More than ten newer runs existed,
+  and two of them were newer merge groups, so the newest and merge-group
+  quotas both passed over the run. → *Fix:* `queue_scan.py --requeued-quota`
+  (env `TARTCI_QUEUE_REQUEUED_QUOTA`). The CLI default is 2, so every lane
+  gets it. On each refresh the scan first reads runs that queued a job after
+  one of their jobs ran:
+  - a `queued` or `pending` run whose `updated_at` is at least 60 s after
+    `created_at`;
+  - an `in_progress` run updated since the previous discovery and at least
+    60 s after its `created_at`.
+
+  Merge groups come first, then requeued runs before merely updated ones,
+  oldest first within each. These reads come from the same slots as
+  `--merge-group-quota`. The newest quota, the oldest-run reservation and one
+  rotating slot keep theirs, so the API-call budget is unchanged. `0`
+  restores the old selection.
