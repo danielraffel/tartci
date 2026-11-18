@@ -87,6 +87,8 @@ class FakeLaunchd:
                 return 113, "", "Could not find service"
             if label not in getattr(self, "kick_noop", set()):
                 job["runs"] += 1  # a demand spawn runs it once and it exits
+                if label in getattr(self, "kick_runs_long", set()):
+                    job["running"] = True  # ...or keeps running
             return 0, "", ""
         return 64, "", "usage"
 
@@ -505,6 +507,46 @@ class DomainStallTests(GuardCase):
         events = [e["event"] for e in self.lane_events()]
         self.assertEqual(events.count("launchd_interval_spawns_recovered"), 1)
         self.assertEqual(lig.status(self.state, now=self.clock.now)["state"], "ok")
+
+    def test_long_running_jobs_launchd_started_are_not_a_stall(self) -> None:
+        # m3, 2026-11-18: the fleet-pass lanes (StartInterval 120-200 s) run
+        # for tens of minutes. launchd does not start a job that is still
+        # running, so their run counts froze, and the guard opened an episode
+        # (tartci issue 992) while launchd started every other timer itself.
+        for label in ("com.danielraffel.fleet-pass.repair2",
+                      "com.danielraffel.fleet-pass.reviewer2",
+                      "com.danielraffel.shipyard.steward-tick"):
+            self.interval_agent(label, 120, running=True)
+        g = self.guard()
+        g.pass_once()
+        for _ in range(16):  # 80 minutes, every one still in its first run
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertFalse(receipt["episode"]["active"], receipt)
+        self.assertEqual(receipt["stalled"], [])
+        self.assertEqual(self.launchd.kicks(), [])
+        # It still counts once the run ends and launchd does not start it again.
+        for job in self.launchd.jobs.values():
+            job["running"] = False
+        for _ in range(3):
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertTrue(receipt["episode"]["active"])
+
+    def test_a_kicked_run_that_keeps_running_is_still_a_stall(self) -> None:
+        # In a real stall the guard's kicks keep the timers going; a kicked
+        # run that lasts must not read as launchd starting the job.
+        labels = ("com.danielraffel.tartci.reap", "com.danielraffel.tartci.launchd-watchdog")
+        for label in labels:
+            self.interval_agent(label, 300)
+        self.launchd.kick_runs_long = set(labels)
+        g = self.guard()
+        g.pass_once()
+        for _ in range(12):
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertGreaterEqual(len(self.launchd.kicks()), 2)
+        self.assertTrue(receipt["episode"]["active"], receipt)
 
     def test_one_stuck_agent_is_not_a_domain_stall(self) -> None:
         self.interval_agent("com.danielraffel.tartci.reap", 300)

@@ -338,12 +338,21 @@ class Guard:
                 mem["natural_ts"] = now
                 mem["unconfirmed"] = 0
                 mem.pop("ceiling_reported", None)
+            # Whose run is the latest one: launchd's, or one the guard kicked.
+            mem["run_ours"] = delta <= ours
             mem["runs"] = obs["runs"]
         limit = STALL_FACTOR * interval
         natural_age = now - float(mem.get("natural_ts", now))
         if obs["running"]:
-            # Running is progress for the kick decision, never for launchd.
+            # Running is progress for the kick decision. It is progress for
+            # launchd too while the run is one launchd started: launchd does
+            # not start a StartInterval job that is still running, so a job
+            # that runs longer than 2x its interval (the fleet-pass lanes, m3
+            # 2026-11-18) froze its run count and read as a domain stall.
             mem["progress_ts"] = now
+            if not mem.get("run_ours"):
+                mem["natural_ts"] = now
+                natural_age = 0.0
         if natural_age > limit:
             stalled.append({"label": label, "interval": interval,
                             "seconds_since_launchd_start": int(natural_age)})
