@@ -282,9 +282,37 @@ heal_bin="$tmp/heal-bin"; mkdir -p "$heal_bin"
 cat >"$heal_bin/killall" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_STATE/killall.log"
+# Records whether the wrapper's lock descriptor leaked into this child.
+if [ -e /dev/fd/9 ]; then echo inherited >>"$STUB_STATE/fd9.log"; fi
+if [ -n "${STUB_BLOCK_FILE:-}" ] && ( set -C; : >"$STUB_BLOCK_FILE" ) 2>/dev/null; then
+  while [ ! -e "${STUB_RELEASE_FILE:?}" ]; do sleep 0.02; done
+fi
+# A real killall prints "No matching processes ..." and exits 1 on a name
+# with no match.
+if [ "${2:-}" = sandboxd ]; then
+  if [ "${STUB_SANDBOXD_ABSENT:-0}" = 1 ]; then echo "No matching processes were found" >&2; exit 1; fi
+  exit "${STUB_KILLALL_SANDBOXD_RC:-${STUB_KILLALL_RC:-0}}"
+fi
 exit "${STUB_KILLALL_RC:-0}"
 EOF
 chmod +x "$heal_bin/killall"
+# lockf: the real one unless a test forces its exit status.
+cat >"$heal_bin/lockf" <<'EOF'
+#!/usr/bin/env bash
+[ -z "${STUB_LOCKF_RC:-}" ] || exit "$STUB_LOCKF_RC"
+exec /usr/bin/lockf "$@"
+EOF
+chmod +x "$heal_bin/lockf"
+# pgrep -x NAME: tccd always runs; sandboxd unless STUB_SANDBOXD_ABSENT=1.
+cat >"$heal_bin/pgrep" <<'EOF'
+#!/usr/bin/env bash
+case "${2:-}" in
+  tccd) echo 101 ;;
+  sandboxd) [ "${STUB_SANDBOXD_ABSENT:-0}" = 1 ] || [ "${STUB_PGREP_NO_SANDBOXD:-0}" = 1 ] && exit 1; echo 202 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$heal_bin/pgrep"
 heal_env=(env TARTCI_HEAL_TCC_TEST=1 TARTCI_HEAL_TCC_STAMP="$tmp/heal.stamp"
           TARTCI_HEAL_TCC_LOG="$tmp/heal.log" TARTCI_HEAL_TCC_PATH="$heal_bin:$PATH"
           STUB_STATE="$STUB_STATE")
@@ -298,19 +326,85 @@ if [ "$(uname -s)" = Darwin ]; then
   has err "must run as root"
   expect_rc 0 "heal: first run" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has out "restarted tccd and sandboxd"
-  [ "$(cat "$STUB_STATE/killall.log")" = "tccd sandboxd" ] || fail "heal: killall must receive exactly 'tccd sandboxd', got: $(cat "$STUB_STATE/killall.log")"
+  # SIGKILL: tccd and sandboxd defer SIGTERM until idle, and a wedged tccd never is.
+  [ "$(cat "$STUB_STATE/killall.log")" = "$(printf -- '-KILL tccd\n-KILL sandboxd')" ] || fail "heal: killall must receive exactly '-KILL tccd' then '-KILL sandboxd', got: $(cat "$STUB_STATE/killall.log")"
   [ -e "$tmp/heal.stamp" ] || fail "heal: no stamp written"
   grep -q "heal uid=" "$tmp/heal.log" || fail "heal: no audit line"
   expect_rc 75 "heal: second run within the interval is rate limited" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has err "rate limited"
-  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 1 ] || fail "heal: rate limit must run nothing"
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: rate limit must run nothing"
   grep -q "rate-limited" "$tmp/heal.log" || fail "heal: rate limit not logged"
   # An old stamp (older than 30 min) allows a run again; a failing killall is reported and still stamps.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
   expect_rc 3 "heal: killall failure is passed through" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_RC=3 bash "$HEAL"
-  has err "killall tccd sandboxd exited 3"
-  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: an old stamp must allow one run"
+  has err "killall -KILL tccd exited 3"
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 4 ] || fail "heal: an old stamp must allow one run"
   expect_rc 75 "heal: a failed attempt still spends the budget" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # sandboxd is launched on demand: its kill is always issued, and killall's
+  # no-match exit is not a failure.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
+  expect_rc 0 "heal: an absent sandboxd does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_SANDBOXD_ABSENT=1 bash "$HEAL"
+  [ "$(cat "$STUB_STATE/killall.log")" = "$(printf -- '-KILL tccd\n-KILL sandboxd')" ] || fail "heal: the sandboxd kill must always be issued, got: $(cat "$STUB_STATE/killall.log")"
+  has out "restarted tccd (sandboxd was not running)"
+  grep -q "sandboxd_rc=absent" "$tmp/heal.log" || fail "heal: the absent sandboxd is not logged"
+  # A sandboxd that the pgrep snapshot missed (it started after) is killed.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
+  expect_rc 0 "heal: a sandboxd missing from the snapshot is still killed" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_PGREP_NO_SANDBOXD=1 bash "$HEAL"
+  grep -qx -- "-KILL sandboxd" "$STUB_STATE/killall.log" || fail "heal: the sandboxd kill was skipped"
+  # Any other sandboxd kill failure fails the heal (after tccd was killed).
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  expect_rc 3 "heal: a real sandboxd kill failure is propagated" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_SANDBOXD_RC=3 bash "$HEAL"
+  has err "killall -KILL sandboxd exited 3"
+  # A lock left by a heal that died (no live holder) never blocks a later one:
+  # flock is released by the kernel when its holder exits.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$tmp/heal.flock"
+  expect_rc 0 "heal: a leftover lock file without a holder does not block" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # A holder killed with SIGKILL releases the lock too.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  /usr/bin/lockf -k "$tmp/heal.flock" /bin/sleep 30 &
+  holder=$!
+  sleep 0.3
+  expect_rc 75 "heal: a live lock holder blocks a second heal" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has err "already in progress"
+  kill -KILL "$holder"; wait "$holder" 2>/dev/null || true
+  expect_rc 0 "heal: a SIGKILLed holder's lock is released" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # A wrapper SIGKILLed while its killall hangs leaves no lock behind: neither
+  # the orphaned command substitution nor killall holds fd 9.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  oblock="$tmp/orphan.block"; orelease="$tmp/orphan.release"; rm -f "$oblock" "$orelease"
+  env STUB_BLOCK_FILE="$oblock" STUB_RELEASE_FILE="$orelease" "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL" >/dev/null 2>&1 &
+  orphan_pid=$!
+  for _ in $(seq 1 100); do [ -e "$oblock" ] && break; sleep 0.02; done
+  [ -e "$oblock" ] || fail "heal: the orphan test's wrapper did not reach killall"
+  kill -KILL "$orphan_pid"; wait "$orphan_pid" 2>/dev/null || true
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  expect_rc 0 "heal: a hung child of a killed wrapper does not hold the lock" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_BLOCK_FILE="$oblock" STUB_RELEASE_FILE="$orelease" bash "$HEAL"
+  touch "$orelease"
+  # A lockf failure other than contention is a failure, not a benign "busy".
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
+  expect_rc 70 "heal: a lockf usage error is not reported as busy" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_LOCKF_RC=64 bash "$HEAL"
+  has err "lockf exited 64"
+  [ ! -s "$STUB_STATE/killall.log" ] || fail "heal: a failed lock must run nothing"
+  # The kill vectors never inherit the lock: a killall that outlives the
+  # wrapper must not keep the lock held.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  : >"$STUB_STATE/fd9.log"
+  expect_rc 0 "heal: fd 9 closed for killall" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  [ ! -s "$STUB_STATE/fd9.log" ] || fail "heal: killall inherited the lock descriptor"
+  # The lock covers both the budget reservation and the kill vectors: a
+  # concurrent caller must be rejected before it reaches killall.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  : >"$STUB_STATE/killall.log"
+  block="$tmp/heal.block"; release="$tmp/heal.release"
+  ( env STUB_BLOCK_FILE="$block" STUB_RELEASE_FILE="$release" "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL" >"$tmp/concurrent.out" 2>"$tmp/concurrent.err" ) &
+  first_pid=$!
+  for _ in $(seq 1 100); do [ -e "$block" ] && break; sleep 0.02; done
+  [ -e "$block" ] || fail "heal: first concurrent caller did not reach killall"
+  expect_rc 75 "heal: concurrent caller is rejected before signaling" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has err "already in progress"
+  touch "$release"
+  wait "$first_pid" || { cat "$tmp/concurrent.out" "$tmp/concurrent.err" >&2; fail "heal: first concurrent caller failed"; }
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: concurrent caller reached killall"
 else
   expect_rc 78 "heal: refuses off macOS" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has err "macOS only"
@@ -323,6 +417,9 @@ has out "nothing changed"
 expect_rc 77 "heal installer: apply refuses without root" -- env -u SUDO_USER bash "$HEAL_INSTALL" --apply
 has err "run with sudo"
 expect_rc 64 "heal installer: unknown flag" -- bash "$HEAL_INSTALL" --bogus
+# Rollback removes every file the wrapper leaves in its state directory, so
+# the directory itself can go.
+grep -q '/var/db/tartci-heal-tcc/heal.flock' "$HEAL_INSTALL" || fail "heal installer: rollback leaves heal.flock"
 
 # The chain check's mode predicate (stat prints octal; bash must read base 8).
 # Owner is root only in real use, so only the mode is tested here.
