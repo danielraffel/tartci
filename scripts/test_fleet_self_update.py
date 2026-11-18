@@ -1384,7 +1384,10 @@ class OneAtATimeTests(Base):
 
     def test_stagger_is_stable_and_bounded(self) -> None:
         self.assertEqual(su.stagger_seconds("m5"), su.stagger_seconds("m5"))
-        self.assertTrue(0 <= su.stagger_seconds("studio") < 600)
+        # m3 ("studio") hashed to 596 s of a 600 s window and slept ~10 min in
+        # every scheduled attempt (2026-11-17/18 receipts: "checkout 9.9 min").
+        for host in ("m1", "m5", "studio", "m5studio"):
+            self.assertTrue(0 <= su.stagger_seconds(host) <= 120, host)
 
 
 class HandoffKickTests(Base):
