@@ -3529,10 +3529,11 @@ with nothing alerting.
   it. A golden with no record is `unknown`; record an existing one by hand with
   `scripts/runner_age.py record --golden NAME --version V`, using the version
   printed by `~/actions-runner/bin/Runner.Listener --version` inside that golden.
-  The macOS lane also installs its pinned runner into each VM
-  (`providers/tart-macos/runner.sh`, checked by `check_runner_version`), so a
-  stale macOS golden is replaced per job; the Linux lane runs the golden's agent
-  as it is. Proxmox goldens are not covered: their version lives in the Proxmox
+  The macOS lane installs its pinned runner into each VM
+  (`providers/tart-macos/runner.sh`), so what runs there is the pin and not the
+  golden's copy. For `pulp-build-runner` the installed version is therefore the
+  pin (`runner.sh --print-runner-version`), judged by the same 30-day rule. The
+  Linux lane runs the golden's agent as it is. Proxmox goldens are not covered: their version lives in the Proxmox
   bake receipt, which is a different read path.
 - **Where it shows.** `tartci doctor runner-age [--json]`, a section in bare
   `tartci doctor`, and the tool-freshness refresh (every watchdog pass), which

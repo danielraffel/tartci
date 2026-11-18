@@ -24,6 +24,11 @@ The installed version is never read by booting a golden. It is recorded when
 the golden is provisioned (`record`), and `check` reads that record. A golden
 with no record is unknown.
 
+The macOS lane is the exception: its supervisor installs a pinned runner into
+every VM, so what runs there is the pin, not what the golden carries. For the
+macOS golden the installed version is therefore the pin
+(`providers/tart-macos/runner.sh --print-runner-version`).
+
 CLI:
   runner_age.py check [--json] [--golden NAME ...] [--min V] [--warn-days N]
   runner_age.py record --golden NAME --version V [--source TEXT]
@@ -48,6 +53,9 @@ DEADLINE_DAYS = 30.0
 WARN_DAYS = 10.0
 RUNNER_REPO = "actions/runner"
 DEFAULT_GOLDENS = ("pulp-build-runner", "pulp-linux-build")
+# Goldens whose VMs run the supervisor's pinned runner, not the baked one.
+PINNED_GOLDENS = ("pulp-build-runner",)
+MACOS_RUNNER = Path(__file__).resolve().parent.parent / "providers" / "tart-macos" / "runner.sh"
 DAY = 86400.0
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
@@ -158,6 +166,16 @@ def read_record(golden: str, home: Optional[Path] = None) -> Optional[str]:
     return value.get("version") if isinstance(value, dict) else None
 
 
+def macos_pin(script: Optional[Path] = None) -> Optional[str]:
+    """The runner version the macOS supervisor installs into each VM, or None."""
+    try:
+        proc = subprocess.run(["bash", str(script or MACOS_RUNNER), "--print-runner-version"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
 def present_goldens() -> Optional[set]:
     """Base names of the local Tart VMs, or None when tart cannot be listed."""
     try:
@@ -182,16 +200,25 @@ def fetch_releases(feed: Optional[Callable[[str], str]] = None) -> Optional[list
 def collect(goldens, now: float, *, home: Optional[Path] = None, minimum: Optional[str] = None,
             warn_days: float = WARN_DAYS, releases: Optional[list] = None,
             present: Optional[Callable[[], Optional[set]]] = None,
-            read: Optional[Callable[[str], Optional[str]]] = None) -> list:
-    """One row per golden that exists on this host. Reads records only; boots nothing."""
+            read: Optional[Callable[[str], Optional[str]]] = None,
+            pin: Optional[Callable[[], Optional[str]]] = None) -> list:
+    """One row per golden that exists on this host. Reads records and the macOS
+    pin only; boots nothing."""
     here = (present or present_goldens)()
     rows = []
     for golden in goldens:
         if here is not None and base_name(golden) not in here:
             continue
-        installed = (read or (lambda g: read_record(g, home)))(golden)
+        pinned = base_name(golden) in PINNED_GOLDENS
+        if pinned:
+            installed = (pin or macos_pin)()
+        else:
+            installed = (read or (lambda g: read_record(g, home)))(golden)
         row = classify(installed, releases, now, minimum=minimum, warn_days=warn_days)
+        if pinned and row["installed"] is None:
+            row["reason"] = "pinned macOS runner version could not be read"
         row["golden"] = base_name(golden)
+        row["source"] = "pin" if pinned else "record"
         rows.append(row)
     return rows
 

@@ -94,9 +94,33 @@ class CollectTests(unittest.TestCase):
     def test_no_record_is_unknown(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.dict(os.environ, {"TARTCI_HOME": tmp}):
-            rows = ra.collect(("pulp-build-runner",), NOW, releases=LATEST_OLD,
-                              present=lambda: {"pulp-build-runner"})
+            rows = ra.collect(("pulp-linux-build",), NOW, releases=LATEST_OLD,
+                              present=lambda: {"pulp-linux-build"})
         self.assertEqual(rows[0]["verdict"], "unknown")
+
+    def test_macos_golden_is_judged_by_the_pin_not_a_record(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"TARTCI_HOME": tmp}):
+            ra.record("pulp-build-runner", "2.336.0", now=NOW)
+            rows = ra.collect(("pulp-build-runner",), NOW, releases=LATEST_OLD,
+                              present=lambda: {"pulp-build-runner"}, pin=lambda: "2.338.2")
+        self.assertEqual((rows[0]["verdict"], rows[0]["installed"], rows[0]["source"]),
+                         ("ok", "2.338.2", "pin"))
+
+    def test_stale_macos_pin_fails(self):
+        rows = ra.collect(("pulp-build-runner",), NOW, releases=LATEST_OLD,
+                          present=lambda: {"pulp-build-runner"}, pin=lambda: "2.336.0")
+        self.assertEqual(rows[0]["verdict"], "fail")
+
+    def test_unreadable_macos_pin_is_unknown(self):
+        rows = ra.collect(("pulp-build-runner",), NOW, releases=LATEST_OLD,
+                          present=lambda: {"pulp-build-runner"}, pin=lambda: None)
+        self.assertEqual(rows[0]["verdict"], "unknown")
+        self.assertIn("pinned macOS runner", rows[0]["reason"])
+
+    def test_macos_pin_is_read_from_the_supervisor(self):
+        self.assertRegex(ra.macos_pin() or "", r"^\d+\.\d+\.\d+$")
+        self.assertIsNone(ra.macos_pin(Path("/nonexistent/runner.sh")))
 
     def test_tart_unlistable_checks_every_named_golden(self):
         rows = ra.collect(("a", "b"), NOW, releases=LATEST_OLD, present=lambda: None,
