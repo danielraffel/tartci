@@ -901,15 +901,76 @@ def wrapper_sends_sigkill(wrapper: str) -> bool:
     return tuple(kill_vectors(text)) == KILL_VECTORS
 
 
+_KILL_WORD = '"$KILLALL"'
+_COMMAND_LEADERS = ("", ";", "&", "|", "(", "{", "!", "exec", "then", "do", "else", "elif")
+_HEREDOC = re.compile(r"<<-?\s*(?:'([^']+)'|\"([^\"]+)\"|\\?(\w+))")
+
+
 def kill_vectors(text: str) -> list[str]:
-    """Each `"$KILLALL" ...` call on a code line (comments skipped), in order,
-    with its redirection dropped."""
+    """Each `"$KILLALL" ...` the wrapper would execute, in order, redirections dropped.
+
+    A small shell scanner, not a regex over lines: a call counts only in code
+    that runs (top level or inside `$( )`), at a command position. Quoted
+    strings, comments and here-document bodies are skipped, so a wrapper that
+    merely prints or stores the two vectors is not credited with running them.
+    Anything it cannot place is left uncounted, which reads as stale.
+    """
     calls: list[str] = []
-    for line in text.splitlines():
-        if line.lstrip().startswith("#"):
+    stack = ["code"]  # "code", "paren" (code inside $( )), "dq", "sq"
+    pending: list[str] = []  # here-document tags awaiting their bodies
+    n, i = len(text), 0
+    while i < n:
+        c, top = text[i], stack[-1]
+        if top == "sq":
+            if c == "'":
+                stack.pop()
+        elif top == "dq":
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                stack.pop()
+            elif text.startswith("$(", i):
+                stack.append("paren")
+                i += 1
+        elif c == "\n" and pending:
+            i += 1
+            while pending and i <= n:
+                end = text.find("\n", i)
+                end = n if end < 0 else end
+                if text[i:end].strip() == pending[0]:
+                    pending.pop(0)
+                i = end + 1
             continue
-        for call in _KILL_CALL.findall(line):
-            calls.append(_REDIRECTIONS.sub("", call).strip())
+        elif c == "\\":
+            i += 1
+        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;"):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        elif text.startswith(_KILL_WORD, i):
+            lead = re.split(r"[\n]|\$\(|&&|\|\||[;&|({!]", text[:i])[-1].strip()
+            raw = re.match(r'(?:[^)\n;&|<>]|\d*>&?[-\w/]*)*', text[i:]).group(0)
+            if lead.split()[-1:] in ([], ["exec"], ["then"], ["do"], ["else"], ["elif"]) \
+                    or lead in _COMMAND_LEADERS:
+                calls.append(_REDIRECTIONS.sub("", raw).strip())
+            i += len(_KILL_WORD)
+            continue
+        elif c == "'":
+            stack.append("sq")
+        elif c == '"':
+            stack.append("dq")
+        elif text.startswith("$(", i):
+            stack.append("paren")
+            i += 1
+        elif c == ")" and top == "paren":
+            stack.pop()
+        elif text.startswith("<<", i) and not text.startswith("<<<", i):
+            m = _HEREDOC.match(text, i)
+            if m:
+                pending.append(m.group(1) or m.group(2) or m.group(3))
+                i = m.end()
+                continue
+        i += 1
     return calls
 
 

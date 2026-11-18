@@ -383,6 +383,27 @@ class HealTests(unittest.TestCase):
         self.wrapper.write_text(good + "# a comment naming \"$KILLALL\" -KILL tccd\n")
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
 
+    def test_vectors_that_are_quoted_echoed_or_in_a_heredoc_are_not_executed(self) -> None:
+        # The old SIGTERM call still runs in each; the two vectors only appear
+        # as text. None may be credited as the SIGKILL wrapper.
+        old = '/usr/bin/killall tccd sandboxd\n'
+        v1, v2 = tw.KILL_VECTORS
+        not_executed = {
+            "echoed": f"echo '{v1}'\necho '{v2}'\n" + old,
+            "double quoted": f'msg="{v1.replace(chr(34), chr(92) + chr(34))}"\n' + old,
+            "heredoc body": f"cat <<'EOF'\n{v1}\n{v2}\nEOF\n" + old,
+            "unquoted heredoc": f"cat <<EOF\n{v1}\n{v2}\nEOF\n" + old,
+            "as an argument": f"echo {v1}\necho {v2}\n" + old,
+            "inside a quoted $( )": f"x='$({v1})'\ny='$({v2})'\n" + old,
+        }
+        for name, body in not_executed.items():
+            with self.subTest(name):
+                self.wrapper.write_text("#!/bin/bash\n" + body)
+                self.assertFalse(tw.wrapper_sends_sigkill(str(self.wrapper)), name)
+        # An executed call after a heredoc is still found.
+        self.wrapper.write_text(f"#!/bin/bash\ncat <<EOF\nnote\nEOF\n{v1}\n{v2}\n")
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+
     def test_the_repo_wrapper_is_the_sigkill_version(self) -> None:
         self.assertTrue(tw.wrapper_sends_sigkill(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")))
 
