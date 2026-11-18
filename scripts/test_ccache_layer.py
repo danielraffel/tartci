@@ -37,6 +37,22 @@ def entry(kind: int, payload: bytes = b"payload") -> bytes:
     return b"\xcc\xac\x01" + bytes([kind]) + b"\x00" * 16 + payload
 
 
+def bsd_tar_path() -> str | None:
+    """A BSD tar binary: bsdtar itself, or a tar that reports bsdtar."""
+    found = shutil.which("bsdtar")
+    if found:
+        return found
+    tar = shutil.which("tar")
+    if tar is None:
+        return None
+    try:
+        version = subprocess.run([tar, "--version"], capture_output=True, text=True,
+                                 timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return tar if "bsdtar" in version else None
+
+
 def write_entry(remote: Path, key: str, data: bytes, mtime: float | None = None) -> Path:
     path = remote / key[:2] / key[2:]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -791,9 +807,18 @@ class SeedTests(Base):
         self.peer_promotions = self.peer_root / "ccache-layer-state" / "promotions"
         self.peer_shared.mkdir(parents=True)
         self.peer_promotions.mkdir(parents=True)
-        # Runs the remote script locally, as ssh would on the peer.
+        # Runs the remote script locally, as ssh would on the peer. Peers are
+        # macOS hosts, so the script uses BSD tar flags (--no-mac-metadata,
+        # -s); where the local tar is GNU tar (the Linux CI runner), put
+        # bsdtar first on the script's PATH as "tar", or skip without one.
+        bsd_tar = bsd_tar_path()
+        if bsd_tar is None:
+            self.skipTest("the peer pull script needs BSD tar; no bsdtar here")
+        shim = self.tmp / "peer-bin"
+        shim.mkdir()
+        (shim / "tar").symlink_to(bsd_tar)
         self.ssh = self.tmp / "fake-ssh"
-        self.ssh.write_text('#!/bin/sh\nfor a; do last=$a; done\nexec sh -c "$last"\n')
+        self.ssh.write_text(f'#!/bin/sh\nfor a; do last=$a; done\nPATH={shim}:$PATH exec sh -c "$last"\n')
         self.ssh.chmod(0o755)
 
     def identity_file(self, name: str, **changes: object) -> Path:
