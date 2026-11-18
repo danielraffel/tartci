@@ -581,7 +581,11 @@ all is `unavailable`, never "no alert". Then:
   the only sender. The send is recorded in
   `~/.tartci/state/tcc-prompt-notify.json` only once it succeeds, so a failed
   post is retried on the next pass; a post that reached Discord but timed out
-  is sent again (at least once, not exactly once). `TARTCI_OWNER_NOTIFY=0`
+  is sent again (at least once, not exactly once). The WARN line says
+  `owner told`, or `owner NOT told: <why>` until a send succeeds. Nothing on
+  this path touches /Volumes (the store volume a prompt wedge hangs): the
+  webhook file, the receipt, the watchdog's program, generation and log all
+  live under the home directory. `TARTCI_OWNER_NOTIFY=0`
   turns it off. On 2026-11-18 the issue alone (tartci #960) waited about 4 h
   for a click;
 - the consent-alert pass owns the fallback heal: once a store open has waited

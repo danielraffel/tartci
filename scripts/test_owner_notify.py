@@ -75,5 +75,87 @@ class OwnerNotifyTests(unittest.TestCase):
         opened.assert_not_called()
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class NoVolumesTests(unittest.TestCase):
+    """During the 2026-11-18 m5studio wedge every launchd job that opened the
+    Tart store volume hung. The owner message is the way out of that wedge,
+    so nothing on its path may resolve under /Volumes."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        (self.home / ".config/pulp/secrets/fleet").mkdir(parents=True)
+        (self.home / ".config/pulp/secrets/fleet/discord-machine-room.webhook").write_text(
+            "https://example.invalid/webhook\n")
+
+    def test_the_watchdog_that_sends_runs_and_logs_off_volumes(self) -> None:
+        import plistlib
+        import render_launchd_template as render
+        template = ROOT / "launchd" / "com.danielraffel.tartci.launchd-watchdog.plist.template"
+        import re
+        source = re.sub(rb"<!--.*?-->", b"", template.read_bytes(), flags=re.DOTALL)
+        plist = render.replace_strings(plistlib.loads(source),
+                                       {"TART_HOME": "/Volumes/Example/VMs",
+                                        "HOME": "/Users/example"})
+        env = plist["EnvironmentVariables"]
+        paths = [*plist["ProgramArguments"][:2], plist["WorkingDirectory"],
+                 plist["StandardOutPath"], plist["StandardErrorPath"], env["HOME"],
+                 env["TARTCI_HOME"], *env["PATH"].split(":")]
+        for path in paths:
+            self.assertFalse(path.startswith("/Volumes"), path)
+        # The store path is only the store: the owner path never reads it.
+        self.assertEqual(env["TART_HOME"], "/Volumes/Example/VMs")
+
+    def test_default_webhook_and_receipt_resolve_under_home(self) -> None:
+        import tcc_prompt
+        env = {"HOME": str(self.home)}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.dict(os.environ, {"TARTCI_OWNER_WEBHOOK_FILE": ""}), \
+                mock.patch.dict(os.environ, {"TARTCI_HOME": ""}):
+            os.environ.pop("TARTCI_OWNER_WEBHOOK_FILE")
+            os.environ.pop("TARTCI_HOME")
+            webhook = owner_notify.webhook_file()
+            receipt = tcc_prompt._home() / "state" / tcc_prompt.NOTIFY_STATE_NAME
+        for path in (webhook, receipt):
+            self.assertTrue(str(path).startswith(str(self.home)), path)
+
+    def test_a_send_opens_nothing_under_volumes(self) -> None:
+        opened: list = []
+        recording = [True]
+
+        def hook(event, args):
+            if recording[0] and event == "open" and args and isinstance(args[0], (str, bytes)):
+                opened.append(os.fsdecode(args[0]))
+        sys.addaudithook(hook)
+        self.addCleanup(recording.__setitem__, 0, False)
+
+        class Response:
+            status = 204
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        state = self.home / ".tartci" / "state" / "tcc-prompt-notify.json"
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
+                mock.patch.object(owner_notify, "_test_run", return_value=False), \
+                mock.patch("urllib.request.urlopen", return_value=Response()):
+            os.environ.pop("TARTCI_OWNER_WEBHOOK_FILE", None)
+            out = owner_notify.notify_once(state, "k", "Click Allow on m5studio")
+        recording[0] = False
+        self.assertTrue(out["sent"], out)
+        self.assertTrue(any(p.endswith("discord-machine-room.webhook") for p in opened), opened)
+        # The modules themselves load from the code checkout, which in
+        # production is ~/.local/share/tartci-generations (the template test
+        # above); a developer checkout may sit on /Volumes.
+        code = str(Path(__file__).resolve().parent)
+        self.assertEqual([p for p in opened if os.path.realpath(p).startswith("/Volumes")
+                          and not os.path.realpath(p).startswith(code)], [])
+
+
 if __name__ == "__main__":
     unittest.main()

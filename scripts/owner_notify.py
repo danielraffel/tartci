@@ -12,6 +12,13 @@ never restores the file itself and never prints or logs the URL.
 `notify_once` posts at most once per key (one wedge episode): the key is
 recorded only after a post succeeds, so a failed post is retried on the next
 pass and a sent one never repeats. Runs under the system python3 (3.9).
+
+Nothing here touches /Volumes. During a privacy-prompt wedge every open on
+the Tart store volume hangs, and this is the message that says so: the
+webhook file and the receipt live under the home directory, the watchdog
+that calls it runs from ~/.local/share/tartci-generations with its log
+under ~/Library/Logs, and the post itself is a network call
+(test_owner_notify.NoVolumesTests).
 """
 from __future__ import annotations
 
@@ -21,7 +28,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
-DEFAULT_WEBHOOK = Path.home() / ".config" / "pulp" / "secrets" / "fleet" / "discord-machine-room.webhook"
+WEBHOOK_RELATIVE = Path(".config") / "pulp" / "secrets" / "fleet" / "discord-machine-room.webhook"
 TIMEOUT_S = 20
 
 Sender = Callable[[str], Tuple[bool, str]]
@@ -29,7 +36,7 @@ Sender = Callable[[str], Tuple[bool, str]]
 
 def webhook_file() -> Path:
     override = os.environ.get("TARTCI_OWNER_WEBHOOK_FILE")
-    return Path(override) if override else DEFAULT_WEBHOOK
+    return Path(override) if override else Path.home() / WEBHOOK_RELATIVE
 
 
 def enabled() -> bool:

@@ -482,6 +482,16 @@ class AlertPassTests(unittest.TestCase):
                       notify=lambda text: sent.append(text) or (True, "HTTP 204"))
         self.assertEqual(len(sent), 1)
 
+    def test_the_warn_line_says_when_the_owner_was_not_told(self) -> None:
+        line = tp.alert_pass(PRESENT, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                             issue=self.issue, close=self.close, heal=lambda **kw: {},
+                             notify=lambda text: (False, "no readable owner webhook at x"))
+        self.assertIn("owner NOT told: no readable owner webhook", line)
+        line = self.run_pass(PRESENT, self.verdict(), now=NOW + 300)
+        self.assertIn("owner told", line)
+        line = self.run_pass(PRESENT, self.verdict(), now=NOW + 600)
+        self.assertNotIn("owner", line, "quiet once told")
+
     def test_no_owner_message_without_a_page(self) -> None:
         self.assertIsNone(self.run_pass(PRESENT, None))
         self.assertEqual(self.sent, [])

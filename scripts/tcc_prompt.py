@@ -502,6 +502,7 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
     # so a peer that sees the issue knows the host could have sent too. After
     # the heal, so a slow post never delays it; not on the pass the heal ran,
     # which drops the alert (a click instruction then would be stale).
+    owner_text_note = ""
     if not healed:
         try:
             import owner_notify  # noqa: PLC0415 - sibling module
@@ -509,11 +510,16 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
             # episode's number when this episode's open failed.
             saved = _read_json(state_dir / ALERT_STATE_NAME)
             number = saved.get("issue") if saved.get("since") == reading.get("since") else None
-            owner_notify.notify_once(
+            told = owner_notify.notify_once(
                 state_dir / NOTIFY_STATE_NAME, str(reading.get("since")),
                 owner_text(host, reading.get("since"), number), sender=notify, now=now)
-        except Exception:  # noqa: BLE001 - the owner message never breaks the pass
-            pass
+            if told.get("sent"):
+                owner_text_note = "; owner told"
+            elif told.get("skipped") != "already sent for this episode":
+                owner_text_note = ("; owner NOT told: "
+                                   + str(told.get("skipped") or told.get("detail"))[:120])
+        except Exception as exc:  # noqa: BLE001 - the owner message never breaks the pass
+            owner_text_note = f"; owner NOT told: {type(exc).__name__}"
     why = (f"near Shipyard install {install['generation'][:12]} "
            f"({install['seconds_before_alert']} s; timing only)" if install else "")
     if waiting:
@@ -522,7 +528,7 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
         if job:
             why += f" (probe job {job})"
     return (f"{detected} launchd-watchdog: WARN tcc-prompt: a privacy consent alert has waited "
-            f"on the console since {reading.get('since')} ({why}{heal_text})"
+            f"on the console since {reading.get('since')} ({why}{heal_text}{owner_text_note})"
             + (f" (issue #{out.get('issue')})" if out.get("issue") else " (issue not opened)"))
 
 
