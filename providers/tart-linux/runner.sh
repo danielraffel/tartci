@@ -452,9 +452,11 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     note "[$i] runner assignment timeout — unassigned JIT runner and VM discarded"
   elif [ "$run_status" -ne 0 ]; then
     note "[$i] runner exited non-zero (job failure or no job) — VM discarded"
-    if grep -q 'is deprecated and cannot receive messages' "$logdir/runner-output.log" 2>/dev/null; then
-      note "[$i] runner_version_deprecated: the golden's Actions runner agent is retired by GitHub; refresh the golden (tartci doctor runner-age)"
-    fi
+  fi
+  # Checked whatever the exit status: the runner's own wrapper can exit 0 after
+  # the listener reports that GitHub retired it.
+  if grep -q 'is deprecated and cannot receive messages' "$logdir/runner-output.log" 2>/dev/null; then
+    note "[$i] runner_version_deprecated: the golden's Actions runner agent is retired by GitHub; update it (tartci doctor runner-age)"
   fi
   t_done="$(now_epoch)"
   {

@@ -1068,7 +1068,7 @@ def measure_runner_age(config: dict, home: Path, now: float) -> list[dict]:
     `unknown` row, which doctor shows and the watchdog does not alert on.
     """
     try:
-        return runner_age.collect(config["goldens"], now, home=home,
+        return runner_age.collect(config["goldens"], now, home=home, persist=True,
                                   latest=runner_age.latest_release(home))
     except Exception as exc:  # noqa: BLE001
         return [{"golden": "(all)", "verdict": "unknown", "installed": None, "latest": None,

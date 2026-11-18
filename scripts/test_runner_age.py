@@ -37,16 +37,22 @@ class PolicyTests(unittest.TestCase):
                          ("warn", "2.336.0", "2.338.2"))
 
     def test_refusal_of_the_installed_version_is_fail(self):
-        row = ra.classify("2.336.0", "2.338.2", refused="2.336.0")
+        row = ra.classify("2.336.0", "2.338.2", refused={"2.336.0"})
         self.assertEqual(row["verdict"], "fail")
         self.assertIn("refuses runner v2.336.0", row["reason"])
 
     def test_refusal_fails_even_when_the_version_is_unrecorded(self):
-        self.assertEqual(ra.classify(None, None, refused="2.336.0")["verdict"], "fail")
+        self.assertEqual(ra.classify(None, None, refused={"2.336.0"})["verdict"], "fail")
+
+    def test_installed_refusal_wins_among_several(self):
+        row = ra.classify("2.336.0", "2.338.2", refused={"2.330.0", "2.336.0"})
+        self.assertIn("v2.336.0", row["reason"])
+        row = ra.classify(None, None, refused={"2.330.0", "2.336.0"})
+        self.assertIn("v2.336.0", row["reason"])
 
     def test_refusal_of_another_version_is_ignored(self):
         # The golden was updated and recorded since that log was written.
-        self.assertEqual(ra.classify("2.338.2", "2.338.2", refused="2.336.0")["verdict"], "ok")
+        self.assertEqual(ra.classify("2.338.2", "2.338.2", refused={"2.336.0"})["verdict"], "ok")
 
     def test_unrecorded_version_is_unknown(self):
         self.assertEqual(ra.classify(None, "2.338.2")["verdict"], "unknown")
@@ -69,28 +75,29 @@ class PolicyTests(unittest.TestCase):
                 self.assertEqual(ra.classify(installed, latest)["verdict"],
                                  names[rv.evaluate(installed, latest, [])[0]])
         hit = [{"version": "2.336.0", "log": "x"}]
-        self.assertEqual(ra.classify("2.336.0", "2.338.2", refused="2.336.0")["verdict"],
+        self.assertEqual(ra.classify("2.336.0", "2.338.2", refused={"2.336.0"})["verdict"],
                          names[rv.evaluate("2.336.0", "2.338.2", hit)[0]])
 
 
 class ProblemTests(unittest.TestCase):
     def test_healthy_host_has_no_problem(self):
         rows = ra.collect(("pulp-build-runner", "pulp-linux-build"), NOW, latest="2.338.2",
-                          present=lambda: None, read=lambda g: "2.338.2",
-                          pin=lambda: "2.338.2", refusal=lambda g: None)
+                          present=lambda: {"pulp-build-runner", "pulp-linux-build"},
+                          read=lambda g: "2.338.2",
+                          pin=lambda: "2.338.2", refusal=lambda g, v: set())
         self.assertEqual([r["verdict"] for r in rows], ["ok", "ok"])
         self.assertEqual(ra.problems(rows), [])
 
     def test_unknown_is_not_a_problem(self):
         rows = ra.collect(("pulp-build-runner", "pulp-linux-build"), NOW, latest=None,
-                          present=lambda: None, read=lambda g: None,
-                          pin=lambda: None, refusal=lambda g: None)
+                          present=lambda: {"pulp-build-runner", "pulp-linux-build"},
+                          read=lambda g: None, pin=lambda: None, refusal=lambda g, v: set())
         self.assertEqual([r["verdict"] for r in rows], ["unknown", "unknown"])
         self.assertEqual(ra.problems(rows), [])
 
     def test_behind_and_refused_are_problems(self):
         rows = [dict(ra.classify("2.336.0", "2.338.2"), golden="a"),
-                dict(ra.classify(None, None, refused="2.336.0"), golden="b")]
+                dict(ra.classify(None, None, refused={"2.336.0"}), golden="b")]
         self.assertEqual(ra.problems(rows),
                          ["a: WARN: runner v2.336.0 is 2 minor versions behind v2.338.2",
                           "b: FAIL: GitHub refuses runner v2.336.0 as deprecated"])
@@ -139,19 +146,39 @@ class CollectTests(unittest.TestCase):
                           present=lambda: {"pulp-build-runner"}, pin=lambda: "2.336.0")
         self.assertEqual(rows[0]["verdict"], "fail")
 
-    def test_old_refusal_log_no_longer_counts(self):
+    def test_refusal_outlives_its_log(self):
+        # The watchdog pass sees the refusal and remembers it. A day later the
+        # log is old and the lane has not run, and the host is still broken.
+        log = self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log"
+        self.write_log(log, REFUSAL)
+        kw = dict(latest="2.338.2", present=lambda: {"pulp-linux-build"})
+        self.assertEqual(ra.collect(("pulp-linux-build",), NOW, persist=True, **kw)[0]["verdict"],
+                         "fail")
+        later = NOW + 3 * ra.LOG_SCAN_WINDOW_SECS
+        self.assertEqual(ra.collect(("pulp-linux-build",), later, **kw)[0]["verdict"], "fail")
+        log.unlink()
+        self.assertEqual(ra.collect(("pulp-linux-build",), later, **kw)[0]["verdict"], "fail")
+
+    def test_doctor_read_does_not_remember(self):
+        self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log", REFUSAL)
+        ra.collect(("pulp-linux-build",), NOW, latest="2.338.2",
+                   present=lambda: {"pulp-linux-build"})
+        self.assertEqual(ra.read_refused("pulp-linux-build"), set())
+
+    def test_old_log_alone_is_not_opened(self):
         self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log",
-                       REFUSAL, age=ra.REFUSAL_WINDOW_SECS + 60)
+                       REFUSAL, age=ra.LOG_SCAN_WINDOW_SECS + 60)
         rows = ra.collect(("pulp-linux-build",), NOW, latest="2.338.2",
                           present=lambda: {"pulp-linux-build"})
         self.assertEqual(rows[0]["verdict"], "unknown")
 
     def test_refusal_clears_once_a_newer_version_is_recorded(self):
         self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log", REFUSAL)
+        kw = dict(latest="2.338.2", present=lambda: {"pulp-linux-build"}, persist=True)
+        self.assertEqual(ra.collect(("pulp-linux-build",), NOW, **kw)[0]["verdict"], "fail")
         ra.record("pulp-linux-build", "2.338.2", now=NOW, source="operator")
-        rows = ra.collect(("pulp-linux-build",), NOW, latest="2.338.2",
-                          present=lambda: {"pulp-linux-build"})
-        self.assertEqual(rows[0]["verdict"], "ok")
+        self.assertEqual(ra.collect(("pulp-linux-build",), NOW, **kw)[0]["verdict"], "ok")
+        self.assertEqual(ra.read_refused("pulp-linux-build"), set())
 
     def test_macos_golden_is_judged_by_the_pin_not_a_record(self):
         ra.record("pulp-build-runner", "2.336.0", now=NOW)
@@ -164,10 +191,25 @@ class CollectTests(unittest.TestCase):
         self.assertRegex(ra.macos_pin() or "", r"^\d+\.\d+\.\d+$")
         self.assertIsNone(ra.macos_pin(Path("/nonexistent/runner.sh")))
 
-    def test_tart_unlistable_checks_every_named_golden(self):
-        rows = ra.collect(("a", "b"), NOW, latest="2.338.2", present=lambda: None,
-                          read=lambda g: None, refusal=lambda g: None)
+    def test_unlistable_images_judge_nothing(self):
+        # Without the image list this host may not hold the golden at all, so a
+        # stale pin or record must not alert for it.
+        rows = ra.collect(("pulp-build-runner", "pulp-linux-build"), NOW, latest="2.338.2",
+                          present=lambda: None, read=lambda g: "2.330.0",
+                          pin=lambda: "2.330.0", refusal=lambda g, v: {"2.330.0"})
         self.assertEqual([r["verdict"] for r in rows], ["unknown", "unknown"])
+        self.assertEqual(ra.problems(rows), [])
+
+    def test_macos_refusals_come_from_the_pin_check_scan(self):
+        self.write_log(self.home / "macos-state" / "vm-1.actions-runner.log", REFUSAL,
+                       age=30 * 86400.0)
+        hits = rv.scan_logs(str(self.home / "macos-state"), "2.336.0")
+        self.assertEqual(ra.scan_refusals("pulp-build-runner", "2.336.0", NOW),
+                         {h["version"] for h in hits})
+        self.assertEqual(ra.scan_refusals("pulp-build-runner", "2.338.2", NOW), set())
+
+    def test_render_tolerates_a_truncated_row(self):
+        self.assertEqual(ra.render({"golden": "x"}), "x: UNKNOWN: ")
 
     def test_record_refuses_garbage_and_accepts_listener_output(self):
         with self.assertRaises(ValueError):
@@ -194,7 +236,8 @@ class SurfaceTests(unittest.TestCase):
         out = []
         with mock.patch.object(ra, "latest_release", lambda home=None: "2.338.2"), \
                 mock.patch.object(ra, "present_goldens", lambda: {"pulp-linux-build"}), \
-                mock.patch.object(ra, "recent_refusal", lambda patterns, now: refused), \
+                mock.patch.object(ra, "scan_refusals",
+                                  lambda g, v, now, home=None: {refused} if refused else set()), \
                 mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
             code = ra.main(["check", *args])
         return code, "\n".join(out)
@@ -222,7 +265,8 @@ class SurfaceTests(unittest.TestCase):
                     "runner_age": {"goldens": ["pulp-linux-build"]}}
         with mock.patch.object(ra, "present_goldens", lambda: {"pulp-linux-build"}), \
                 mock.patch.object(ra, "latest_release", lambda home=None: latest), \
-                mock.patch.object(ra, "recent_refusal", lambda patterns, now: refused):
+                mock.patch.object(ra, "scan_refusals",
+                                  lambda g, v, now, home=None: {refused} if refused else set()):
             tf.refresh(self.home, NOW, settings=settings, feed=lambda repo: "")
         import state_age
         with mock.patch.object(state_age, "clock", lambda: NOW + 60):
@@ -257,7 +301,8 @@ class SurfaceTests(unittest.TestCase):
     def test_fleet_reason_names_the_record_command(self):
         reasons = json.loads((HERE / "fleet_reasons.json").read_text())
         text = json.dumps(reasons)
-        self.assertIn("runner_age.py record --golden", text)
+        self.assertIn("python3 scripts/runner_age.py record --golden", text)
+        self.assertIn("tool-freshness --refresh", text)
         self.assertIn("DEFAULT_RUNNER_VERSION", text)
 
 
@@ -266,6 +311,12 @@ class SupervisorTests(unittest.TestCase):
         text = (HERE.parent / "providers/tart-linux/runner.sh").read_text()
         self.assertIn("is deprecated and cannot receive messages", text)
         self.assertIn("runner_version_deprecated:", text)
+
+    def test_linux_runner_checks_the_log_whatever_the_exit_status(self):
+        text = (HERE.parent / "providers/tart-linux/runner.sh").read_text()
+        branch = text.index('elif [ "$run_status" -ne 0 ]; then')
+        closed = text.index("\n  fi\n", branch)
+        self.assertGreater(text.index("is deprecated and cannot receive messages"), closed)
 
     def test_supervisor_wording_matches_the_log_pattern(self):
         self.assertEqual(rv.find_deprecated(REFUSAL), "2.336.0")

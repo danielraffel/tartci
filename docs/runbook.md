@@ -3516,13 +3516,18 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
 
 - **What it reports.** Per golden on this host (`pulp-build-runner`,
   `pulp-linux-build`), the runner its VMs run and a verdict. `fail`: a runner
-  log written in the last 24 hours shows GitHub refusing that version (`Runner
-  version vX is deprecated and cannot receive messages`). `warn`: the version
+  log shows GitHub refusing that version (`Runner version vX is deprecated and
+  cannot receive messages`). The watchdog pass remembers a refusal in
+  `~/.tartci/state/golden-runner/<golden>.refused.json`, so the alert stays
+  after the log ages out or the lane stops trying, and clears only when the
+  version changes. `warn`: the version
   trails the latest `actions/runner` release by two minor versions or more.
-  `ok` otherwise. `unknown`: the version has no record, or the latest release
-  could not be read.
-- **One rule.** The verdict comes from `scripts/runner_version.py`, the rule
-  the macOS pin check already uses, so the two cannot disagree. There is no
+  `ok` otherwise. `unknown`: the version has no record, the latest release
+  could not be read, or the local Tart images could not be listed (then nothing
+  is judged, because the host may not hold the golden).
+- **One rule.** The lag verdict comes from `scripts/runner_version.py`, the rule
+  the macOS pin check already uses, and the macOS golden's refusals come from
+  the same log read as that check, so the two agree on the same input. There is no
   date arithmetic: GitHub's actual retirement dates do not follow a fixed
   number of days after a release, and the refusal line is the direct signal.
 - **Where the version comes from.** Nothing boots a golden to read it.
@@ -3555,10 +3560,12 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
   current `actions-runner-linux-arm64` release (keep `.env` and `.path`), shut
   it down, then record what it now carries:
 
-      scripts/runner_age.py record --golden pulp-linux-build --version <version> --source operator
+      python3 scripts/runner_age.py record --golden pulp-linux-build --version <version> --source operator
+      tartci fleet-macos tool-freshness --refresh
 
   `~/actions-runner/bin/Runner.Listener --version` inside the golden prints the
-  version. Recording a newer version also clears a `fail` from older logs.
+  version. Recording a version other than the refused one clears the `fail`;
+  the refresh makes the watchdog's stored result catch up at once.
 
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
