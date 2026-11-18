@@ -2591,7 +2591,7 @@ def behind_alert(cfg: Config, skew: dict, now: float) -> None:
         me = self_host_id(cfg)
         path = cfg.state_dir / BEHIND_ALERT_NAME
         last_path = cfg.state_dir / BEHIND_ALERT_LAST_NAME
-        active = behind >= BEHIND_STARVED_SECONDS
+        active = behind > BEHIND_STARVED_SECONDS
         state = host_off._read_json(path) or {}
         since = state.get("since") or _iso(now)
         last = _ts((host_off._read_json(last_path) or {}).get("opened_at"))
@@ -2639,6 +2639,16 @@ def behind_alert(cfg: Config, skew: dict, now: float) -> None:
             _write_json(last_path, {"opened_at": _iso(now), "issue": out["issue"]})
     except Exception as exc:  # noqa: BLE001 - an alert never fails the update
         print(f"self-update: behind-main alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def behind_alert_for_apply(cfg: Config, skew: dict, now: float, *, scheduled: bool) -> None:
+    """Alert on scheduled applies; let a manual recovery close an open episode."""
+    if scheduled:
+        behind_alert(cfg, skew, now)
+        return
+    behind = behind_main_seconds(skew, cfg.soak_seconds, now)
+    if behind is not None and behind <= BEHIND_STARVED_SECONDS:
+        behind_alert(cfg, skew, now)
 
 
 # A gate-demand snapshot older than this is not used: the bound falls back.
@@ -3619,7 +3629,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     last_skew = _read_json(cfg.state_dir / "skew.json") or {}
 
     def early_alert() -> None:
-        if not apply:
+        if not apply or not scheduled:
             return
         skew = (last_skew if behind_main_seconds(last_skew, cfg.soak_seconds, now) is not None
                 else _read_json(cfg.state_dir / BEHIND_SKEW_NAME) or {})
@@ -3629,7 +3639,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return
         if not skew.get("installed") or skew["installed"] != running:
             return  # measured before an install moved the host, or lacks provenance
-        behind_alert(cfg, skew, now)
+        behind_alert_for_apply(cfg, skew, now, scheduled=scheduled)
     blocked, interrupted = previous_run_state(cfg, sys_)
     if blocked:
         print(f"self-update: REFUSED: {blocked}")
@@ -3707,7 +3717,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
               f"{_source_name(installed_fleet_source_commit(cfg))}; {selected_source['why']})")
     print(f"self-update: {render_skew(skew)}")
     if apply:
-        behind_alert(cfg, skew, now)
+        behind_alert_for_apply(cfg, skew, now, scheduled=scheduled)
     if skew.get("explicit"):
         print(f"self-update: selected {skew.get('selected_target') or 'none'} "
               f"(requested {skew.get('requested_target')}; {skew.get('selection_reason', 'same')})")
@@ -4052,7 +4062,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
                   helper=helper, approval=approval, excluded=survey.excluded,
-                  previous_fleet_source=previous_fleet_source, auto_ack=auto_ack)
+                  previous_fleet_source=previous_fleet_source, auto_ack=auto_ack,
+                  scheduled=scheduled)
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
@@ -4390,11 +4401,12 @@ class Run:
                  repository: str | None = None,
                  excluded: list[str] | None = None,
                  previous_fleet_source: dict[str, Any] | None = None,
-                 auto_ack: bool = False) -> None:
+                 auto_ack: bool = False, scheduled: bool = False) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         # The launcher change was acknowledged automatically, not by a person
         # waiting to grant Removable Volumes: a lost grant rolls back.
         self.auto_ack = auto_ack
+        self.scheduled = scheduled
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
@@ -4437,7 +4449,7 @@ class Run:
             _write_json(self.cfg.state_dir / "skew.json", skew)
             self.receipt.step("skew", render_skew(skew))
             # Caught up: close a STARVED issue now, not at the next attempt.
-            behind_alert(self.cfg, skew, self.sys.now())
+            behind_alert_for_apply(self.cfg, skew, self.sys.now(), scheduled=self.scheduled)
         except Exception as exc:  # noqa: BLE001 - never turn a success into a failure
             self.receipt.step("skew", f"not recorded: {type(exc).__name__}: {exc}", ok=False)
 

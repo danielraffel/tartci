@@ -994,6 +994,10 @@ class BehindMainAlertTests(Base):
         oldest = None if behind is None else su._iso(NOW - self.cfg.soak_seconds - behind)
         return {"state": state, "behind": 3, "installed": INSTALLED, "oldest_undeployed": oldest}
 
+    def scheduled_apply(self) -> int:
+        return su.plan_or_apply(self.cfg, self.sys, apply=True, scheduled=True,
+                                target_ref="origin/main")
+
     def test_a_deferred_host_far_behind_is_loud_once(self) -> None:
         # m3, 2026-11-17: ten hours behind, held by refusals that never
         # reach defer(), and nothing said STARVED.
@@ -1001,8 +1005,8 @@ class BehindMainAlertTests(Base):
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertDeferred(self.apply())
-            self.assertDeferred(self.apply())
+            self.assertDeferred(self.scheduled_apply())
+            self.assertDeferred(self.scheduled_apply())
         self.assertIn("STARVED", out.getvalue())
         self.assertEqual(1, len(self.opened()), self.issues)
         self.assertIn("STARVED", self.opened()[0])
@@ -1011,7 +1015,7 @@ class BehindMainAlertTests(Base):
 
     def test_an_update_that_catches_up_closes_its_issue(self) -> None:
         self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
-        self.assertUpdated(self.apply())
+        self.assertUpdated(self.scheduled_apply())
         self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
 
     def test_a_host_inside_the_bound_is_quiet(self) -> None:
@@ -1020,7 +1024,7 @@ class BehindMainAlertTests(Base):
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertDeferred(self.apply())
+            self.assertDeferred(self.scheduled_apply())
         self.assertNotIn("STARVED", out.getvalue())
         self.assertEqual([], self.opened())
 
@@ -1049,12 +1053,12 @@ class BehindMainAlertTests(Base):
         with mock.patch.object(su, "refresh_checkout",
                                side_effect=su.Refused("fetch failed")), \
                 contextlib.redirect_stdout(out):
-            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+            self.assertEqual(su.EXIT_UNKNOWN, self.scheduled_apply())
             self.assertEqual(1, len(self.opened()), self.issues)
             # That run wrote an unknown skew.json; the next one still knows.
             out.truncate(0)
             out.seek(0)
-            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+            self.assertEqual(su.EXIT_UNKNOWN, self.scheduled_apply())
         self.assertIn("STARVED", out.getvalue())
         self.assertEqual(1, len(self.opened()), self.issues)
         self.assertIn(
@@ -1094,6 +1098,28 @@ class BehindMainAlertTests(Base):
         self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
         self.plan()
         self.assertEqual([], self.opened())
+
+    def test_a_manual_apply_never_opens_a_behind_main_alert(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists())
+
+    def test_exactly_four_hours_is_inside_the_bound(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS), NOW)
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+
+    def test_a_manual_recovery_closes_an_existing_episode(self) -> None:
+        su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS + 60), NOW)
+        su.behind_alert_for_apply(self.cfg, self.skew(0.0), NOW + 60, scheduled=False)
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
 
 
 class QueueLightTests(Base):
