@@ -73,7 +73,7 @@ CODES: tuple[str, ...] = (
     "gate_reserve_unknown",
     "generation_path_exec",
     "heal_wrapper_current",
-    "heal_wrapper_drift",
+    "heal_wrapper_unknown",
     "heal_wrapper_not_installed",
     "heal_wrapper_stale",
     "heal_wrapper_unreadable",
@@ -1363,16 +1363,21 @@ def check_heal_wrapper(installed: Path | None = None, repo_copy: Path | None = N
     if live == wanted:
         return Finding("heal_wrapper", OK, "heal_wrapper_current",
                        f"heal wrapper: {installed} matches this checkout", facts)
-    facts["sends_sigkill"] = tcc_wedge.wrapper_sends_sigkill(str(installed))
-    if facts["sends_sigkill"]:
-        # Any other difference (a comment, a log line) leaves the heal working:
-        # a notice, never a reason to spend an owner sudo step.
-        return Finding("heal_wrapper", OK, "heal_wrapper_drift",
-                       f"heal wrapper: {installed} differs from {repo_copy} but sends SIGKILL, "
-                       f"so the heal works; reinstall when convenient: {install}", facts)
-    return Finding("heal_wrapper", PROBLEM, "heal_wrapper_stale",
-                   f"heal wrapper: {installed} still sends SIGTERM, which tccd defers, so a heal "
-                   f"cannot restart it; reinstall: {install}", facts)
+    state = tcc_wedge.wrapper_state(str(installed))
+    facts["wrapper_state"] = state
+    if state == "current":
+        return Finding("heal_wrapper", OK, "heal_wrapper_current",
+                       f"heal wrapper: {installed} is a known current version", facts)
+    if state == "stale":
+        return Finding("heal_wrapper", PROBLEM, "heal_wrapper_stale",
+                       f"heal wrapper: {installed} is a known old version that sends SIGTERM, "
+                       f"which tccd defers, so a heal cannot restart it; reinstall: {install}",
+                       facts)
+    # Anything else (a local edit, a newer install) is a notice, never a reason
+    # to spend an owner sudo step.
+    return Finding("heal_wrapper", OK, "heal_wrapper_unknown",
+                   f"heal wrapper: {installed} differs from {repo_copy} and is not a version "
+                   f"this checkout knows; reinstall when convenient: {install}", facts)
 
 
 def check_reclaim(value: dict | None) -> Finding:

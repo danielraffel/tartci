@@ -605,12 +605,17 @@ re-reads the PIDs of tccd and sandboxd about 5 s later: if they are all the same
 processes the outcome is `heal ineffective` (event `tcc_heal_ineffective` and a
 `WARN tcc-heal ineffective` line), the page continues, and nothing stronger is
 tried. A wider root helper is the owner's decision. An `ineffective` heal
-whose installed wrapper does not send SIGKILL also records `stale_wrapper`:
-the live copy in `/usr/local/sbin` predates the SIGKILL change, and a repo
-change reaches a host only when the installer below is re-run there.
+whose installed wrapper's sha256 is a known old SIGTERM version also records
+`stale_wrapper`: the live copy in `/usr/local/sbin` predates the SIGKILL change.
+A wrapper whose hash is in neither list (a local edit) records
+`unknown_wrapper`, a notice with the same install command, never a problem. A
+repo change reaches a host only when the installer below is re-run there, and
+the new file's sha256 goes in `WRAPPER_CURRENT_SHA256` (scripts/tcc_wedge.py)
+in the same change; a test fails until it does.
 Merging a wrapper change changes nothing on a host until
 `sudo fleet/ops/install-tartci-heal-tcc.sh --apply` runs there; `tartci doctor
-fleet` reports `heal_wrapper_stale` until it does. It is installed by hand, once
+fleet` reports `heal_wrapper_stale` (known old version) or the notice
+`heal_wrapper_unknown` until it does. It is installed by hand, once
 per host, and again after each wrapper change:
 
 ```sh

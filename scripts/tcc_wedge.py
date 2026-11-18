@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import hashlib
 import json
 import math
 import os
@@ -112,18 +113,19 @@ PGREP = "/usr/bin/pgrep"
 # The wrapper's one command vector since it sends SIGKILL (fleet/ops/tartci-heal-tcc).
 INSTALLER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "fleet", "ops", "install-tartci-heal-tcc.sh")
-SIGKILL_VECTOR = '"$KILLALL" -KILL tccd'
-# Every command the SIGKILL wrapper runs, in order. wrapper_sends_sigkill
-# requires exactly these on code lines: a SIGTERM for either daemon, a missing
-# or extra kill, or a vector that only appears in a comment is not the fix.
-KILL_VECTORS = ('"$KILLALL" -KILL tccd', '"$KILLALL" -KILL sandboxd')
-SIGKILL_WRAPPER_LINES = ('output=$(exec 9>&-; exec "$KILLALL" -KILL tccd 2>&1) || rc=$?\n'
-                         'sandboxd_output=$(exec 9>&-; exec "$KILLALL" -KILL sandboxd 2>&1)'
-                         ' || sandboxd_rc=$?\n')
-# A call runs to the end of its command substitution or line; its trailing
-# redirections (`2>&1`, `9>&-`) are then dropped whole.
-_KILL_CALL = re.compile(r'"\$KILLALL"[^)\n]*')
-_REDIRECTIONS = re.compile(r"(\s+\d*>&?[-\w/]*)+\s*$")
+# Installed-wrapper identity is a hash, not a reading of its source: a script
+# that decides what a root wrapper does by parsing shell can be fooled by any
+# quoting trick. Add the new hash here in the same change that edits
+# fleet/ops/tartci-heal-tcc (a test fails until you do).
+WRAPPER_CURRENT_SHA256 = frozenset({
+    "657941360b74b612eb251cb4e88145fde85c5e62864a8435c79e011bb7bfc3e8",
+})
+# Versions that reached main and send SIGTERM, which tccd and sandboxd defer
+# until idle, so a heal through them cannot restart a wedged daemon.
+WRAPPER_STALE_SHA256 = frozenset({
+    "ded836e75858502c75d83ed06ab66582499f410ccad951493fcbe27dcce54da5",  # e40651e
+    "5f56cd2c96d8da689c241fc49fb49ae7b4f27f98087177b3b9b9f449dd932e7a",  # f2712f3
+})
 
 
 def _iso(epoch: float) -> str:
@@ -886,149 +888,26 @@ def unchanged_pids(before: dict[str, list[int]], after: dict[str, list[int]]) ->
     return all(before.get(name, []) == after.get(name, []) for name in HEALED_PROCESSES)
 
 
-def wrapper_sends_sigkill(wrapper: str) -> bool:
-    """Whether the installed wrapper is the SIGKILL version (read only; it is 0755).
+def wrapper_state(wrapper: str, current: Optional[frozenset] = None,
+                  stale: Optional[frozenset] = None) -> str:
+    """Classify the installed root wrapper by the sha256 of its bytes (read only; 0755).
 
-    The live wrapper is a root-owned copy installed by hand, so a repo change
-    reaches a host only when the installer is re-run. Unreadable reads as True:
-    nothing is claimed about a file this cannot see.
+    `current`: a known-good version. `stale`: a version that sends SIGTERM.
+    `unknown`: anything else, such as a local edit; never treated as broken.
+    `unreadable`: nothing is claimed about a file this cannot see.
     """
+    current = WRAPPER_CURRENT_SHA256 if current is None else current
+    stale = WRAPPER_STALE_SHA256 if stale is None else stale
     try:
-        with open(wrapper, encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
+        with open(wrapper, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
     except OSError:
-        return True
-    return tuple(kill_vectors(text)) == KILL_VECTORS
-
-
-_KILL_WORD = '"$KILLALL"'
-_LEADER_KEYWORDS = frozenset({"exec", "then", "do", "else", "elif"})
-_WORD = re.compile(r"[A-Za-z_]\w*(?=[\s;&|)]|$)")
-_HEREDOC = re.compile(r"""<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([^\s;&|()<>'"\\]+))(?=[\s;&|)<>]|$)""")
-
-
-def kill_vectors(text: str) -> list[str]:
-    """Each `"$KILLALL" ...` that appears at a command position, in order,
-    redirections dropped.
-
-    A small shell scanner, not a regex over lines. It tracks whether the next
-    word starts a command (line start, after an unescaped `;` `&` `|` `$(` or a
-    subshell `(`, after `exec`/`then`/`do`/`else`/`elif`), so a vector that is
-    an argument to `echo`/`printf`, stored in an array, quoted, in a comment, or
-    in a here-document body is not counted. It is a static read: it does not
-    know whether the line is reachable. Anything it cannot place is left
-    uncounted, which reads as stale.
-    """
-    calls: list[str] = []
-    stack = ["code"]  # "code", "paren" (code inside $( )), "dq", "sq"
-    pending: list[tuple[str, bool]] = []  # here-document (tag, tab-stripping)
-    cmd = True  # the next word is at a command position
-    saved: list[int] = []  # `arrays` of the code a $( ) interrupted
-    arrays = 0  # open `name=( ... )`: its words are values, even across lines
-    n, i = len(text), 0
-    while i < n:
-        c, top = text[i], stack[-1]
-        if top == "sq":
-            if c == "'":
-                stack.pop()
-            i += 1
-            continue
-        if top == "dq":
-            if c == "\\":
-                i += 1
-            elif c == '"':
-                stack.pop()
-            elif text.startswith("$(", i):
-                stack.append("paren")
-                saved.append(arrays)
-                arrays = 0
-                cmd = True
-                i += 1
-            i += 1
-            continue
-        if c == "\n":
-            cmd = arrays == 0
-            i += 1
-            while pending and i <= n:  # bodies start on the next line
-                tag, dash = pending[0]
-                end = text.find("\n", i)
-                end = n if end < 0 else end
-                if (text[i:end].lstrip("\t") if dash else text[i:end]) == tag:
-                    pending.pop(0)
-                i = end + 1
-            continue
-        if c in " \t":
-            i += 1
-        elif c == "\\":
-            if text.startswith("\\\n", i):  # a continuation joins the lines
-                i += 2
-            else:
-                cmd = False
-                i += 2
-        elif c == "#" and (i == 0 or text[i - 1] in " \t\n;"):
-            end = text.find("\n", i)
-            i = n if end < 0 else end
-        elif text.startswith(_KILL_WORD, i):
-            if cmd:
-                raw = re.match(r'(?:[^)\n;&|<>]|\d*>&?[-\w/]*)*', text[i:]).group(0)
-                calls.append(_REDIRECTIONS.sub("", raw).strip())
-            cmd = False
-            i += len(_KILL_WORD)
-        elif c == "'":
-            stack.append("sq")
-            cmd = False
-            i += 1
-        elif c == '"':
-            stack.append("dq")
-            cmd = False
-            i += 1
-        elif text.startswith("$(", i):
-            stack.append("paren")
-            saved.append(arrays)
-            arrays = 0
-            cmd = True
-            i += 2
-        elif c == ")" and top == "paren":
-            stack.pop()
-            arrays = saved.pop()
-            cmd = False
-            i += 1
-        elif c in ";|" or (c == "&" and text[i - 1:i] not in ("<", ">") and text[i + 1:i + 2] != ">"):
-            cmd = arrays == 0
-            i += 1
-        elif c == "(":
-            # A subshell at a command position; otherwise an array assignment
-            # or arithmetic, whose words are not commands.
-            arrays += 0 if cmd else 1
-            i += 1
-        elif c == ")" and arrays:
-            arrays -= 1
-            cmd = False
-            i += 1
-        elif text.startswith("<<<", i):
-            i += 3
-        elif text.startswith("<<", i):
-            m = _HEREDOC.match(text, i)
-            if m:
-                pending.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
-                i = m.end()
-            else:
-                # An unparsable here-document: the rest cannot be placed, so
-                # the result must not read as complete.
-                calls.append("<unparsed here-document>")
-                break
-        elif c in "<>&":
-            i += 1
-        elif cmd and c in "!{" and text[i + 1:i + 2] in (" ", "\t"):
-            i += 1  # `!` and `{ ` leave the next word at a command position
-        else:
-            word = _WORD.match(text, i) if cmd else None
-            if word and word.group(0) in _LEADER_KEYWORDS:
-                i = word.end()  # still at a command position
-            else:
-                cmd = False
-                i += 1
-    return calls
+        return "unreadable"
+    if digest in current:
+        return "current"
+    if digest in stale:
+        return "stale"
+    return "unknown"
 
 
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
@@ -1092,12 +971,18 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
             record["detail"] = ("killall returned 0 but tccd/sandboxd are the same processes "
                                 f"{settle_s:g}s later (pids {before_pids}); the heal did not "
                                 "restart them")
-            if not wrapper_sends_sigkill(wrapper):
+            state = wrapper_state(wrapper)
+            if state == "stale":
                 record["stale_wrapper"] = True
                 record["detail"] += (f"; {wrapper} does not send SIGKILL (an install from before "
                                      "the SIGKILL change, whose SIGTERM the daemons defer): "
                                      "reinstall it with sudo "
                                      f"{INSTALLER} --apply")
+            elif state == "unknown":
+                record["unknown_wrapper"] = True
+                record["detail"] += (f"; {wrapper} is not a version this checkout knows "
+                                     "(a local edit or a newer install); to rule it out, "
+                                     f"reinstall: sudo {INSTALLER} --apply")
         else:
             record["outcome"] = "ran"
     elif rc == 75:

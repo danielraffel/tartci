@@ -112,9 +112,9 @@
       "summary": "The installed tartci-heal-tcc wrapper matches this checkout.",
       "why": "The root-owned copy in /usr/local/sbin is byte-identical to fleet/ops/tartci-heal-tcc."
     },
-    "heal_wrapper_drift": {
-      "summary": "The installed tartci-heal-tcc wrapper differs from this checkout but sends SIGKILL.",
-      "why": "A difference that keeps the SIGKILL command (a comment or log line) leaves the heal working, so it is a notice, not a problem.",
+    "heal_wrapper_unknown": {
+      "summary": "The installed tartci-heal-tcc wrapper is not a version this checkout knows.",
+      "why": "Its sha256 is neither a current version nor a known SIGTERM one (a local edit or a newer install), so nothing says the heal is broken: a notice, not a problem.",
       "remedy": "Reinstall when convenient: sudo fleet/ops/install-tartci-heal-tcc.sh --apply (an owner step).",
       "do_not": "Do not treat this as a broken heal or page the owner for it."
     },

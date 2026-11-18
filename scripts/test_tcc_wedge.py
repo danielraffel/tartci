@@ -7,6 +7,7 @@ removed must NOT classify, and must NOT invoke the wrapper.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -353,87 +354,65 @@ class HealTests(unittest.TestCase):
         self.assertIn("same processes", record["detail"])
         self.assertEqual(record["pids_after"], same)
         self.assertIn("ineffective", tw.BUDGET_OUTCOMES)
-        # The fixture wrapper is not the SIGKILL version, so the record names it.
-        self.assertTrue(record.get("stale_wrapper"))
+        # The fixture wrapper is a local edit (neither list): a notice with the
+        # install command, never the stale-wrapper problem.
+        self.assertTrue(record.get("unknown_wrapper"))
+        self.assertNotIn("stale_wrapper", record)
         self.assertIn(tw.INSTALLER + " --apply", record["detail"])
         self.assertTrue(os.path.isabs(tw.INSTALLER))
 
-    def test_ineffective_heal_through_the_sigkill_wrapper_is_not_called_stale(self) -> None:
-        self.wrapper.write_text("#!/bin/bash\n" + tw.SIGKILL_WRAPPER_LINES)
+    def test_ineffective_heal_through_a_known_old_wrapper_is_stale(self) -> None:
+        self.wrapper.write_bytes(b"old sigterm wrapper\n")
+        digest = hashlib.sha256(b"old sigterm wrapper\n").hexdigest()
+        same = {"tccd": [10970], "sandboxd": [35552]}
+        with mock.patch.object(tw, "WRAPPER_STALE_SHA256", frozenset({digest})):
+            record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
+        self.assertEqual(record["outcome"], "ineffective")
+        self.assertTrue(record.get("stale_wrapper"))
+        self.assertNotIn("unknown_wrapper", record)
+        self.assertIn(tw.INSTALLER + " --apply", record["detail"])
+
+    def test_ineffective_heal_through_the_current_wrapper_is_not_called_stale(self) -> None:
+        self.wrapper.write_bytes((ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_bytes())
         same = {"tccd": [10970], "sandboxd": [35552]}
         record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
         self.assertEqual(record["outcome"], "ineffective")
         self.assertNotIn("stale_wrapper", record)
+        self.assertNotIn("unknown_wrapper", record)
         self.assertNotIn("--apply", record["detail"])
 
-    def test_only_both_exact_kill_vectors_on_code_lines_count_as_sigkill(self) -> None:
-        good = "#!/bin/bash\n" + tw.SIGKILL_WRAPPER_LINES
-        incomplete = {
-            "sandboxd still SIGTERMed": good.replace('-KILL sandboxd', 'sandboxd'),
-            "sandboxd kill missing": good.splitlines()[0] + "\n" + good.splitlines()[1] + "\n",
-            "only in a comment": '#!/bin/bash\n# "$KILLALL" -KILL tccd\n# "$KILLALL" -KILL sandboxd\n'
-                                 '"$KILLALL" tccd sandboxd\n',
-            "an extra kill": good + '"$KILLALL" -KILL launchd\n',
-            "the old one-line SIGTERM": '#!/bin/bash\n"$KILLALL" tccd sandboxd\n',
+    def test_wrapper_state_is_decided_by_hash_alone(self) -> None:
+        repo = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_bytes()
+        cases = {
+            "the repo copy": (repo, "current"),
+            # Text that merely prints or comments the vectors is not the wrapper.
+            "repo copy plus a comment": (repo + b"# a comment\n", "unknown"),
+            "vectors only echoed": (b"#!/bin/bash\necho '\"$KILLALL\" -KILL tccd'\n"
+                                    b"/usr/bin/killall tccd sandboxd\n", "unknown"),
+            "empty": (b"", "unknown"),
         }
-        for name, text in incomplete.items():
+        for name, (content, want) in cases.items():
             with self.subTest(name):
-                self.wrapper.write_text(text)
-                self.assertFalse(tw.wrapper_sends_sigkill(str(self.wrapper)), name)
-        self.wrapper.write_text(good + "# a comment naming \"$KILLALL\" -KILL tccd\n")
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+                self.wrapper.write_bytes(content)
+                self.assertEqual(tw.wrapper_state(str(self.wrapper)), want)
+        # A hash in the stale set is stale; one in neither set is unknown.
+        self.wrapper.write_bytes(b"old sigterm wrapper\n")
+        digest = hashlib.sha256(b"old sigterm wrapper\n").hexdigest()
+        self.assertEqual(tw.wrapper_state(str(self.wrapper)), "unknown")
+        self.assertEqual(tw.wrapper_state(str(self.wrapper), stale=frozenset({digest})), "stale")
+        self.assertEqual(tw.wrapper_state(str(Path(self.wrapper).parent / "gone")), "unreadable")
 
-    def test_vectors_that_are_quoted_echoed_or_in_a_heredoc_are_not_executed(self) -> None:
-        # The old SIGTERM call still runs in each; the two vectors only appear
-        # as text. None may be credited as the SIGKILL wrapper.
-        old = '/usr/bin/killall tccd sandboxd\n'
-        v1, v2 = tw.KILL_VECTORS
-        not_executed = {
-            "echoed": f"echo '{v1}'\necho '{v2}'\n" + old,
-            "double quoted": f'msg="{v1.replace(chr(34), chr(92) + chr(34))}"\n' + old,
-            "heredoc body": f"cat <<'EOF'\n{v1}\n{v2}\nEOF\n" + old,
-            "unquoted heredoc": f"cat <<EOF\n{v1}\n{v2}\nEOF\n" + old,
-            "as an argument": f"echo {v1}\necho {v2}\n" + old,
-            "exec as an echo argument": f"echo exec {v1}\necho exec {v2}\n" + old,
-            "padded heredoc terminator": f"cat <<EOF\nnote\n EOF \n{v1}\n{v2}\nEOF\n" + old,
-            "printf continuation": f"printf '%s\\n' \\\n  {v1}\nprintf '%s\\n' \\\n  {v2}\n" + old,
-            "escaped separator": f"echo \\; {v1}\necho \\; {v2}\n" + old,
-            "bang or brace argument": f"echo would run ! {v1}\necho {{ {v2}\n" + old,
-            "array storage": f"a=({v1})\nb=( {v2} )\n" + old,
-            "heredoc with a redirect": f"cat <<EOF>/dev/null\n{v1}\n{v2}\nEOF\n" + old,
-            "quoted heredoc with a redirect": f"cat <<'EOF'>/dev/null\n{v1}\n{v2}\nEOF\n" + old,
-            "heredoc tag with a dash": f"cat <<EOF-X\n{v1}\n{v2}\nEOF-X\n" + old,
-            "heredoc tag with dots": f"cat <<E.O.F\n{v1}\n{v2}\nE.O.F\n" + old,
-            "multi-line array": f"a=(\n  {v1}\n  {v2}\n)\n" + old,
-            "appended array": f"a+=(\n  {v1}\n  {v2}\n)\n" + old,
-            "unparsable heredoc then a third kill": f"{v1}\n{v2}\ncat <<E\\OF\nEOF\n{v1.replace('tccd', 'launchd')}\n",
-            "inside a quoted $( )": f"x='$({v1})'\ny='$({v2})'\n" + old,
-        }
-        for name, body in not_executed.items():
-            with self.subTest(name):
-                self.wrapper.write_text("#!/bin/bash\n" + body)
-                self.assertFalse(tw.wrapper_sends_sigkill(str(self.wrapper)), name)
-        # An executed call after a heredoc is still found.
-        self.wrapper.write_text(f"#!/bin/bash\ncat <<EOF\nnote\nEOF\n{v1}\n{v2}\n")
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
-        # A here-string is not a here-document: the calls after it still run.
-        self.wrapper.write_text(f'#!/bin/bash\ntr a b <<<"$x"\n{v1}\n{v2}\n')
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
-        # An array that closes does not end command position for what follows.
-        self.wrapper.write_text(f"#!/bin/bash\na=(\n  x\n)\n{v1}\n{v2}\n")
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
-        # A $( ) inside an array starts its own commands.
-        self.wrapper.write_text(f"#!/bin/bash\na=( $(\n{v1}\n{v2}\n) )\n")
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
-        # `!` and a `{ }` group still run their command.
-        self.wrapper.write_text(f"#!/bin/bash\n! {v1}\n{{ {v2}; }}\n")
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
-        # `<<-` strips leading tabs from the terminator, and only then.
-        self.wrapper.write_text(f"#!/bin/bash\ncat <<-EOF\nnote\n\tEOF\n{v1}\n{v2}\n")
-        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+    def test_the_repo_wrapper_hash_is_listed_as_current(self) -> None:
+        # Fails after any edit to fleet/ops/tartci-heal-tcc until its new sha256
+        # is added to WRAPPER_CURRENT_SHA256.
+        digest = hashlib.sha256((ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_bytes()).hexdigest()
+        self.assertIn(digest, tw.WRAPPER_CURRENT_SHA256)
+        self.assertEqual(tw.wrapper_state(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")), "current")
 
-    def test_the_repo_wrapper_is_the_sigkill_version(self) -> None:
-        self.assertTrue(tw.wrapper_sends_sigkill(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")))
+    def test_hash_lists_are_well_formed_and_disjoint(self) -> None:
+        for digest in tw.WRAPPER_CURRENT_SHA256 | tw.WRAPPER_STALE_SHA256:
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertFalse(tw.WRAPPER_CURRENT_SHA256 & tw.WRAPPER_STALE_SHA256)
 
     def test_changed_pids_after_a_zero_exit_are_ran(self) -> None:
         record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([
@@ -747,17 +726,21 @@ class LaneAndDoctorTests(unittest.TestCase):
         # change reaches a host only when the installer is re-run there.
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo-wrapper"
-            repo.write_text("#!/bin/bash\n" + tw.SIGKILL_WRAPPER_LINES)
+            repo.write_text("#!/bin/bash\n# repo copy\n")
             installed = Path(td) / "installed-wrapper"
+            old = '#!/bin/bash\n"$KILLALL" tccd sandboxd\n'
+            old_sha = hashlib.sha256(old.encode()).hexdigest()
             cases = [
                 (None, fd.NOT_APPLICABLE, "heal_wrapper_not_installed"),
                 (repo.read_text(), fd.OK, "heal_wrapper_current"),
-                # A comment-only difference in a SIGKILL wrapper is a notice.
-                (repo.read_text() + "# a newer comment\n", fd.OK, "heal_wrapper_drift"),
-                ('#!/bin/bash\n"$KILLALL" tccd sandboxd\n', fd.PROBLEM, "heal_wrapper_stale"),
+                # Any other difference (a comment, a local edit) is a notice.
+                (repo.read_text() + "# a newer comment\n", fd.OK, "heal_wrapper_unknown"),
+                # Only a hash listed as an old SIGTERM version is a problem.
+                (old, fd.PROBLEM, "heal_wrapper_stale"),
             ]
             for text, state, code in cases:
-                with self.subTest(code=code):
+                with self.subTest(code=code), \
+                        mock.patch.object(tw, "WRAPPER_STALE_SHA256", frozenset({old_sha})):
                     if text is None:
                         installed.unlink(missing_ok=True)
                     else:
@@ -804,7 +787,7 @@ class WrapperSourceTests(unittest.TestCase):
     def test_wrapper_is_fixed_argument_less_and_rate_limited(self) -> None:
         text = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_text()
         self.assertIn('[[ $# -eq 0 ]] || die "takes no arguments"', text)
-        self.assertIn(tw.SIGKILL_VECTOR, text)
+        self.assertIn('"$KILLALL" -KILL tccd', text)
         self.assertIn('"$KILLALL" -KILL sandboxd', text)
         self.assertEqual(text.count('"$KILLALL"'), 2, "two fixed command vectors")
         # The lock is lockf's fd form: a fixed binary, no interpreter, no
