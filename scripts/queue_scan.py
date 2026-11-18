@@ -498,8 +498,11 @@ class QueueScanner:
                     continue
                 kind = 0
             elif status == "in_progress":
-                if not now or not window or _age_seconds(updated, now) > window \
-                        or _seconds_between(created, updated) < REQUEUE_AFTER_SECONDS:
+                # Remembered runs stay until a job fetch shows their queued
+                # work gone (_forget_served), not just one discovery window.
+                if _seconds_between(created, updated) < REQUEUE_AFTER_SECONDS or (
+                        not run.get("_remembered")
+                        and (not now or not window or _age_seconds(updated, now) > window)):
                     continue
                 kind = 1
             else:
@@ -528,21 +531,32 @@ class QueueScanner:
         } if isinstance(memory_raw, dict) else {}
         for run in self._requeued_runs(runs):
             memory[str(int(run["id"]))] = {
-                key: run[key] for key in ("id", "name", "event", "status", "created_at",
-                                          "updated_at", "head_sha") if key in run
+                **{key: run[key] for key in ("id", "name", "event", "status", "created_at",
+                                             "updated_at", "head_sha") if key in run},
+                "_remembered": True,
             }
         # Expire by the same age bound, then keep the newest updates.
         live = self._requeued_runs(list(memory.values()))
         live.sort(key=lambda run: str(run.get("updated_at") or ""), reverse=True)
         memory = {str(run["id"]): run for run in live[:REQUEUE_MEMORY_MAX]}
         state["requeued_runs"] = memory
-        return runs + [run for run in memory.values() if int(run["id"]) not in listed]
+        # A listed run keeps its remembered standing (an in_progress run whose
+        # update has left the discovery window is still requeued).
+        marked = [{**run, "_remembered": True} if str(int(run["id"])) in memory else run
+                  for run in runs]
+        return marked + [run for run in memory.values() if int(run["id"]) not in listed]
 
     def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any]) -> None:
         memory = state.get("requeued_runs")
         if not isinstance(memory, dict) or str(run_id) not in memory:
             return
-        if not any(isinstance(job, dict) and job.get("status") == "queued" for job in jobs):
+        # Kept only while a queued job can need a fleet VM: a queued job on a
+        # GitHub-hosted runner would otherwise hold a priority slot for 6 h.
+        if not any(
+            isinstance(job, dict) and job.get("status") == "queued"
+            and "self-hosted" in [str(label).lower() for label in job.get("labels") or []]
+            for job in jobs
+        ):
             memory.pop(str(run_id), None)
 
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:

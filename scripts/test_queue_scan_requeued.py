@@ -198,11 +198,37 @@ class RequeuedRankingTests(unittest.TestCase):
         second, _ = scanner._candidate_runs(list(prs), state)
         self.assertEqual(int(second[0]["id"]), INCIDENT)
         # A fetch shows its job still queued: kept. Then served: forgotten.
-        scanner._forget_served(state, INCIDENT, [{"status": "queued"}])
+        scanner._forget_served(state, INCIDENT, [{"status": "queued", "labels": ["self-hosted", "macOS"]}])
         self.assertIn(str(INCIDENT), state["requeued_runs"])
         scanner._forget_served(state, INCIDENT, [{"status": "completed"}, {"status": "in_progress"}])
         third, _ = scanner._candidate_runs(list(prs), state)
         self.assertNotIn(INCIDENT, [int(r["id"]) for r in third])
+
+    def test_a_remembered_in_progress_run_outlives_the_discovery_window(self) -> None:
+        now = datetime.now(timezone.utc)
+        run = _run(7, now - timedelta(hours=2), "merge_group", "in_progress",
+                   now - timedelta(seconds=30))
+        prs = [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+               for i in range(1, 9)]
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        scanner._candidate_runs([run, *prs], state)
+        # 20 min later its page is not read; its update is older than the window.
+        scanner.now += 1200
+        later, _ = scanner._candidate_runs(list(prs), state)
+        self.assertEqual(int(later[0]["id"]), 7)
+        # Listed again, with the same old update: still first.
+        listed, _ = scanner._candidate_runs([run, *prs], state)
+        self.assertEqual(int(listed[0]["id"]), 7)
+
+    def test_a_hosted_queued_job_does_not_keep_a_run(self) -> None:
+        now = datetime.now(timezone.utc)
+        run = _run(8, now - timedelta(hours=2), "merge_group", "queued", now - timedelta(minutes=3))
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        scanner._candidate_runs([run], state)
+        scanner._forget_served(state, 8, [{"status": "queued", "labels": ["ubuntu-24.04"]}])
+        self.assertNotIn("8", state["requeued_runs"])
 
     def test_memory_is_bounded(self) -> None:
         import queue_scan
