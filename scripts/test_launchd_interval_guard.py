@@ -469,6 +469,61 @@ class FailureVisibilityTests(GuardCase):
 
 
 class DomainStallTests(GuardCase):
+    def test_old_state_running_after_guard_kick_still_opens_episode(self) -> None:
+        labels = ("com.danielraffel.tartci.reap",
+                  "com.danielraffel.tartci.launchd-watchdog")
+        for label in labels:
+            self.interval_agent(label, 300, running=True)
+        self.state.mkdir()
+        (self.state / "state.json").write_text(json.dumps({"agents": {
+            label: {"runs": 10, "progress_ts": self.clock.now - 900,
+                    "natural_ts": self.clock.now - 900, "pending_kicks": 1,
+                    "kicked_runs": 10} for label in labels}, "episode": None}))
+        receipt = self.guard().pass_once()
+        self.assertTrue(receipt["episode"]["active"], receipt)
+        self.assertEqual(receipt["episode"]["labels"], sorted(labels))
+        persisted = json.loads((self.state / "state.json").read_text())
+        for label in labels:
+            self.assertEqual(persisted["agents"][label]["run_owner"], "unknown")
+            self.assertEqual(persisted["agents"][label]["natural_ts"], self.clock.now - 900)
+
+    def test_observed_launchd_started_long_runs_open_no_episode(self) -> None:
+        labels = ("com.danielraffel.fleet-pass.repair2",
+                  "com.danielraffel.fleet-pass.reviewer2",
+                  "com.danielraffel.shipyard.steward-tick")
+        for label in labels:
+            self.interval_agent(label, 120)
+        g = self.guard()
+        g.pass_once()
+        for label in labels:
+            self.launchd.jobs[label]["runs"] += 1
+            self.launchd.jobs[label]["running"] = True
+        g.pass_once()
+        for _ in range(16):
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertFalse(receipt["episode"]["active"], receipt)
+        self.assertEqual(receipt["stalled"], [])
+        persisted = json.loads((self.state / "state.json").read_text())
+        for label in labels:
+            self.assertEqual(persisted["agents"][label]["run_owner"], "launchd-started")
+
+    def test_fresh_state_real_stall_opens_episode(self) -> None:
+        labels = ("com.danielraffel.tartci.reap",
+                  "com.danielraffel.tartci.launchd-watchdog")
+        for label in labels:
+            self.interval_agent(label, 300)
+        g = self.guard()
+        g.pass_once()
+        for _ in range(3):
+            self.clock.now += 300
+            receipt = g.pass_once()
+        self.assertTrue(receipt["episode"]["active"], receipt)
+        self.assertEqual(receipt["episode"]["labels"], sorted(labels))
+        persisted = json.loads((self.state / "state.json").read_text())
+        for label in labels:
+            self.assertEqual(persisted["agents"][label]["run_owner"], "guard-started")
+
     def test_the_domain_stall_is_reported_once_per_episode(self) -> None:
         self.interval_agent("com.danielraffel.tartci.reap", 300)
         self.interval_agent("com.danielraffel.tartci.launchd-watchdog", 300)
@@ -516,8 +571,12 @@ class DomainStallTests(GuardCase):
         for label in ("com.danielraffel.fleet-pass.repair2",
                       "com.danielraffel.fleet-pass.reviewer2",
                       "com.danielraffel.shipyard.steward-tick"):
-            self.interval_agent(label, 120, running=True)
+            self.interval_agent(label, 120)
         g = self.guard()
+        g.pass_once()
+        for job in self.launchd.jobs.values():
+            job["runs"] += 1  # an observed launchd start, without a guard kick
+            job["running"] = True
         g.pass_once()
         for _ in range(16):  # 80 minutes, every one still in its first run
             self.clock.now += 300

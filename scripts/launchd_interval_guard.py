@@ -316,8 +316,10 @@ class Guard:
                 or obs["runs"] < mem["runs"]:
             # First sight, or the counter reset (re-registered): start measuring now.
             memory[label] = {"runs": obs["runs"], "progress_ts": now,
-                             "natural_ts": now, "pending_kicks": 0}
+                             "natural_ts": now, "pending_kicks": 0,
+                             "run_owner": "unknown"}
             return
+        mem.setdefault("run_owner", "unknown")
         delta = obs["runs"] - mem["runs"]
         if "kicked_runs" in mem:
             # Did the last kick take? It ran (or is running) by now, or it did not.
@@ -339,7 +341,7 @@ class Guard:
                 mem["unconfirmed"] = 0
                 mem.pop("ceiling_reported", None)
             # Whose run is the latest one: launchd's, or one the guard kicked.
-            mem["run_ours"] = delta <= ours
+            mem["run_owner"] = "guard-started" if delta <= ours else "launchd-started"
             mem["runs"] = obs["runs"]
         limit = STALL_FACTOR * interval
         natural_age = now - float(mem.get("natural_ts", now))
@@ -350,7 +352,7 @@ class Guard:
             # that runs longer than 2x its interval (the fleet-pass lanes, m3
             # 2026-11-18) froze its run count and read as a domain stall.
             mem["progress_ts"] = now
-            if not mem.get("run_ours"):
+            if mem["run_owner"] == "launchd-started":
                 mem["natural_ts"] = now
                 natural_age = 0.0
         if natural_age > limit:
