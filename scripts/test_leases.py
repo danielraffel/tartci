@@ -306,6 +306,76 @@ class AgentFloorTests(LeaseCliTestCase):
         self.assertEqual(cap["floor_available_cores"], 0)
 
 
+class CheckClassTests(LeaseCliTestCase):
+    """A `--class check` lease never queues behind compiles (m5studio,
+    2026-11-17: gates and provenance checks waited 1 to 2.5 h)."""
+
+    build_floor_acquire = AgentFloorTests.floor_acquire
+    fill_non_gate = AgentFloorTests.fill_non_gate
+
+    def floor_acquire(self, lease_id, cores, *, check_class=False, **kwargs):
+        if not check_class:
+            return self.build_floor_acquire(lease_id, cores, **kwargs)
+        extra = ["--capacity-mem-mb", "0", "--agent-floor-cores", "6",
+                 "--agent-floor-pool-cores", "6", "--allow-floor", "--class", "check",
+                 "--min-cores", "2"]
+        return self.run_cli(
+            "acquire", "--id", lease_id, "--cores", str(cores), "--capacity", "26",
+            "--reserved-gate-cores", "14", "--priority", "build", "--pid", str(self.pid),
+            "--kind", kwargs.get("kind", "agent-build"), *extra, check=False)
+
+    def fill_builds_and_floor(self) -> None:
+        # Compiles hold the whole non-gate budget and the whole floor pool.
+        self.fill_non_gate()
+        self.assertTrue(json.loads(self.build_floor_acquire("agent-2", 12).stdout)["floor"])
+        self.assertEqual(self.build_floor_acquire("agent-3", 12).returncode, 75)
+
+    def test_a_check_is_admitted_while_compiles_hold_everything(self) -> None:
+        self.fill_builds_and_floor()
+        granted = self.floor_acquire("check-1", 8, check_class=True)
+        self.assertEqual(granted.returncode, 0, granted.stdout + granted.stderr)
+        body = json.loads(granted.stdout)
+        self.assertTrue(body["check"])
+        self.assertTrue(body["floor"], "callers run it at the floor QoS")
+        self.assertEqual(body["lease"]["lease_size_cores"], 1)
+        self.assertEqual(body["lease"]["build_class"], "check")
+
+    def test_a_background_build_in_the_same_state_still_waits(self) -> None:
+        # Control, same instrument: without --class check the request is denied.
+        self.fill_builds_and_floor()
+        denied = self.run_cli(
+            "acquire", "--id", "bg-1", "--cores", "8", "--capacity", "26",
+            "--reserved-gate-cores", "14", "--priority", "build", "--pid", str(self.pid),
+            "--kind", "agent-build", "--capacity-mem-mb", "0", "--agent-floor-cores", "6",
+            "--agent-floor-pool-cores", "6", "--allow-floor", "--class", "background",
+            "--min-cores", "2", check=False)
+        self.assertEqual(denied.returncode, 75)
+
+    def test_the_check_pool_is_bounded_and_falls_back_to_background(self) -> None:
+        self.fill_builds_and_floor()
+        for n in (1, 2):
+            self.assertEqual(self.floor_acquire(f"check-{n}", 8, check_class=True).returncode, 0)
+        # Pool of 2 is full and compiles hold the rest: the third waits.
+        self.assertEqual(self.floor_acquire("check-3", 8, check_class=True).returncode, 75)
+
+    def test_checks_do_not_spend_the_build_floor_pool(self) -> None:
+        self.fill_non_gate()
+        self.assertEqual(self.floor_acquire("check-1", 8, check_class=True).returncode, 0)
+        floor = json.loads(self.build_floor_acquire("agent-2", 12).stdout)
+        self.assertEqual(floor["lease"]["lease_size_cores"], 6, "the whole floor is left")
+
+    def test_checks_do_not_take_gate_capacity(self) -> None:
+        self.fill_builds_and_floor()
+        self.assertEqual(self.floor_acquire("check-1", 8, check_class=True).returncode, 0)
+        gate = self.acquire("gate", 14, capacity=26, reserved=14, priority="gate")
+        self.assertTrue(json.loads(gate.stdout)["ok"])
+
+    def test_vm_requests_never_take_a_check_lease(self) -> None:
+        self.acquire("gate", 26, capacity=26, reserved=14, priority="gate")
+        vm = self.floor_acquire("vm-1", 4, check_class=True, kind="tart-macos-vm")
+        self.assertNotEqual(vm.returncode, 0)
+
+
 class LeasePriorityTests(LeaseCliTestCase):
     def test_reserved_gate_cores_are_unavailable_to_non_gate_leases(self) -> None:
         self.acquire("build", 6, capacity=10, reserved=4, priority="build")

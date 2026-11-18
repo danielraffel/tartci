@@ -56,6 +56,47 @@ def is_floor(record: dict[str, Any]) -> bool:
     return record.get("floor") is True
 
 
+# --- check leases --------------------------------------------------------------
+#
+# Git and Python checks (fast gates, provenance verify, observatory reconcile)
+# used to queue for the same build cores as compiles: on a busy m5studio on
+# 2026-11-17 they waited 1 to 2.5 h before starting. A `--class check` lease is
+# always 1 core from its own small pool, admitted whenever that pool has room
+# whatever compiles hold or wait for. Like a floor lease it is charged to no
+# other admission and runs at the floor QoS, so gates and VMs never see it; it
+# is not charged to the build floor pool either, so compiles cannot fill it.
+# Memory is not oversubscribed. A full pool falls back to a background lease.
+CHECK_POOL_CORES_DEFAULT = 2
+
+
+def is_check(record: dict[str, Any]) -> bool:
+    return record.get("check") is True
+
+
+def check_grant(
+    args: argparse.Namespace, cfg: dict[str, Any], active: list[dict[str, Any]], priority: int
+) -> int | None:
+    """Memory (MB) of a 1-core check lease that fits its pool now, or None."""
+    if priority >= cfg["gate_priority"] or is_vm_kind(args.kind):
+        return None
+    used = sum(record_int(r, "lease_size_cores") for r in active if is_check(r))
+    if used + 1 > int(cfg.get("check_pool_cores", CHECK_POOL_CORES_DEFAULT)):
+        return None
+    mem = int(args.mem_mb) if getattr(args, "mem_mb", None) is not None else cfg["per_job_mem_mb"]
+    if cfg["total_mem_mb"] > 0:
+        per_job = cfg["per_job_mem_mb"]
+        used_all = sum(record_mem_mb(r, per_job) for r in active)
+        non_gate_all = sum(
+            record_mem_mb(r, per_job)
+            for r in active
+            if record_int(r, "priority") < cfg["gate_priority"]
+        )
+        non_gate_limit = max(per_job, cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"])
+        if used_all + mem > cfg["total_mem_mb"] or non_gate_all + mem > non_gate_limit:
+            return None
+    return max(1, mem)
+
+
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -732,6 +773,7 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         "agent_floor_cores": floor_cores,
         "agent_floor_pool_cores": floor_pool,
         "agent_floor_qos": floor_qos,
+        "check_pool_cores": max(0, int(profile.get("check_pool_cores", CHECK_POOL_CORES_DEFAULT))),
         "reserved_gate_cores": reserved,
         "gate_priority": gate_priority,
         "total_mem_mb": total_mem,
@@ -1127,7 +1169,7 @@ def usage(all_records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, A
     # Floor leases are reported separately and excluded from every figure other
     # admissions read, which is what keeps them from taking gate or VM capacity.
     records = [record for record in all_records if not is_floor(record)]
-    floor_records = [record for record in all_records if is_floor(record)]
+    floor_records = [record for record in all_records if is_floor(record) and not is_check(record)]
     used = sum(record_int(record, "lease_size_cores") for record in records)
     non_gate_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
     non_gate_used = sum(
@@ -1214,7 +1256,9 @@ def floor_grant(
     floor_pool = int(cfg.get("agent_floor_pool_cores", 0))
     if floor_cores <= 0 or floor_pool <= 0:
         return None
-    floor_used = sum(record_int(r, "lease_size_cores") for r in active if is_floor(r))
+    floor_used = sum(
+        record_int(r, "lease_size_cores") for r in active if is_floor(r) and not is_check(r)
+    )
     size = min(lease_size, floor_cores, floor_pool - floor_used)
     if size < 1:
         return None
@@ -1816,6 +1860,11 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         build_class = getattr(args, "build_class", None)
         if build_class is not None and priority >= cfg["gate_priority"]:
             raise ValueError("--class applies to non-gate build leases only")
+        check_mem = None
+        if build_class == "check":
+            check_mem = None if memory_only else check_grant(args, cfg, active, priority)
+            # A full check pool queues like any background build.
+            build_class = None if check_mem is not None else "background"
         reserve, reserve_source = prompt_reserve(store_dir, cfg)
         vm_slot_open = (
             holds_macos_slot(args.kind)
@@ -1832,10 +1881,16 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             cfg, current_usage, priority, lease_size, req_mem,
             build_class=build_class, reserve=reserve, vm_slot_open=vm_slot_open,
         )
+        if check_mem is not None:
+            verdict = {**verdict, "total_exceeded": False, "class_exceeded": False,
+                       "mem_exceeded": False}
         min_cores = int(getattr(args, "min_cores", 0) or 0)
         requested_full = lease_size
+        if check_mem is not None:
+            lease_size, req_mem = 1, check_mem
         if (
-            min_cores > 0
+            check_mem is None
+            and min_cores > 0
             and lease_size > min_cores
             and not memory_only
             and (verdict["total_exceeded"] or verdict["class_exceeded"] or verdict["mem_exceeded"])
@@ -1917,7 +1972,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             }, 75
 
         waiter_id = str(getattr(args, "waiter_id", "") or "")
-        if floor is None:
+        if floor is None and check_mem is None:
             hypothetical = {
                 "id": lease_id,
                 "lease_size_cores": lease_size,
@@ -1980,6 +2035,9 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             record.update(
                 {"floor": True, "qos": cfg["agent_floor_qos"], "requested_cores": requested_cores}
             )
+        if check_mem is not None:
+            record.update({"floor": True, "check": True, "build_class": "check",
+                           "qos": cfg["agent_floor_qos"], "requested_cores": requested_full})
         if memory_only:
             record["memory_only"] = True
         if vm_slot_open and (
@@ -2024,10 +2082,14 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         write_records(store_dir, active)
         settle_waiter(store_dir, cfg, waiter_id, granted=True)
         apply_qos_actions(qos_actions)
+        floored = floor is not None or check_mem is not None
         return {
             "ok": True,
-            "floor": floor is not None,
-            "qos": cfg["agent_floor_qos"] if floor is not None else None,
+            # A check lease runs at the floor QoS, so callers that honour a
+            # floor grant (leased-build) run it the same way.
+            "floor": floored,
+            "check": check_mem is not None,
+            "qos": cfg["agent_floor_qos"] if floored else None,
             "partial": lease_size < requested_full,
             "requested_cores": requested_full,
             "qos_actions": [action["summary"] for action in qos_actions],

@@ -3623,6 +3623,15 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   role QoS and the agent floor. A lease without `--class` follows the exact
   pre-class rule. `host-profile` exports `TARTCI_GOVERNOR_SCHEMA=1` so a caller
   can tell the store accepts `--class`.
+- **Check class** — `leases acquire --class check` is for git and Python checks
+  (fast gates, provenance verify, observatory reconcile), which used to queue
+  behind compiles for 1 to 2.5 h on a busy m5studio. Whatever `--cores` asks,
+  it is granted 1 core from a pool of its own (`check_pool_cores`, default 2)
+  whenever that pool has room, however many compiles hold or wait for cores.
+  Like a floor lease it is charged to no other admission and runs at
+  `agent_floor_qos` (the result says `"floor": true`), and it never counts
+  against the build floor pool, so compiles cannot fill it. Memory is not
+  oversubscribed. A full pool falls back to an ordinary background lease.
 - **Dynamic gate lending (opt-in per host, default off)** — with
   `dynamic_lending = true`, an interactive lease may grow non-gate use past the
   guaranteed budget N = T - S, up to `max(N, T - G - P)` where G is the cores
