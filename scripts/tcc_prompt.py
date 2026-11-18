@@ -64,10 +64,8 @@ INSTALL_WINDOW_S = 10 * 60
 STATE_NAME = "tcc-prompt.json"
 ALERT_STATE_NAME = "tcc-prompt-alert.json"
 HEAL_STATE_NAME = "tcc-prompt-heal.json"
-# Read by peers (peer_stall_alert.PEER_READ): set once the owner was told about
-# this episode, so a peer's host-vitals alert does not tell him again.
+# Set once the owner was told about this alert episode (owner_notify).
 NOTIFY_STATE_NAME = "tcc-prompt-notify.json"
-NOTIFY_LINK_STATE_NAME = "tcc-prompt-notify-link.json"
 TITLE = "[tartci] {host} has a macOS privacy prompt waiting: click Allow"
 GENERATION = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -427,18 +425,14 @@ def render(host: str, reading: dict, verdict: Optional[dict], heal_after_s: int,
     return TITLE.format(host=host), tartci_incident.with_marker(body, line)
 
 
-def _issue_repo() -> str:
-    import host_off  # noqa: PLC0415
-    return host_off.ISSUE_REPO
-
-
 def owner_text(host: str, since: object, issue: object = None) -> str:
     """The owner-channel line for a waiting privacy prompt on `host`."""
     import host_off  # noqa: PLC0415
     return (f"{host}: a macOS privacy prompt has waited on the console since {since}. "
             f"Click Allow on {host} (at its screen or over Screen Sharing); its Tart store and "
             "lanes are blocked until then. Do not click Don't Allow."
-            + (f" https://github.com/{host_off.ISSUE_REPO}/issues/{issue}" if issue else ""))
+            + (f" https://github.com/{host_off.ISSUE_REPO}/issues/{issue}" if issue else
+               f" (issue: \"{TITLE.format(host=host)}\")"))
 
 
 def host_id() -> str:
@@ -489,34 +483,37 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
         issues_enabled=os.environ.get("TARTCI_TCC_PROMPT_ISSUE", "1") != "0")
     if not active:
         return None
-    # Only the owner can click Allow, and an issue alone sat unread for hours
-    # (tartci #960): tell him on the owner channel, once per alert episode.
-    import owner_notify  # noqa: PLC0415 - sibling module
-    # This episode's issue only: `out` can carry the previous episode's number
-    # when this episode's open failed.
-    saved = _read_json(state_dir / ALERT_STATE_NAME)
-    number = saved.get("issue") if saved.get("since") == reading.get("since") else None
-    try:
-        sent = owner_notify.notify_once(
-            state_dir / NOTIFY_STATE_NAME, str(reading.get("since")),
-            owner_text(host, reading.get("since"), number), sender=notify, now=now)
-        told = _read_json(state_dir / NOTIFY_STATE_NAME)
-        if number and told.get("sent_at") and "/issues/" not in str(told.get("text")) \
-                and not sent.get("sent"):
-            # The first message went out before its issue could be opened:
-            # send the link once it exists.
-            owner_notify.notify_once(
-                state_dir / NOTIFY_LINK_STATE_NAME, str(reading.get("since")),
-                f"{host}: the privacy-prompt issue is "
-                f"https://github.com/{_issue_repo()}/issues/{number}", sender=notify, now=now)
-    except Exception:  # noqa: BLE001 - the owner message must never stop the fallback heal
-        pass
     heal_text = ""
+    healed = False
     pending = reading.get("pending_since_epoch")
     if waiting and isinstance(pending, (int, float)):
-        record = fallback_heal(reading, store_state, now, state_dir=state_dir,
-                               heal_after_s=heal_after_s, heal=heal, enabled=heal_enabled)
+        try:
+            record = fallback_heal(reading, store_state, now, state_dir=state_dir,
+                                   heal_after_s=heal_after_s, heal=heal, enabled=heal_enabled)
+        except Exception as exc:  # noqa: BLE001 - the owner message below must still run
+            record = {"outcome": f"error {type(exc).__name__}: {str(exc)[:120]}"}
         heal_text = f"; heal {record.get('outcome')}"
+        # Only a heal that ran dropped the alert; a failed, ineffective or
+        # refused heal leaves it for the owner.
+        healed = record.get("outcome") == "ran"
+    # Only the owner can click Allow, and an issue alone sat unread for hours
+    # (tartci #960): tell him on the owner channel, once per alert episode.
+    # The host is the one sender: it opens the prompt issue in this same pass,
+    # so a peer that sees the issue knows the host could have sent too. After
+    # the heal, so a slow post never delays it; not on the pass the heal ran,
+    # which drops the alert (a click instruction then would be stale).
+    if not healed:
+        try:
+            import owner_notify  # noqa: PLC0415 - sibling module
+            # This episode's issue only: `out` can carry the previous
+            # episode's number when this episode's open failed.
+            saved = _read_json(state_dir / ALERT_STATE_NAME)
+            number = saved.get("issue") if saved.get("since") == reading.get("since") else None
+            owner_notify.notify_once(
+                state_dir / NOTIFY_STATE_NAME, str(reading.get("since")),
+                owner_text(host, reading.get("since"), number), sender=notify, now=now)
+        except Exception:  # noqa: BLE001 - the owner message never breaks the pass
+            pass
     why = (f"near Shipyard install {install['generation'][:12]} "
            f"({install['seconds_before_alert']} s; timing only)" if install else "")
     if waiting:

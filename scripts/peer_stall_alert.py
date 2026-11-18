@@ -61,7 +61,6 @@ RESOLVER_SEPARATOR = "--- resolver ---"
 LAST_SEPARATOR = "--- peer-stall ---"
 VITALS_SEPARATOR = "--- host-vitals ---"
 FRESHNESS_SEPARATOR = "--- tool-freshness ---"
-OWNER_SEPARATOR = "--- owner-notify ---"
 # Open issues on the same host that explain a host-vitals stall.
 PROMPT_TITLE = "[tartci] {peer} has a macOS privacy prompt waiting: click Allow"
 STORE_STALL_PREFIX = "[tartci] {peer}: writes on "
@@ -82,8 +81,6 @@ PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
              'cat "${TARTCI_HOST_VITALS_STATE:-$HOME/.local/state/pulp/host_vitals.json}" '
              '2>/dev/null || true; echo; echo "' + FRESHNESS_SEPARATOR + '"; '
              'cat "${TARTCI_HOME:-$HOME/.tartci}/state/tool-freshness/state.json" '
-             '2>/dev/null || true; echo; echo "' + OWNER_SEPARATOR + '"; '
-             'cat "${TARTCI_HOME:-$HOME/.tartci}/state/tcc-prompt-notify.json" '
              '2>/dev/null || true')
 
 Runner = Callable[[List[str]], Tuple[int, str, str]]
@@ -140,7 +137,6 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
     body, _, last_text = body.partition(LAST_SEPARATOR)
     last_text, _, vitals_text = last_text.partition(VITALS_SEPARATOR)
     vitals_text, _, freshness_text = vitals_text.partition(FRESHNESS_SEPARATOR)
-    freshness_text, _, owner_text = freshness_text.partition(OWNER_SEPARATOR)
     guard_text, _, resolver_text = body.partition(RESOLVER_SEPARATOR)
     try:
         last = json.loads(last_text) if last_text.strip() else None
@@ -168,15 +164,10 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
         freshness = json.loads(freshness_text) if freshness_text.strip() else None
     except ValueError:
         freshness = None
-    try:
-        owner = json.loads(owner_text) if owner_text.strip() else None
-    except ValueError:
-        owner = None
     return {"readable": True, "clock": clock, "last": last if isinstance(last, dict) else None,
             "resolver": resolver if isinstance(resolver, dict) else None,
             "vitals": vitals if isinstance(vitals, dict) else None,
             "freshness": freshness if isinstance(freshness, dict) else None,
-            "owner_notified": owner if isinstance(owner, dict) else None,
             "guard": launchd_interval_guard.classify(
                 receipt, float(clock),
                 receipt_path=f"{target}:launchd-interval-guard/status.json"),
@@ -357,21 +348,6 @@ def related_text(peer: str, related: List[Dict[str, Any]]) -> List[str]:
         return [f"Likely cause: a macOS privacy prompt is waiting on {peer}; click Allow on "
                 f"{peer} (at its screen or over Screen Sharing). Open issues on {peer}:", *links]
     return [f"Possibly related open issues on {peer}:", *links] if links else []
-
-
-def _sent_key(path: pathlib.Path) -> Optional[str]:
-    saved = host_off._read_json(path) or {}
-    return saved.get("key") if saved.get("sent_at") else None
-
-
-def host_told_owner(info: Dict[str, Any], prompt: Dict[str, Any]) -> bool:
-    """Whether the peer itself already told the owner about this prompt
-    episode (tcc_prompt writes tcc-prompt-notify.json; its key is the
-    episode's `since`, which the issue's incident marker carries)."""
-    told = info.get("owner_notified") or {}
-    key = told.get("key")
-    return bool(told.get("sent_at")) and key is not None and (
-        '"symptom_at":' + json.dumps(str(key))) in str(prompt.get("body") or "")
 
 
 def vitals_alert_text(peer: str, target: str, me: str,
@@ -567,7 +543,7 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                peers: Optional[Dict[str, str]] = None, me: Optional[str] = None,
                run: Optional[Runner] = None, issue: Any = None,
                close: Any = None, lister: Optional[Lister] = None,
-               notify: Any = None, comment: Any = None) -> Dict[str, Any]:
+               comment: Any = None) -> Dict[str, Any]:
     """The watchdog's pass. Returns {"skipped": bool, "peers": {peer: verdict}}."""
     now = time.time() if now is None else now
     directory = directory or state_root()
@@ -706,32 +682,10 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                 if rc == 0:
                     host_off._write_json(links_path, {"issue": this_issue,
                                                       "numbers": numbers})
-        owner: Dict[str, Any] = {}
-        prompt = next((r for r in related if r.get("title") == PROMPT_TITLE.format(peer=peer)),
-                      None)
-        key = f"issue-{prompt.get('number')}" if prompt is not None else None
-        primary_row = (((reads.get(primary) or {}).get("last") or {}).get("peers") or {}).get(peer) \
-            if primary and primary != me else None
-        primary_told = isinstance(primary_row, dict) and (
-            (primary_row.get("host_vitals") or {}).get("owner_key") == key)
-        if prompt is not None and not host_told_owner(info, prompt) and not primary_told:
-            # Only the owner can click Allow. The stalled host normally tells
-            # him itself; when it has not, the reader does, once per prompt issue.
-            import owner_notify  # noqa: PLC0415 - sibling module
-            owner = owner_notify.notify_once(
-                directory / f"{peer}.owner-notify.json", key,
-                f"{peer}: host-vitals stalled since {vitals_verdict['since']} behind a "
-                f"waiting macOS privacy prompt. Click Allow on {peer} (at its screen or over "
-                f"Screen Sharing). https://github.com/{host_off.ISSUE_REPO}/issues/"
-                f"{prompt.get('number')}", sender=notify, now=now)
         result[peer]["host_vitals"] = {**vitals_verdict, "acting": acting,
                                         "issue": vitals_out.get("issue"),
                                         "closed": bool(vitals_out.get("closed")),
-                                        "related": [r.get("number") for r in related],
-                                        "owner_notified": bool(owner.get("sent")),
-                                        # Read by a fallback reader (last-read.json) so the
-                                        # owner is told once per prompt, not once per reader.
-                                        "owner_key": _sent_key(directory / f"{peer}.owner-notify.json")}
+                                        "related": [r.get("number") for r in related]}
         drift_verdict = shipyard_drift_judge(
             info, setting("TARTCI_SHIPYARD_DRIFT_RELEASES", SHIPYARD_DRIFT_RELEASES),
             setting("TARTCI_SHIPYARD_DRIFT_HOURS", SHIPYARD_DRIFT_HOURS))

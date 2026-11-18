@@ -428,18 +428,59 @@ class AlertPassTests(unittest.TestCase):
                       notify=lambda text: sent.append(text) or (True, "HTTP 204"))
         self.assertEqual(len(sent), 1)
         self.assertNotIn("issues/101", sent[0])
+        self.assertIn("has a macOS privacy prompt waiting", sent[0], "names the issue by title")
 
-    def test_a_message_sent_before_its_issue_opened_is_followed_by_the_link(self) -> None:
-        tp.alert_pass(PRESENT, self.verdict(), now=NOW, state_dir=self.state, host="m3",
-                      issue=lambda title, body: (1, "HTTP 502"), close=self.close,
-                      heal=lambda **kw: {},
-                      notify=lambda text: self.sent.append(text) or (True, "HTTP 204"))
-        self.assertEqual(len(self.sent), 1)
-        self.assertNotIn("/issues/", self.sent[0])
-        self.run_pass(PRESENT, self.verdict(), now=NOW + 300)
-        self.run_pass(PRESENT, self.verdict(), now=NOW + 600)
-        self.assertEqual(len(self.sent), 2, "one follow-up with the link, once")
-        self.assertIn("issues/101", self.sent[1])
+    def test_no_owner_message_on_the_pass_the_heal_is_due(self) -> None:
+        # The heal drops the alert: a click instruction then would be stale,
+        # and a slow post must not delay the heal.
+        order: list = []
+        reading = dict(PRESENT, hang=True, pending_since_epoch=NOW - 3600)
+        tp.alert_pass(reading, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                      issue=self.issue, close=self.close,
+                      heal=lambda **kw: order.append("heal") or {"outcome": "ran"},
+                      notify=lambda text: order.append("notify") or (True, "HTTP 204"))
+        self.assertEqual(order, ["heal"])
+
+    def test_the_owner_is_told_before_the_heal_is_due(self) -> None:
+        order: list = []
+        reading = dict(PRESENT, hang=True, pending_since_epoch=NOW - 60)
+        tp.alert_pass(reading, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                      issue=self.issue, close=self.close,
+                      heal=lambda **kw: order.append("heal") or {"outcome": "ran"},
+                      notify=lambda text: order.append("notify") or (True, "HTTP 204"))
+        self.assertEqual(order, ["notify"])
+
+    def test_a_heal_that_did_not_drop_the_alert_still_tells_the_owner(self) -> None:
+        sent: list = []
+        reading = dict(PRESENT, hang=True, pending_since_epoch=NOW - 3600)
+        tp.alert_pass(reading, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                      issue=self.issue, close=self.close,
+                      heal=lambda **kw: {"outcome": "ineffective"},
+                      notify=lambda text: sent.append(text) or (True, "HTTP 204"))
+        self.assertEqual(len(sent), 1)
+
+    def test_a_heal_that_raises_still_tells_the_owner(self) -> None:
+        sent: list = []
+
+        def boom(**kw):
+            raise RuntimeError("bad heal record")
+        reading = dict(PRESENT, hang=True, pending_since_epoch=NOW - 3600)
+        line = tp.alert_pass(reading, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                             issue=self.issue, close=self.close, heal=boom,
+                             notify=lambda text: sent.append(text) or (True, "HTTP 204"))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("heal error RuntimeError", line)
+
+    def test_a_prompt_still_up_after_its_heal_ran_is_still_told(self) -> None:
+        # The heal already ran this episode (or is disabled) and the alert is
+        # back: the owner is the only way out, so he is told.
+        sent: list = []
+        reading = dict(PRESENT, hang=True, pending_since_epoch=NOW - 3600)
+        tp.alert_pass(reading, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                      issue=self.issue, close=self.close, heal=lambda **kw: {},
+                      heal_enabled=False,
+                      notify=lambda text: sent.append(text) or (True, "HTTP 204"))
+        self.assertEqual(len(sent), 1)
 
     def test_no_owner_message_without_a_page(self) -> None:
         self.assertIsNone(self.run_pass(PRESENT, None))

@@ -38,6 +38,15 @@ class OwnerNotifyTests(unittest.TestCase):
         self.assertNotIn("sent_at", json.loads(self.state.read_text()))
         self.assertTrue(owner_notify.notify_once(self.state, "a", "x", sender=self.ok)["sent"])
 
+    def test_an_unwritable_receipt_never_sends(self) -> None:
+        # A send whose receipt cannot be saved would repeat on every pass.
+        state = Path(self.tmp.name) / "missing-dir" / "sub" / "notify.json"
+        with mock.patch.object(owner_notify, "_test_run", return_value=True), \
+                mock.patch("host_off._write_json", side_effect=OSError("read-only")):
+            out = owner_notify.notify_once(state, "a", "x", sender=self.ok)
+        self.assertEqual(self.sent, [])
+        self.assertIn("receipt not writable", out["skipped"])
+
     def test_the_switch_turns_it_off(self) -> None:
         with mock.patch.dict(os.environ, {"TARTCI_OWNER_NOTIFY": "0"}):
             out = owner_notify.notify_once(self.state, "a", "x", sender=self.ok)

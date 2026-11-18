@@ -48,7 +48,7 @@ class Fleet:
 
     def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
               last: dict | None = None, vitals: dict | None = None,
-              freshness: dict | None = None, owner: dict | None = None) -> None:
+              freshness: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
         tail = json.dumps(last) if last is not None else ""
         self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
@@ -56,9 +56,7 @@ class Fleet:
                                    f"{psa.VITALS_SEPARATOR}\n"
                                    f"{json.dumps(vitals) if vitals is not None else ''}\n"
                                    f"{psa.FRESHNESS_SEPARATOR}\n"
-                                   f"{json.dumps(freshness) if freshness is not None else ''}\n"
-                                   f"{psa.OWNER_SEPARATOR}\n"
-                                   f"{json.dumps(owner) if owner is not None else ''}\n",
+                                   f"{json.dumps(freshness) if freshness is not None else ''}\n",
                                 "")
 
     def healthy(self, target: str) -> None:
@@ -176,76 +174,70 @@ class PeerStall(unittest.TestCase):
     OTHER = {"number": 1, "title": "[tartci] m5 has a macOS privacy prompt waiting: click Allow",
              "body": ""}
 
-    def stale_vitals(self, owner=None):
+    def stale_vitals(self):
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},
-                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360}, owner=owner)
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360})
 
-    def test_a_vitals_stall_links_the_prompt_and_tells_the_owner_once(self):
+    def test_a_vitals_stall_links_the_prompt_and_never_messages_the_owner(self):
         # 2026-11-18: #965 (host-vitals) said only "tartci launchd heal" while
         # #960 (privacy prompt) on the same host waited for a click for hours.
         self.stale_vitals()
-        sent: list = []
-        notify = lambda text: sent.append(text) or (True, "HTTP 204")  # noqa: E731
         lister = lambda: [self.OTHER, self.STORE, self.PROMPT]  # noqa: E731
-        out = self.run_pass(RECEIPT_TS + 60, lister=lister, notify=notify)
+        with mock.patch("owner_notify.notify_once") as told:
+            out = self.run_pass(RECEIPT_TS + 60, lister=lister)
         body = self.opened[0][1]
         self.assertIn("click Allow on studio", body)
         self.assertIn("#960", body)
         self.assertIn("#959", body)
         self.assertNotIn("#1 ", body, "another host's prompt is not linked")
         self.assertEqual(out["peers"]["studio"]["host_vitals"]["related"], [960, 959])
-        self.assertEqual(len(sent), 1)
-        self.assertIn("Click Allow on studio", sent[0])
-        self.assertIn("issues/960", sent[0])
-        self.run_pass(RECEIPT_TS + psa.READ_SECS + 60, lister=lister, notify=notify)
-        self.assertEqual(len(sent), 1, "one owner message per prompt")
+        # The stalled host is the one sender (tcc_prompt): a reader never adds a
+        # second owner message for the same wedge.
+        told.assert_not_called()
 
     def test_a_prompt_that_appears_later_is_commented_on_the_open_vitals_issue(self):
         self.stale_vitals()
         patched: list = []
         patch = lambda number, body: patched.append((number, body)) or (0, "1")  # noqa: E731
-        notify = lambda text: (True, "HTTP 204")  # noqa: E731
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [], notify=notify, comment=patch)
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [], comment=patch)
         self.assertNotIn("click Allow", self.opened[0][1])
         self.assertEqual(patched, [])
         later = RECEIPT_TS + psa.READ_SECS + 60
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},
                          clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
-        self.run_pass(later, lister=lambda: [self.PROMPT], notify=notify, comment=patch)
+        self.run_pass(later, lister=lambda: [self.PROMPT], comment=patch)
         self.assertEqual(patched[-1][0], "501")
         self.assertIn("click Allow on studio", patched[-1][1])
         n = len(patched)
-        self.run_pass(later + psa.READ_SECS, lister=lambda: [self.PROMPT], notify=notify,
+        self.run_pass(later + psa.READ_SECS, lister=lambda: [self.PROMPT],
                       comment=patch)
         self.assertEqual(len(patched), n, "patched once per change of links")
 
     def test_a_prompt_that_closes_is_removed_from_the_open_vitals_issue(self):
         self.stale_vitals()
-        notify = lambda text: (True, "HTTP 204")  # noqa: E731
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT], notify=notify)
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
         later = RECEIPT_TS + psa.READ_SECS + 60
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},
                          clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
-        self.run_pass(later, lister=lambda: [], notify=notify)
+        self.run_pass(later, lister=lambda: [])
         self.assertNotIn("click Allow", self.patched[-1][1])
         count = len(self.patched)
         # A failed issue read keeps the links: no rewrite.
-        self.run_pass(later + psa.READ_SECS, lister=lambda: None, notify=notify)
+        self.run_pass(later + psa.READ_SECS, lister=lambda: None)
         self.assertEqual(len(self.patched), count)
 
     def test_an_unreadable_issue_list_keeps_the_existing_links(self):
         self.stale_vitals()
-        notify = lambda text: (True, "HTTP 204")  # noqa: E731
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT], notify=notify)
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
         count = len(self.patched)
         later = RECEIPT_TS + psa.READ_SECS + 60
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},
                          clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
-        self.run_pass(later, lister=lambda: None, notify=notify)
+        self.run_pass(later, lister=lambda: None)
         self.assertEqual(len(self.patched), count)
 
     def test_a_malformed_issue_list_is_an_unreadable_read(self):
@@ -268,59 +260,31 @@ class PeerStall(unittest.TestCase):
         self.assertEqual(rc, 1)
         real.assert_not_called()
 
-    def test_a_fallback_reader_does_not_repeat_the_primary_message(self):
-        # m5 reads studio as a fallback (m1 is primary). m1's last pass says it
-        # already told the owner about prompt #960.
-        self.stale_vitals()
-        self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
-                                "paused": []},
-                         last={"ts": RECEIPT_TS - 99999, "peers": {"studio": {
-                             "error": "ssh failed",
-                             "host_vitals": {"owner_key": "issue-960"}}}})
-        sent: list = []
-        for at in (RECEIPT_TS + 60, RECEIPT_TS + psa.READ_SECS + 60):
-            self.run_pass(at, host="m5", lister=lambda: [self.PROMPT],
-                          notify=lambda text: sent.append(text) or (True, "HTTP 204"))
-        self.assertEqual(sent, [])
-
     def test_a_failed_open_in_a_new_episode_never_patches_the_old_issue(self):
         self.stale_vitals()
-        notify = lambda text: (True, "HTTP 204")  # noqa: E731
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [], notify=notify)
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [])
         self.assertEqual([t for t, _ in self.opened], [VITALS_TITLE])
         later = RECEIPT_TS + psa.READ_SECS + 60
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},
                          clock=later, vitals={"sampled_at": later - 900})
-        self.run_pass(later, lister=lambda: [self.PROMPT], notify=notify,
+        self.run_pass(later, lister=lambda: [self.PROMPT],
                       issue=lambda title, body: (1, "HTTP 502"))
         self.assertEqual(self.patched, [], "issue 501 belongs to the previous episode")
 
     def test_a_freshly_opened_issue_gets_no_duplicate_link_comment(self):
         self.stale_vitals()
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT],
-                      notify=lambda text: (True, "HTTP 204"))
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
         self.assertIn("#960", self.opened[0][1])
         self.assertEqual(self.patched, [])
 
-    def test_no_second_owner_message_when_the_host_told_him(self):
-        self.stale_vitals(owner={"key": "2026-10-09T06:50:00Z", "sent_at": "2026-10-09T06:51:00Z"})
-        sent: list = []
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT],
-                      notify=lambda text: sent.append(text) or (True, "HTTP 204"))
-        self.assertIn("click Allow on studio", self.opened[0][1])
-        self.assertEqual(sent, [])
-
-    def test_a_store_stall_alone_is_linked_without_an_owner_message(self):
+    def test_a_store_stall_alone_is_linked_without_a_prompt_hint(self):
         self.stale_vitals()
-        sent: list = []
-        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.STORE],
-                      notify=lambda text: sent.append(text) or (True, "HTTP 204"))
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.STORE])
         body = self.opened[0][1]
         self.assertIn("Possibly related open issues on studio", body)
         self.assertIn("#959", body)
         self.assertNotIn("click Allow", body)
-        self.assertEqual(sent, [])
 
     def test_fresh_host_vitals_is_the_negative_control(self):
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},

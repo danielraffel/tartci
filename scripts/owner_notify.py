@@ -76,13 +76,21 @@ def notify_once(state: Path, key: str, text: str, *, sender: Optional[Sender] = 
         return {"sent": False, "skipped": "already sent for this episode", "detail": ""}
     if not enabled():
         return {"sent": False, "skipped": "TARTCI_OWNER_NOTIFY=0", "detail": ""}
+    record = {"key": key, "text": text[:500], "detail": "sending"}
+    try:
+        # Proven writable before sending: a receipt that cannot be saved would
+        # repeat the message on every pass.
+        host_off._write_json(state, record)
+    except OSError as exc:
+        return {"sent": False, "skipped": f"receipt not writable: {type(exc).__name__}",
+                "detail": ""}
     ok, detail = (sender or post)(text)
-    record = {"key": key, "text": text[:500], "detail": detail[:200]}
+    record["detail"] = detail[:200]
     if ok:
         record["sent_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                           time.gmtime(time.time() if now is None else now))
     try:
         host_off._write_json(state, record)
-    except OSError:
-        pass
+    except OSError as exc:
+        detail = f"{detail}; receipt not saved: {type(exc).__name__}"
     return {"sent": ok, "skipped": None, "detail": detail}
