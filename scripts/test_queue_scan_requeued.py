@@ -223,12 +223,24 @@ class RequeuedRankingTests(unittest.TestCase):
 
     def test_a_hosted_queued_job_does_not_keep_a_run(self) -> None:
         now = datetime.now(timezone.utc)
-        run = _run(8, now - timedelta(hours=2), "merge_group", "queued", now - timedelta(minutes=3))
+        # A PR run, so the plain merge-group quota does not read it either.
+        run = _run(8, now - timedelta(hours=2), "pull_request", "queued", now - timedelta(minutes=3))
+        prs = [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+               for i in range(1, 9)]
         scanner = self.scanner()
         state: dict[str, Any] = {}
-        scanner._candidate_runs([run], state)
-        scanner._forget_served(state, 8, [{"status": "queued", "labels": ["ubuntu-24.04"]}])
+        scanner._candidate_runs([run, *prs], state)
+        scanner._forget_served(state, 8, [{"status": "queued", "labels": ["ubuntu-24.04"]}],
+                               run["updated_at"])
         self.assertNotIn("8", state["requeued_runs"])
+        # Listed again unchanged: no priority slot, on this or later refreshes.
+        for _ in range(3):
+            again, _ = scanner._candidate_runs([run, *prs], state)
+            self.assertNotEqual(int(again[0]["id"]), 8)
+        # Once the run changes (a new job queued), it is requeued again.
+        changed = {**run, "updated_at": _stamp(now - timedelta(minutes=1))}
+        later, _ = scanner._candidate_runs([changed, *prs], state)
+        self.assertEqual(int(later[0]["id"]), 8)
 
     def test_memory_is_bounded(self) -> None:
         import queue_scan

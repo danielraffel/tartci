@@ -1188,4 +1188,5 @@ not permission to force-remove a worktree.
   discovery remembers up to 16 requeued runs (`requeued_runs`) and reads them
   even when their page is not read again. A remembered run stays requeued
   until a fetch of its jobs shows no queued job on a self-hosted runner,
-  within the 6 h bound.
+  within the 6 h bound. After that fetch the run gets no priority read until
+  its `updated_at` changes (`requeued_cleared`), though it still rotates.

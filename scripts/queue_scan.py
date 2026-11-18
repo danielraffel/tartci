@@ -514,22 +514,35 @@ class QueueScanner:
     def _with_remembered(
         self, runs: list[dict[str, Any]], state: dict[str, Any]
     ) -> list[dict[str, Any]]:
-        """The listed runs plus remembered requeued runs no page listed now.
+        """The runs that may hold a requeued slot this refresh.
 
-        Records this listing's requeued runs in `state["requeued_runs"]`
-        (bounded, newest update kept), so a requeued run on an older page is
-        still read while the rotation reads a different page. A remembered run
-        is dropped once a fetch of its jobs shows none queued (_forget_served).
+        The listed runs, plus remembered requeued runs no page listed now:
+        `state["requeued_runs"]` (bounded, newest update kept) records each
+        listing's requeued runs, so a requeued run on an older page is still
+        read while the rotation reads a different page. A run whose job fetch
+        showed no queued fleet work (`state["requeued_cleared"]`, keyed by the
+        update that fetch saw) is left out until it changes again; it stays in
+        the rotation, which reads `runs` directly.
         """
         if not self._requeued_quota():
             return runs
         listed = {int(run["id"]) for run in runs}
-        memory_raw = state.get("requeued_runs")
-        memory = {
-            str(key): value for key, value in (memory_raw or {}).items()
-            if isinstance(value, dict) and isinstance(value.get("id"), int)
-        } if isinstance(memory_raw, dict) else {}
-        for run in self._requeued_runs(runs):
+
+        def load(key: str) -> dict[str, Any]:
+            raw = state.get(key)
+            return dict(raw) if isinstance(raw, dict) else {}
+
+        cleared = {key: str(value) for key, value in load("requeued_cleared").items()
+                   if key.isdigit() and int(key) in listed}
+        state["requeued_cleared"] = cleared
+
+        def is_cleared(run: dict[str, Any]) -> bool:
+            return cleared.get(str(int(run["id"]))) == str(run.get("updated_at") or "")
+
+        memory = {key: value for key, value in load("requeued_runs").items()
+                  if isinstance(value, dict) and isinstance(value.get("id"), int)}
+        eligible = [run for run in runs if not is_cleared(run)]
+        for run in self._requeued_runs(eligible):
             memory[str(int(run["id"]))] = {
                 **{key: run[key] for key in ("id", "name", "event", "status", "created_at",
                                              "updated_at", "head_sha") if key in run},
@@ -543,10 +556,11 @@ class QueueScanner:
         # A listed run keeps its remembered standing (an in_progress run whose
         # update has left the discovery window is still requeued).
         marked = [{**run, "_remembered": True} if str(int(run["id"])) in memory else run
-                  for run in runs]
+                  for run in eligible]
         return marked + [run for run in memory.values() if int(run["id"]) not in listed]
 
-    def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any]) -> None:
+    def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any],
+                       updated_at: str = "") -> None:
         memory = state.get("requeued_runs")
         if not isinstance(memory, dict) or str(run_id) not in memory:
             return
@@ -557,7 +571,10 @@ class QueueScanner:
             and "self-hosted" in [str(label).lower() for label in job.get("labels") or []]
             for job in jobs
         ):
-            memory.pop(str(run_id), None)
+            gone = memory.pop(str(run_id), None) or {}
+            cleared = state.setdefault("requeued_cleared", {})
+            if isinstance(cleared, dict):
+                cleared[str(run_id)] = str(updated_at or gone.get("updated_at") or "")
 
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         now = int(getattr(self, "now", 0) or 0)
@@ -805,7 +822,7 @@ class QueueScanner:
                 ).get("jobs", [])
                 if not isinstance(jobs, list):
                     raise ValueError(f"jobs is not a list for run {run_id}")
-                self._forget_served(discovery, run_id, jobs)
+                self._forget_served(discovery, run_id, jobs, str(run.get("updated_at") or ""))
                 discovered.append({**run, "_jobs": jobs})
 
             discovery["fetched_at"] = int(time.time())
