@@ -2608,7 +2608,8 @@ def behind_alert(cfg: Config, skew: dict, now: float) -> None:
                 f"on: {skew.get('behind')} commits behind, the oldest undeployed from "
                 f"{skew.get('oldest_undeployed')}, {behind / 3600:.1f} h past its soak.", "",
                 "## Evidence",
-                f"- `~/.tartci/state/self-update/skew.json`: {render_skew(skew)[:300]}",
+                f"- `~/.tartci/state/self-update/{BEHIND_SKEW_NAME}`: "
+                f"{render_skew(skew)[:300]}",
                 "- the newest receipts in `~/.tartci/state/self-update/attempts/` say why "
                 "each attempt did not update (stepped aside, refused, deferred, rate limited)", "",
                 "## Fix", "```sh",
@@ -3624,10 +3625,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 else _read_json(cfg.state_dir / BEHIND_SKEW_NAME) or {})
         try:
             running = installed_commit(cfg)[0]
-        except Exception:  # noqa: BLE001 - unknown install: the skew still names one
-            running = None
-        if running and skew.get("installed") and skew["installed"] != running:
-            return  # measured before an install moved the host; stale
+        except Exception:  # noqa: BLE001 - without proof, do not alert from stale skew
+            return
+        if not skew.get("installed") or skew["installed"] != running:
+            return  # measured before an install moved the host, or lacks provenance
         behind_alert(cfg, skew, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
     if blocked:

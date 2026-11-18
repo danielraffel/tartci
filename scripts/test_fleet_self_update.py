@@ -1057,6 +1057,26 @@ class BehindMainAlertTests(Base):
             self.assertEqual(su.EXIT_UNKNOWN, self.apply())
         self.assertIn("STARVED", out.getvalue())
         self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertIn(
+            f"~/.tartci/state/self-update/{su.BEHIND_SKEW_NAME}", self.bodies[0])
+        self.assertNotIn(
+            "~/.tartci/state/self-update/skew.json`:", self.bodies[0])
+
+    def test_an_unreadable_installed_commit_does_not_alert_from_saved_skew(self) -> None:
+        su._write_json(self.cfg.state_dir / su.BEHIND_SKEW_NAME,
+                       self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        with mock.patch.object(su, "installed_commit",
+                               side_effect=su.Refused("installed commit unreadable")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.issues)
+
+    def test_a_saved_skew_without_installed_commit_does_not_alert(self) -> None:
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       {**self.skew(su.BEHIND_STARVED_SECONDS + 600), "installed": None})
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.issues)
 
     def test_a_skew_from_before_an_install_is_not_used(self) -> None:
         su._write_json(self.cfg.state_dir / "skew.json",
