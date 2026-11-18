@@ -108,6 +108,13 @@ class ProfileTests(unittest.TestCase):
                     path.write_text(base.replace(line, bad))
                     with self.assertRaisesRegex(ValueError, "refresh_after_every_serve"):
                         fleet.load(path)
+            # Under a minimum queue age a just-queued job cannot count (m1).
+            path = Path(td) / "p.toml"
+            aged = "min_queued_age_seconds = 0\n# Vellum's merge-group sterile job"
+            self.assertEqual(base.count(aged), 1)
+            path.write_text(base.replace(aged, aged.replace("= 0", "= 600")))
+            with self.assertRaisesRegex(ValueError, "refresh_after_every_serve"):
+                fleet.load(path)
             # A single-label lane has no tier loop to refresh.
             spectr = 'id = "spectr-gate"\n'
             self.assertEqual(base.count(spectr), 1)

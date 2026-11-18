@@ -498,15 +498,15 @@ class QueueScanner:
         # The run whose job the lane just served goes first: a dependent job
         # it queued as that job ended exists nowhere else, and the run (as old
         # as its proof) would otherwise wait for its turn in the rotation. It
-        # takes a slot from the same cap, ahead of the merge-group quota.
+        # takes one of the newest-run slots, so the merge-group quota, the
+        # oldest-run reservation and the rotating slot keep theirs.
         priority_run_id = self._priority_run_id()
         served = [
             run for run in newest if priority_run_id and int(run["id"]) == priority_run_id
         ][:1]
         merge_quota = min(
             self._merge_group_quota(),
-            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1
-                - len(served)),
+            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
         )
         priority = served + [
             run for run in newest
@@ -515,7 +515,7 @@ class QueueScanner:
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
-        ][: self.args.newest_quota]
+        ][: max(0, self.args.newest_quota - len(served))]
         latency_ids = {int(run["id"]) for run in latency}
         backlog = [
             run for run in runs if int(run["id"]) not in latency_ids

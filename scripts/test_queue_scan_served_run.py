@@ -20,6 +20,7 @@ import test_paginated_queue_scan as helpers
 
 WORKFLOW = "Locked macOS GPU proof"
 STERILE = "self-hosted,macOS,ARM64,vellum-host-m3,vellum-sterile-consumer"
+MERGE_CLASS = "self-hosted,macOS,ARM64,vellum-host-m3,vellum-build-macos-merge-group"
 PR_CLASS = "self-hosted,macOS,ARM64,vellum-host-m3,vellum-build-macos"
 SERVED = 43900000001
 
@@ -39,6 +40,8 @@ def _run(run_id: int, created: datetime, event: str, status: str) -> dict[str, A
 
 
 class ServedRunFirstTests(unittest.TestCase):
+    merge_status = "in_progress"
+
     def _queue(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[int, list]]:
         now = datetime.now(timezone.utc)
         base = ["self-hosted", "macOS", "ARM64"]
@@ -54,7 +57,7 @@ class ServedRunFirstTests(unittest.TestCase):
                 {"id": 1, "status": "completed", "labels": [*base, "vellum-build-macos"]},
                 {"id": 2, "status": "queued", "labels": [*base, "vellum-sterile-consumer"]},
             ],
-            300: [{"id": 3, "status": "in_progress",
+            300: [{"id": 3, "status": self.merge_status,
                    "labels": [*base, "vellum-build-macos-merge-group"]}],
         }
         for run in running:
@@ -102,6 +105,12 @@ class ServedRunFirstTests(unittest.TestCase):
         counts = self._scan(STERILE, refreshes=12)
         self.assertIn(0, counts, counts)
 
+    def test_a_queued_merge_group_proof_is_still_counted(self) -> None:
+        """The served run takes a newest slot, never the merge-group quota's."""
+        self.merge_status = "queued"
+        self.assertEqual(self._scan(MERGE_CLASS, refreshes=6), [1] * 6)
+        self.assertEqual(self._scan(MERGE_CLASS, refreshes=6, priority_run=SERVED), [1] * 6)
+
     def test_an_unknown_served_run_changes_nothing(self) -> None:
         self.assertEqual(self._scan(PR_CLASS, refreshes=3, priority_run=1),
                          self._scan(PR_CLASS, refreshes=3))
@@ -125,6 +134,11 @@ class ServedRunFirstTests(unittest.TestCase):
         self.assertEqual(ids[0], SERVED)
         self.assertLessEqual(len(ids), 5)
         self.assertEqual(len(ids), len(set(ids)))
+        # The merge-group quota keeps its slot: the newest merge_group run.
+        self.assertIn(1, ids)
+        # And the served run's slot came out of the newest quota: the
+        # quota's merge-group run plus one newest run, then the backlog.
+        self.assertEqual(ids[:3], [SERVED, 1, 2])
 
 
 if __name__ == "__main__":

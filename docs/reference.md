@@ -765,18 +765,21 @@ sits in the bounded rotation of runs whose jobs a refresh reads. Without the
 refresh, the freed lane saw only proof-class work and booted it, so the
 dependent job waited for another lane.
 
-`--priority-run` reads that run's jobs first, from the same
-`--max-job-fetches` cap, so the dependent job is counted on that refresh.
+`--priority-run` reads that run's jobs first, so the dependent job is counted
+on that refresh. The run takes one of the `--newest-quota` slots inside the
+same `--max-job-fetches` cap. The merge-group quota, the oldest-run
+reservation and the rotating slot keep theirs.
 
 Cost: a forced selection spends one uncached discovery per workflow set, not
 one per tier. Lower tiers of the same workflows read the snapshot the forced
 scan just published. That is about 5 to 14 API calls per served job and
 changes no priority.
 
-`refresh_after_every_serve` is valid only on a legacy `[[lane.tier]]` lane.
-Set it where a class's jobs are created when another class's job ends, and
-the lane's `min_queued_age_seconds` is 0. With a minimum age, a just-queued
-job cannot count, so the refresh is pure cost.
+`refresh_after_every_serve` is valid only on a legacy `[[lane.tier]]` lane
+with `min_queued_age_seconds = 0`, and the validator refuses it elsewhere:
+under a minimum age a just-queued job cannot count, so the refresh would be
+pure cost. Set it where one class's jobs are created when another class's
+job ends.
 
 To order a lane across hosts by speed, give the same lane id a `claim_rank` on
 every host instead (0 = fastest, integers 0-9; not combined with

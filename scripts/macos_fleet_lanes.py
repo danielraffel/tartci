@@ -931,6 +931,9 @@ def load(path: Path) -> dict:
             # The runner implements it in the tier loop's selection only.
             fail(f"lane {lane_id}: refresh_after_every_serve must be a boolean on a "
                  "[[lane.tier]] lane that is not event-class-v2")
+        if refresh and lane.get("min_queued_age_seconds", 0):
+            # A just-queued job cannot count under a minimum age: pure cost.
+            fail(f"lane {lane_id}: refresh_after_every_serve needs min_queued_age_seconds = 0")
         validate_short_jobs(lane_id, lane, data)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
