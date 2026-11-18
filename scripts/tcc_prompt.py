@@ -64,6 +64,8 @@ INSTALL_WINDOW_S = 10 * 60
 STATE_NAME = "tcc-prompt.json"
 ALERT_STATE_NAME = "tcc-prompt-alert.json"
 HEAL_STATE_NAME = "tcc-prompt-heal.json"
+# Set once the owner was told about this alert episode (owner_notify).
+NOTIFY_STATE_NAME = "tcc-prompt-notify.json"
 TITLE = "[tartci] {host} has a macOS privacy prompt waiting: click Allow"
 GENERATION = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -423,6 +425,16 @@ def render(host: str, reading: dict, verdict: Optional[dict], heal_after_s: int,
     return TITLE.format(host=host), tartci_incident.with_marker(body, line)
 
 
+def owner_text(host: str, since: object, issue: object = None) -> str:
+    """The owner-channel line for a waiting privacy prompt on `host`."""
+    import host_off  # noqa: PLC0415
+    return (f"{host}: a macOS privacy prompt has waited on the console since {since}. "
+            f"Click Allow on {host} (at its screen or over Screen Sharing); its Tart store and "
+            "lanes are blocked until then. Do not click Don't Allow."
+            + (f" https://github.com/{host_off.ISSUE_REPO}/issues/{issue}" if issue else
+               f" (issue: \"{TITLE.format(host=host)}\")"))
+
+
 def host_id() -> str:
     import vm_boot_alert  # noqa: PLC0415 - owns this host's id (works without tomllib)
     return vm_boot_alert._alert_host()[0]
@@ -434,7 +446,8 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
                issue: Optional[Callable[..., Any]] = None,
                close: Optional[Callable[..., Any]] = None,
                heal: Optional[Callable[..., dict]] = None,
-               heal_enabled: bool = True) -> Optional[str]:
+               heal_enabled: bool = True,
+               notify: Optional[Callable[[str], tuple]] = None) -> Optional[str]:
     """Page once per alert episode, close the issue when the alert is gone, and
     run the fallback heal once per episode if nobody answers.
 
@@ -471,11 +484,42 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
     if not active:
         return None
     heal_text = ""
+    healed = False
     pending = reading.get("pending_since_epoch")
     if waiting and isinstance(pending, (int, float)):
-        record = fallback_heal(reading, store_state, now, state_dir=state_dir,
-                               heal_after_s=heal_after_s, heal=heal, enabled=heal_enabled)
+        try:
+            record = fallback_heal(reading, store_state, now, state_dir=state_dir,
+                                   heal_after_s=heal_after_s, heal=heal, enabled=heal_enabled)
+        except Exception as exc:  # noqa: BLE001 - the owner message below must still run
+            record = {"outcome": f"error {type(exc).__name__}: {str(exc)[:120]}"}
         heal_text = f"; heal {record.get('outcome')}"
+        # Only a heal that ran dropped the alert; a failed, ineffective or
+        # refused heal leaves it for the owner.
+        healed = record.get("outcome") == "ran"
+    # Only the owner can click Allow, and an issue alone sat unread for hours
+    # (tartci #960): tell him on the owner channel, once per alert episode.
+    # The host is the one sender: it opens the prompt issue in this same pass,
+    # so a peer that sees the issue knows the host could have sent too. After
+    # the heal, so a slow post never delays it; not on the pass the heal ran,
+    # which drops the alert (a click instruction then would be stale).
+    owner_text_note = ""
+    if not healed:
+        try:
+            import owner_notify  # noqa: PLC0415 - sibling module
+            # This episode's issue only: `out` can carry the previous
+            # episode's number when this episode's open failed.
+            saved = _read_json(state_dir / ALERT_STATE_NAME)
+            number = saved.get("issue") if saved.get("since") == reading.get("since") else None
+            told = owner_notify.notify_once(
+                state_dir / NOTIFY_STATE_NAME, str(reading.get("since")),
+                owner_text(host, reading.get("since"), number), sender=notify, now=now)
+            if told.get("sent"):
+                owner_text_note = "; owner told"
+            elif told.get("skipped") != "already sent for this episode":
+                owner_text_note = ("; owner NOT told: "
+                                   + str(told.get("skipped") or told.get("detail"))[:120])
+        except Exception as exc:  # noqa: BLE001 - the owner message never breaks the pass
+            owner_text_note = f"; owner NOT told: {type(exc).__name__}"
     why = (f"near Shipyard install {install['generation'][:12]} "
            f"({install['seconds_before_alert']} s; timing only)" if install else "")
     if waiting:
@@ -484,7 +528,7 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
         if job:
             why += f" (probe job {job})"
     return (f"{detected} launchd-watchdog: WARN tcc-prompt: a privacy consent alert has waited "
-            f"on the console since {reading.get('since')} ({why}{heal_text})"
+            f"on the console since {reading.get('since')} ({why}{heal_text}{owner_text_note})"
             + (f" (issue #{out.get('issue')})" if out.get("issue") else " (issue not opened)"))
 
 

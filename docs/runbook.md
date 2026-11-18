@@ -572,6 +572,22 @@ all is `unavailable`, never "no alert". Then:
   Allow`, opened when the alert is up and either a store open waits on it or
   the alert followed a Shipyard install, and closed when the alert is gone
   (`TARTCI_TCC_PROMPT_ISSUE=0` keeps the WARN line and opens no issue);
+- only the owner can click Allow, so the same pass, after the fallback heal
+  (and not on the pass a heal ran and dropped the alert), also tells him once
+  per alert episode on the fleet Discord channel ("Click
+  Allow on <host>", with the issue link, or the issue title if the issue is
+  not open yet), through the webhook file fleet-health and fleet-liveness use
+  (`~/.config/pulp/secrets/fleet/discord-machine-room.webhook`). The host is
+  the only sender. The send is recorded in
+  `~/.tartci/state/tcc-prompt-notify.json` only once it succeeds, so a failed
+  post is retried on the next pass; a post that reached Discord but timed out
+  is sent again (at least once, not exactly once). The WARN line says
+  `owner told`, or `owner NOT told: <why>` until a send succeeds. Nothing on
+  this path touches /Volumes (the store volume a prompt wedge hangs): the
+  webhook file, the receipt, the watchdog's program, generation and log all
+  live under the home directory. `TARTCI_OWNER_NOTIFY=0`
+  turns it off. On 2026-11-18 the issue alone (tartci #960) waited about 4 h
+  for a click;
 - the consent-alert pass owns the fallback heal: once a store open has waited
   on the alert for `PROMPT_HEAL_AFTER_S` (15 min) it runs the same scoped heal
   once per alert episode, sharing the store-health heal record as one budget
@@ -2583,7 +2599,15 @@ alert, so its peers raise it.
   is `ssh <peer> 'tartci launchd heal'`. A fresh sample closes the episode.
   This check is deliberately peer-driven because a watchdog cannot report its
   own StartInterval stall. Its receipt is recorded beside the existing peer
-  alert state as `<peer>.host-vitals.json`.
+  alert state as `<peer>.host-vitals.json`. The issue links any open
+  privacy-prompt or store-stall issue for the same host, and gets a comment
+  when that set changes later (`<peer>.host-vitals-links.json`; a failed issue
+  read changes nothing); with a privacy prompt open it names that as the
+  likely cause. Readers never message the owner: the stalled host's own
+  prompt pass is the one sender, so a wedge is announced once. A reader can
+  only see a prompt issue the host opened, in the same pass that sends the
+  message; the one gap is a host whose first post failed and that then stopped
+  running its watchdog before a retry.
 
 ### System resolver dead while TCP is alive (`resolver_dead`)
 
