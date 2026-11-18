@@ -287,35 +287,56 @@ class RequeuedRankingTests(unittest.TestCase):
         second, _ = scanner._candidate_runs(runs, state)
         self.assertNotEqual(int(second[0]["id"]), oldest)
 
-    def test_the_reservation_does_not_charge_a_requeued_run(self) -> None:
-        """Two requeued merge groups, refreshed inside negative_ttl, both read."""
-        now = datetime.now(timezone.utc)
-        old_a = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
-        old_b = _run(2, now - timedelta(hours=2), "merge_group", "queued", now - timedelta(minutes=8))
-        prs = [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
-               for i in range(1, 13)]
+    def reads(self, runs: list[dict[str, Any]], refreshes: int = 12) -> dict[int, int]:
+        """Reads per run at production cadence: 160 s apart, state through JSON."""
+        import json
         scanner = self.scanner()
         state: dict[str, Any] = {}
-        # The first refresh spends the reservation on the oldest PR run; the
-        # next ones, inside negative_ttl, give both requeued groups a slot.
-        scanner._candidate_runs([old_a, old_b, *prs], state)
-        self.assertNotIn("1", state.get("oldest_reserved_at", {}))
-        for _ in range(2):
-            scanner.now += 10
-            ids = [int(r["id"]) for r in scanner._candidate_runs([old_a, old_b, *prs], state)[0]]
-            self.assertIn(1, ids)
-            self.assertIn(2, ids)
+        counts: dict[int, int] = {}
+        for _ in range(refreshes):
+            for run in scanner._candidate_runs([dict(r) for r in runs], state)[0]:
+                counts[int(run["id"])] = counts.get(int(run["id"]), 0) + 1
+            state = json.loads(json.dumps(state))
+            scanner.now += 160
+        return counts
 
-    def test_requeued_and_fresh_merge_groups_share_the_slots(self) -> None:
+    def backlog(self, now: datetime) -> list[dict[str, Any]]:
+        return [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+                for i in range(1, 13)]
+
+    def test_two_requeued_merge_groups_are_both_read_regularly(self) -> None:
         now = datetime.now(timezone.utc)
-        old = [_run(i, now - timedelta(hours=3, minutes=i), "merge_group", "queued",
-                    now - timedelta(minutes=9)) for i in (1, 2)]
-        fresh = _run(3, now - timedelta(minutes=2), "merge_group", "queued")
-        prs = [_run(100 + i, now - timedelta(minutes=10 + i), "pull_request", "queued")
-               for i in range(1, 13)]
-        ids = [int(r["id"]) for r in self.scanner()._candidate_runs([*old, fresh, *prs], {})[0]]
-        self.assertIn(3, ids)
-        self.assertTrue({1, 2} & set(ids))
+        a = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        b = _run(2, now - timedelta(hours=2), "merge_group", "queued", now - timedelta(minutes=8))
+        counts = self.reads([a, b, *self.backlog(now)])
+        self.assertGreaterEqual(counts.get(1, 0), 6)
+        self.assertGreaterEqual(counts.get(2, 0), 6)
+
+    def test_a_fresh_merge_group_is_not_hidden_by_a_requeued_one(self) -> None:
+        now = datetime.now(timezone.utc)
+        a = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        # Fresh, its first job queued, but behind two newer running groups.
+        c = _run(3, now - timedelta(minutes=40), "merge_group", "queued")
+        running = [_run(5 + i, now - timedelta(minutes=20 - i), "merge_group", "in_progress")
+                   for i in range(2)]
+        counts = self.reads([a, c, *running, *self.backlog(now)])
+        self.assertGreaterEqual(counts.get(1, 0), 6)
+        self.assertGreaterEqual(counts.get(3, 0), 6)
+
+    def test_requeued_pr_runs_wait_behind_merge_groups_but_are_read(self) -> None:
+        now = datetime.now(timezone.utc)
+        r1 = _run(1, now - timedelta(hours=4), "pull_request", "queued", now - timedelta(minutes=9))
+        c = _run(3, now - timedelta(minutes=40), "merge_group", "queued")
+        counts = self.reads([r1, c, *self.backlog(now)])
+        self.assertEqual(counts.get(3, 0), 12)
+        self.assertGreaterEqual(counts.get(1, 0), 2)
+
+    def test_off_writes_no_requeued_state(self) -> None:
+        scanner = self.scanner(requeued_quota=0)
+        state: dict[str, Any] = {}
+        for run_id in range(50):
+            scanner._forget_served(state, run_id, [], "2026-11-18T12:00:00Z")
+        self.assertNotIn("requeued_cleared", state)
 
     def test_memory_trim_keeps_merge_groups(self) -> None:
         now = datetime.now(timezone.utc)

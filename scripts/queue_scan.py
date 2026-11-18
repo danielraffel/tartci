@@ -485,7 +485,8 @@ class QueueScanner:
         then requeued before merely updated, oldest first within each.
         """
         now = int(getattr(self, "now", 0) or 0)
-        window = int(getattr(self.args, "discovery_ttl", 0) or 0)
+        window = int(getattr(self, "_requeue_window", 0)
+                     or getattr(self.args, "discovery_ttl", 0) or 0)
         ranked = []
         for run in runs:
             status = str(run.get("status") or str(run.get("_page_key", "")).split(":")[0])
@@ -529,13 +530,21 @@ class QueueScanner:
         if not self._requeued_quota():
             return runs
         listed = {int(run["id"]) for run in runs}
+        # An in_progress run counts if updated since the previous listing:
+        # the cache outlives discovery_ttl by the fetch time and poll latency.
+        now = int(getattr(self, "now", 0) or 0)
+        ttl = int(getattr(self.args, "discovery_ttl", 0) or 0)
+        previous = state.get("requeued_listed_at")
+        self._requeue_window = (
+            max(ttl, now - previous) + 30 if isinstance(previous, int) and now > previous else ttl)
+        if now:
+            state["requeued_listed_at"] = now
 
         def load(key: str) -> dict[str, Any]:
             raw = state.get(key)
             return dict(raw) if isinstance(raw, dict) else {}
 
         # Kept across page rotation, bounded by age and count.
-        now = int(getattr(self, "now", 0) or 0)
         cleared = {
             key: value for key, value in load("requeued_cleared").items()
             if isinstance(value, dict) and isinstance(value.get("at"), int)
@@ -572,6 +581,8 @@ class QueueScanner:
 
     def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any],
                        updated_at: str = "") -> None:
+        if not self._requeued_quota():
+            return
         # Recorded whether or not the run is remembered: memory keeps the
         # newest updates, while priority goes to the oldest runs.
         memory = state.get("requeued_runs")
@@ -639,35 +650,58 @@ class QueueScanner:
         # (Pulp builds up to five groups) cannot starve the PR backlog. When the
         # oldest-run reservation will fire this sweep it costs a slot too.
         # Requeued runs (an old run whose dependent job is now queued) are read
-        # whatever their age, from the same slots as the merge-group quota. The
-        # reservation is judged without them: a requeued run read here needs no
-        # reserved slot, and charging one would cost a priority slot.
-        requeued = self._requeued_runs(self._with_remembered(runs, state))
-        requeued = requeued[: self._requeued_quota()]
-        requeued_ids = {int(run["id"]) for run in requeued}
-        reservation = 1 if self._reservation_fires(
-            [run for run in newest if int(run["id"]) not in requeued_ids], state) else 0
-        slots = max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1)
-        # Merge groups first, alternating requeued and newest, so neither an
-        # old requeued group nor a fresh one hides the other; then other
-        # requeued runs. A requeued PR run never displaces a merge group. The
+        # whatever their age, from the same slots as the merge-group quota:
+        # merge groups first, requeued (oldest first) alternating with the
+        # newest, then other requeued runs, only on a lane that reads merge
+        # groups by quota (so a Pulp-style PR backlog keeps its rotation). The
         # newest quota, the oldest-run reservation and one rotating slot keep
-        # theirs.
+        # theirs. With more merge groups than slots, the starting point turns
+        # each refresh, so each is read every few refreshes rather than one
+        # every time.
+        requeued = self._requeued_runs(self._with_remembered(runs, state))[
+            : self._requeued_quota()]
+        requeued_ids = {int(run["id"]) for run in requeued}
         requeued_mg = [run for run in requeued if run.get("event") == "merge_group"]
         merge = [
             run for run in newest
             if run.get("event") == "merge_group" and int(run["id"]) not in requeued_ids
         ][: self._merge_group_quota()]
+        # A merge group listed `queued` or `pending` is likely waiting for a
+        # runner (its first job, or a requeued one); an `in_progress` one is
+        # likely running. Likely demand comes first and shares the turns.
+        def waiting(run: dict[str, Any]) -> bool:
+            status = str(run.get("status") or str(run.get("_page_key", "")).split(":")[0])
+            return status in ("queued", "pending")
+
+        fresh = [run for run in merge if waiting(run)]
         groups: list[dict[str, Any]] = []
-        for index in range(max(len(requeued_mg), len(merge))):
-            groups += requeued_mg[index:index + 1] + merge[index:index + 1]
-        groups = groups[:slots]
-        taken = {int(run["id"]) for run in groups}
-        requeued_other = [
-            run for run in requeued
-            if run.get("event") != "merge_group" and int(run["id"]) not in taken
-        ][: max(0, slots - len(groups))]
-        priority = groups + requeued_other
+        for index in range(max(len(requeued_mg), len(fresh))):
+            groups += requeued_mg[index:index + 1] + fresh[index:index + 1]
+        running = [run for run in merge if not waiting(run)]
+        others = [run for run in requeued if run.get("event") != "merge_group"] \
+            if self._merge_group_quota() else []
+        turn = int(state.get("requeued_turn", 0) or 0)
+
+        def fit(slots: int) -> list[dict[str, Any]]:
+            if not self._requeued_quota():
+                # Off: exactly the newest merge groups, as before.
+                return merge[:slots]
+            ordered = groups
+            if len(groups) > slots:
+                start = turn % len(groups)
+                ordered = groups[start:] + groups[:start]
+            chosen = ordered[:slots] + running[: max(0, slots - len(groups))]
+            return chosen + others[: max(0, slots - len(chosen))]
+
+        base = max(0, self.args.max_job_fetches - self.args.newest_quota - 1)
+        # The reservation is judged on the backlog these picks leave behind.
+        tentative = {int(run["id"]) for run in fit(max(0, base - 1))} \
+            if self._requeued_quota() else set()
+        reservation = 1 if self._reservation_fires(
+            [run for run in newest if int(run["id"]) not in tentative], state) else 0
+        priority = fit(max(0, base - reservation))
+        if self._requeued_quota() and len(groups) > max(0, base - reservation):
+            state["requeued_turn"] = turn + 1
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
@@ -686,10 +720,7 @@ class QueueScanner:
         # A run older than --oldest-reserve-max-age (a closed PR's run GitHub
         # never retired, a phantom) cannot be live demand worth a guaranteed
         # slot on every refresh; it stays in the rotation but is not reserved.
-        # Judged as _reservation_fires judged it: without requeued runs, which
-        # their own priority reads cover when slots allow.
-        oldest = self._oldest_reservable(
-            [run for run in backlog if int(run["id"]) not in requeued_ids])
+        oldest = self._oldest_reservable(backlog)
         oldest_id = int(oldest["id"]) if oldest is not None else -1
 
         groups: dict[str, list[dict[str, Any]]] = {}
