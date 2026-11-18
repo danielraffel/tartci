@@ -575,6 +575,11 @@ class QueueScanner:
             return
         # Kept only while a queued job can need a fleet VM: a queued job on a
         # GitHub-hosted runner would otherwise hold a priority slot for 6 h.
+        # Not this scanner's labels: the discovery (and this memory) is shared
+        # by every tier of the workflow set on the host, each with its own
+        # class label, so one tier's fetch must not clear another tier's run.
+        # A job only a different host can serve costs at most a priority read
+        # until it is served, within the 6 h bound.
         if not any(
             isinstance(job, dict) and job.get("status") == "queued"
             and "self-hosted" in [str(label).lower() for label in job.get("labels") or []]
