@@ -145,6 +145,64 @@ class IncidentShapeTests(unittest.TestCase):
                     clock["t"] += 160
         self.assertNotIn(0, counts, counts)
 
+    def test_a_finished_remembered_group_does_not_take_the_slot(self) -> None:
+        """Its 90 s journey ends between two refreshes, so memory still says
+        `queued`. Missing from a complete listing, it is not waiting."""
+        from unittest import mock
+        t0 = datetime.now(timezone.utc).replace(microsecond=0)
+        clock = {"t": t0.timestamp()}
+        base = ["self-hosted", "macOS", "ARM64"]
+        gone = _run(900, t0 - timedelta(minutes=120), "merge_group", "queued", t0 - timedelta(minutes=10))
+        waiting = [_run(901, t0 - timedelta(minutes=20), "merge_group", "queued",
+                        t0 - timedelta(minutes=20) + timedelta(seconds=11)),
+                   _run(902, t0 - timedelta(minutes=8), "merge_group", "queued",
+                        t0 - timedelta(minutes=8) + timedelta(seconds=11))]
+        prs = [_run(100 + i, t0 - timedelta(minutes=1 + i // 2), "pull_request", "queued")
+               for i in range(12)]
+        older = _run(50, t0 - timedelta(hours=5), "pull_request", "queued")
+        mg = [*base, "vellum-build-macos-merge-group"]
+        jobs: dict[int, list] = {900: [{"id": 1, "status": "completed", "labels": mg},
+                                       {"id": 2, "status": "queued", "labels": mg}],
+                                 901: [{"id": 3, "status": "queued", "labels": mg}],
+                                 902: [{"id": 4, "status": "queued", "labels": mg}],
+                                 50: [{"id": 5, "status": "queued", "labels": [*base, "vellum-build-macos"]}]}
+        for run in prs:
+            jobs[run["id"]] = [{"id": run["id"] * 10, "status": "queued",
+                                "labels": [*base, "vellum-build-macos"]}]
+        step = {"n": 0}
+
+        def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return helpers.AUTHENTICATED_RATE_LIMIT
+            if path.endswith("/actions/workflows?per_page=100"):
+                return {"workflows": [{"id": 99, "name": WORKFLOW}]}
+            done = step["n"] >= 3
+            if "status=queued" in path:
+                return {"workflow_runs": [*([] if done else [gone]), *waiting, *prs, older]}
+            if "status=in_progress" in path or "status=pending" in path:
+                return {"workflow_runs": []}
+            for run_id, run_jobs in jobs.items():
+                if f"/actions/runs/{run_id}/jobs?" in path:
+                    if run_id == 900 and done:
+                        return {"jobs": [{**job, "status": "completed"} for job in run_jobs]}
+                    return {"jobs": run_jobs}
+            raise AssertionError(path)
+
+        options = {"force_refresh": True, "workflow": WORKFLOW, "labels": MERGE_CLASS,
+                   "negative_ttl": 30, "merge_group_quota": 2,
+                   "oldest_reserve_max_age": 172800, "requeued_quota": 2}
+        counts = []
+        with mock.patch.object(helpers.queue_scan.time, "time", lambda: clock["t"]), \
+                tempfile.TemporaryDirectory() as directory:
+            for n in range(10):
+                step["n"] = n
+                scanner = helpers.PaginatedQueueScanTests()._scanner(
+                    "tart-macos-tier", Path(directory) / "state.json", api, **options)
+                scanner.now = int(clock["t"])
+                counts.append(scanner.scan())
+                clock["t"] += 160
+        self.assertNotIn(0, counts, counts)
+
     def test_control_without_it_the_journey_is_missed(self) -> None:
         counts = self._scan(MERGE_CLASS, 12, requeued_quota=0)
         self.assertIn(0, counts, counts)
@@ -776,6 +834,53 @@ class RequeuedRankingTests(unittest.TestCase):
         run = _run(9, later - timedelta(hours=1), "merge_group", "in_progress", later - timedelta(seconds=175))
         scanner._with_remembered([run], state)
         self.assertEqual([r["id"] for r in scanner._requeued_runs([run])], [9])
+
+    def test_the_reservation_slot_is_not_borrowed_twice_in_a_row(self) -> None:
+        now = datetime.now(timezone.utc)
+        waiting = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        running = [_run(10 + i, now - timedelta(minutes=50 + i), "merge_group", "in_progress")
+                   for i in range(6)]
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        borrows = []
+        for _ in range(40):
+            scanner._candidate_runs([waiting, *running, *self.backlog(now)], state)
+            borrows.append(bool(state.get("requeued_borrowed")))
+            state = json.loads(json.dumps(state))
+            scanner.now += 160
+        self.assertTrue(any(borrows))
+        self.assertFalse(any(a and b for a, b in zip(borrows, borrows[1:])), borrows)
+
+    def test_no_borrow_without_a_rotating_slot_besides(self) -> None:
+        now = datetime.now(timezone.utc)
+        waiting = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        running = _run(10, now - timedelta(minutes=50), "merge_group", "in_progress")
+        scanner = self.scanner(max_job_fetches=3, newest_quota=2)
+        state: dict[str, Any] = {}
+        for _ in range(12):
+            _, picked = scanner._candidate_runs([waiting, running, *self.backlog(now)], state)
+            self.assertTrue(picked)
+            state = json.loads(json.dumps(state))
+            scanner.now += 160
+
+    def test_a_first_seen_running_group_waits_its_turn(self) -> None:
+        """It is not overdue on sight: the waiting group keeps the slot then."""
+        now = datetime.now(timezone.utc)
+        waiting = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        running = _run(10, now - timedelta(minutes=50), "merge_group", "in_progress")
+        scanner = self.scanner()
+        state: dict[str, Any] = {"requeued_borrowed": True}
+        ids = [int(r["id"]) for r in scanner._candidate_runs([waiting, running, *self.backlog(now)], state)[0]]
+        self.assertIn(1, ids)
+        self.assertEqual(state["requeued_read_at"].get("10"), scanner.now)
+
+    def test_fresh_waiting_groups_are_capped_by_the_merge_group_quota(self) -> None:
+        now = datetime.now(timezone.utc)
+        fresh = [_run(i, now - timedelta(minutes=30 + i), "merge_group", "queued") for i in range(1, 5)]
+        scanner = self.scanner(max_job_fetches=8, merge_group_quota=1)
+        ids = [int(r["id"]) for r in scanner._candidate_runs([*fresh, *self.backlog(now)], {})[0]]
+        # Priority picks come before the newest runs (101, 102).
+        self.assertEqual(len([i for i in ids[: ids.index(101)] if i < 10]), 1, ids)
 
     def test_off_writes_no_requeued_state(self) -> None:
         scanner = self.scanner(requeued_quota=0)

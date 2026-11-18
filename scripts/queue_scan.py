@@ -409,12 +409,15 @@ class QueueScanner:
                 # self-hosted job is already `queued`. Include that parent-run
                 # state or a demand-driven runner can never observe the job it
                 # must register to serve.
+                complete = True
                 for status in ("pending", "queued", "in_progress"):
                     sweep = int(page_sweeps.get(status, 0))
                     completed_sweep = False
                     pages = [1]
                     newest_page = self._run_page(workflow_id, status, 1)
                     page_sets = [newest_page]
+                    if len(newest_page) == RUNS_PER_PAGE:
+                        complete = False
                     if len(newest_page) == RUNS_PER_PAGE and self.args.max_run_pages > 1:
                         cursor = page_cursors.get(status, 2)
                         cursor = cursor if isinstance(cursor, int) and cursor >= 2 else 2
@@ -465,6 +468,9 @@ class QueueScanner:
                 raise
             discovery["run_page_cursor"] = page_cursors
             discovery["run_page_sweeps"] = page_sweeps
+            # Every status fit on its first page: a run not listed has left the
+            # queue. Kept on the scanner, not in state, so quota 0 is unchanged.
+            self._listing_complete = complete
             return runs
         raise RuntimeError("workflow ID recovery exhausted")
 
@@ -580,7 +586,8 @@ class QueueScanner:
         # update has left the discovery window is still requeued).
         marked = [{**run, "_remembered": True} if str(int(run["id"])) in memory else run
                   for run in eligible]
-        return marked + [run for run in memory.values() if int(run["id"]) not in listed]
+        return marked + [{**run, "_unlisted": True}
+                         for run in memory.values() if int(run["id"]) not in listed]
 
     def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any],
                        updated_at: str = "") -> None:
@@ -684,6 +691,10 @@ class QueueScanner:
         # runner (its first job, or a requeued one); an `in_progress` one is
         # likely running. Likely demand comes first and shares the turns.
         def waiting(run: dict[str, Any]) -> bool:
+            # A remembered run missing from a complete listing has left the
+            # queue (finished or cancelled): its remembered status is stale.
+            if run.get("_unlisted") and getattr(self, "_listing_complete", False):
+                return False
             status = str(run.get("status") or str(run.get("_page_key", "")).split(":")[0])
             return status in ("queued", "pending")
 
@@ -746,12 +757,20 @@ class QueueScanner:
             if not groups or slots >= 2:
                 return (rest[:1] + overdue + rest[1:])[:slots] if groups else (overdue + rest)[:slots]
             # One slot and a waiting group: the overdue run borrows the
-            # reservation's slot, or waits for a refresh that has one.
-            return rest[:slots] + (overdue if spare else [])
+            # reservation's slot, or waits for a refresh that has one. Only
+            # when the lane has a rotating slot besides (base >= 2), and never
+            # on two refreshes in a row, so the reservation still fires.
+            if spare and base >= 2 and not state.get("requeued_borrowed"):
+                borrowed["now"] = True
+                return rest[:slots] + overdue
+            return rest[:slots]
 
         base = max(0, self.args.max_job_fetches - self.args.newest_quota - 1)
         reservation = 1 if self._reservation_fires(newest, state) else 0
+        borrowed = {"now": False}
         priority = fit(max(0, base - reservation), reservation)
+        if self._requeued_quota():
+            state["requeued_borrowed"] = borrowed["now"]
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
