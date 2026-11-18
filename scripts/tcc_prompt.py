@@ -64,6 +64,10 @@ INSTALL_WINDOW_S = 10 * 60
 STATE_NAME = "tcc-prompt.json"
 ALERT_STATE_NAME = "tcc-prompt-alert.json"
 HEAL_STATE_NAME = "tcc-prompt-heal.json"
+# Read by peers (peer_stall_alert.PEER_READ): set once the owner was told about
+# this episode, so a peer's host-vitals alert does not tell him again.
+NOTIFY_STATE_NAME = "tcc-prompt-notify.json"
+NOTIFY_LINK_STATE_NAME = "tcc-prompt-notify-link.json"
 TITLE = "[tartci] {host} has a macOS privacy prompt waiting: click Allow"
 GENERATION = re.compile(r"^[0-9a-f]{40,64}$")
 
@@ -423,6 +427,20 @@ def render(host: str, reading: dict, verdict: Optional[dict], heal_after_s: int,
     return TITLE.format(host=host), tartci_incident.with_marker(body, line)
 
 
+def _issue_repo() -> str:
+    import host_off  # noqa: PLC0415
+    return host_off.ISSUE_REPO
+
+
+def owner_text(host: str, since: object, issue: object = None) -> str:
+    """The owner-channel line for a waiting privacy prompt on `host`."""
+    import host_off  # noqa: PLC0415
+    return (f"{host}: a macOS privacy prompt has waited on the console since {since}. "
+            f"Click Allow on {host} (at its screen or over Screen Sharing); its Tart store and "
+            "lanes are blocked until then. Do not click Don't Allow."
+            + (f" https://github.com/{host_off.ISSUE_REPO}/issues/{issue}" if issue else ""))
+
+
 def host_id() -> str:
     import vm_boot_alert  # noqa: PLC0415 - owns this host's id (works without tomllib)
     return vm_boot_alert._alert_host()[0]
@@ -434,7 +452,8 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
                issue: Optional[Callable[..., Any]] = None,
                close: Optional[Callable[..., Any]] = None,
                heal: Optional[Callable[..., dict]] = None,
-               heal_enabled: bool = True) -> Optional[str]:
+               heal_enabled: bool = True,
+               notify: Optional[Callable[[str], tuple]] = None) -> Optional[str]:
     """Page once per alert episode, close the issue when the alert is gone, and
     run the fallback heal once per episode if nobody answers.
 
@@ -470,6 +489,28 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
         issues_enabled=os.environ.get("TARTCI_TCC_PROMPT_ISSUE", "1") != "0")
     if not active:
         return None
+    # Only the owner can click Allow, and an issue alone sat unread for hours
+    # (tartci #960): tell him on the owner channel, once per alert episode.
+    import owner_notify  # noqa: PLC0415 - sibling module
+    # This episode's issue only: `out` can carry the previous episode's number
+    # when this episode's open failed.
+    saved = _read_json(state_dir / ALERT_STATE_NAME)
+    number = saved.get("issue") if saved.get("since") == reading.get("since") else None
+    try:
+        sent = owner_notify.notify_once(
+            state_dir / NOTIFY_STATE_NAME, str(reading.get("since")),
+            owner_text(host, reading.get("since"), number), sender=notify, now=now)
+        told = _read_json(state_dir / NOTIFY_STATE_NAME)
+        if number and told.get("sent_at") and "/issues/" not in str(told.get("text")) \
+                and not sent.get("sent"):
+            # The first message went out before its issue could be opened:
+            # send the link once it exists.
+            owner_notify.notify_once(
+                state_dir / NOTIFY_LINK_STATE_NAME, str(reading.get("since")),
+                f"{host}: the privacy-prompt issue is "
+                f"https://github.com/{_issue_repo()}/issues/{number}", sender=notify, now=now)
+    except Exception:  # noqa: BLE001 - the owner message must never stop the fallback heal
+        pass
     heal_text = ""
     pending = reading.get("pending_since_epoch")
     if waiting and isinstance(pending, (int, float)):

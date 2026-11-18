@@ -372,6 +372,7 @@ class AlertPassTests(unittest.TestCase):
         self.state = Path(self.tmp.name)
         self.opened: list = []
         self.closed: list = []
+        self.sent: list = []
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -384,10 +385,65 @@ class AlertPassTests(unittest.TestCase):
         self.closed.append(number)
         return 0, "closed"
 
-    def run_pass(self, reading, store_state=None, now=NOW):
+    def run_pass(self, reading, store_state=None, now=NOW, sent=None):
+        sent = self.sent if sent is None else sent
         return tp.alert_pass(reading, store_state, now=now, state_dir=self.state,
                              host="m3", issue=self.issue, close=self.close,
-                             heal=lambda **kw: self.fail("no heal in a paging test"))
+                             heal=lambda **kw: self.fail("no heal in a paging test"),
+                             notify=lambda text: sent.append(text) or (True, "HTTP 204"))
+
+    def test_the_owner_is_told_once_per_episode_with_the_host_and_click_allow(self) -> None:
+        # tartci #960 sat as an issue for hours; only the owner can click Allow.
+        self.run_pass(PRESENT, self.verdict())
+        self.run_pass(PRESENT, self.verdict(), now=NOW + 300)
+        self.assertEqual(len(self.sent), 1, "one owner message per episode")
+        self.assertIn("Click Allow on m3", self.sent[0])
+        self.assertIn("issues/101", self.sent[0])
+        saved = json.loads((self.state / tp.NOTIFY_STATE_NAME).read_text())
+        self.assertTrue(saved.get("sent_at"))
+        # A new episode (a later alert) is told again.
+        self.run_pass({"state": "absent", "total_windows": 140}, None, now=NOW + 600)
+        self.run_pass(dict(PRESENT, since="2026-11-18T09:00:00Z"), self.verdict(NOW + 900),
+                      now=NOW + 900)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_a_failed_owner_post_is_retried_next_pass(self) -> None:
+        tries: list = []
+        tp.alert_pass(PRESENT, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                      issue=self.issue, close=self.close, heal=lambda **kw: {},
+                      notify=lambda text: tries.append(text) or (False, "post failed: URLError"))
+        self.run_pass(PRESENT, self.verdict(), now=NOW + 300)
+        self.assertEqual(len(tries), 1)
+        self.assertEqual(len(self.sent), 1, "the failed post was retried and sent once")
+
+    def test_a_failed_open_never_links_the_previous_episode_issue(self) -> None:
+        # A new episode straight after the last (no absent pass between):
+        # the previous episode's state still holds #101 when this one starts.
+        self.run_pass(PRESENT, self.verdict())
+        sent: list = []
+        tp.alert_pass(dict(PRESENT, since="2026-11-18T09:00:00Z"), self.verdict(NOW + 900),
+                      now=NOW + 900, state_dir=self.state, host="m3",
+                      issue=lambda title, body: (1, "HTTP 502"), close=self.close,
+                      heal=lambda **kw: {},
+                      notify=lambda text: sent.append(text) or (True, "HTTP 204"))
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("issues/101", sent[0])
+
+    def test_a_message_sent_before_its_issue_opened_is_followed_by_the_link(self) -> None:
+        tp.alert_pass(PRESENT, self.verdict(), now=NOW, state_dir=self.state, host="m3",
+                      issue=lambda title, body: (1, "HTTP 502"), close=self.close,
+                      heal=lambda **kw: {},
+                      notify=lambda text: self.sent.append(text) or (True, "HTTP 204"))
+        self.assertEqual(len(self.sent), 1)
+        self.assertNotIn("/issues/", self.sent[0])
+        self.run_pass(PRESENT, self.verdict(), now=NOW + 300)
+        self.run_pass(PRESENT, self.verdict(), now=NOW + 600)
+        self.assertEqual(len(self.sent), 2, "one follow-up with the link, once")
+        self.assertIn("issues/101", self.sent[1])
+
+    def test_no_owner_message_without_a_page(self) -> None:
+        self.assertIsNone(self.run_pass(PRESENT, None))
+        self.assertEqual(self.sent, [])
 
     def verdict(self, at=NOW):
         return {"classification": {"kind": tw.PROMPT_KIND, "classified_at": tw._iso(at),
