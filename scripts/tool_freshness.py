@@ -657,10 +657,16 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
         carried = isinstance(prior_seen, dict)
         published_seen = {key: value for key, value in (prior_seen or {}).items()
                           if isinstance(key, str) and isinstance(value, str)}
+    if published_seen is not None:
+        # Keep a sighting of every release newer than what runs here, even one
+        # a failed asset probe dropped from this pass's list, so a transient
+        # probe failure does not restart its drift clock.
+        published_seen = {key: value for key, value in published_seen.items()
+                          if (_version(key) or (0, 0, 0)) > installed}
     if not newer:
         row["state"] = "current"
         if published_seen is not None:
-            row["published_seen"] = {}
+            row["published_seen"] = published_seen
         return row
     behind_since = newer[0][2]
     # The feed holds only the newest releases, so an install older than all of
@@ -674,9 +680,9 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
             lower_bound = bool(previous.get("behind_since_lower_bound"))
     hours = max(0.0, (now - behind_since) / 3600)
     if published_seen is not None:
-        row["published_seen"] = {
+        row["published_seen"] = dict(published_seen, **{
             _vstr(version): published_seen.get(_vstr(version)) or _iso(now if carried else at)
-            for version, _, at in newer}
+            for version, _, at in newer})
         first = row["published_seen"][_vstr(newer[0][0])]
         # Like behind_since: once the oldest newer release leaves the bounded
         # feed, keep the earliest time recorded for this installed version.
@@ -980,7 +986,8 @@ def rollout_in_motion(cached: dict, steward: dict) -> bool:
     """Whether the last pass left a release in motion on this host: a tool
     waiting for its apply age, the canary, a steward host or a steward verdict,
     or a steward verdict pending here, or a release that is not ready yet (a
-    download failed or an asset is missing). A hold, a spent attempt or a rejected
+    download failed or an asset is missing), or an older release that just
+    landed while a newer one is still to come. A hold, a spent attempt or a rejected
     release is not motion; those keep the normal interval."""
     if any(isinstance(entry, dict) and not entry.get("gave_up")
            for entry in steward.values()):
@@ -988,7 +995,10 @@ def rollout_in_motion(cached: dict, steward: dict) -> bool:
     tools = cached.get("tools")
     return isinstance(tools, dict) and any(
         isinstance(row, dict) and row.get("state") == "behind"
-        and (str(row.get("apply") or "").startswith("waiting") or bool(row.get("not_ready")))
+        and (str(row.get("apply") or "").startswith("waiting") or bool(row.get("not_ready"))
+             # An older release just landed and a newer one is still to come.
+             or (str(row.get("apply") or "").startswith("applied ")
+                 and str(row.get("apply")).endswith(": ok")))
         for row in tools.values())
 
 
