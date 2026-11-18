@@ -16,6 +16,7 @@ import time
 import uuid
 from typing import Any, Iterator
 
+import external_only_policy
 import fair_share
 import host_profile
 import lease_cli
@@ -779,6 +780,8 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         "total_mem_mb": total_mem,
         "reserved_gate_mem_mb": reserved_mem,
         "per_job_mem_mb": per_job_mem,
+        "external_root": profile.get("external_root"),
+        "external_only_mode": profile.get("external_only_mode", "report"),
     }
 
 
@@ -1740,6 +1743,36 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "id": lease_id,
             "kind": args.kind,
         }, 75
+
+    # External-only hosts keep builds and caches off the internal disk. Judged
+    # once per invocation (not on each --wait-secs retry), before the store lock:
+    # nothing here depends on lease accounting. Fail-open; see external_only_policy.
+    if not getattr(args, "external_policy_checked", False):
+        args.external_policy_checked = True
+        refusal = external_only_policy.check_acquire_safe(
+            args, cfg.get("external_root"), mode=cfg.get("external_only_mode", "report"))
+        try:
+            would = getattr(args, "external_would_refuse", None)
+            unread = getattr(args, "external_policy_unread", None)
+            if refusal is not None or would or unread:
+                observed = (refusal["violations"] if refusal else would) or []
+                observed_unread = (refusal or {}).get("unread", []) if refusal else (unread or [])
+                journal_lease_events(store_dir, [{
+                    "event": "external_only_policy",
+                    "outcome": ("refused" if refusal is not None else
+                                "would_refuse" if would else "unread"),
+                    "mode": cfg.get("external_only_mode", "report"),
+                    "external_root": cfg.get("external_root"),
+                    "kind": args.kind, "lease_id": lease_id, "owner": args.owner,
+                    "paths": [v["path"] for v in observed] + [v["path"] for v in observed_unread],
+                    "labels": [v["label"] for v in observed] + [v["label"] for v in observed_unread],
+                    "unread": observed_unread,
+                }])
+        except Exception:  # noqa: BLE001 - an audit row must never fail an acquire
+            pass
+        if refusal is not None:
+            refusal["id"] = lease_id
+            return refusal, external_only_policy.EXIT_REFUSED
 
     disk: dict[str, Any] | None = None
     requested_disk_bytes = 0
@@ -2809,6 +2842,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         result = {"ok": False, "error": str(exc)}
         rc = 2
+    if result.get("reason") in (external_only_policy.REASON,
+                                 external_only_policy.REASON_UNREADABLE):
+        print(result["message"], file=sys.stderr)
     emit(result, bool(getattr(args, "json", False)))
     return rc
 

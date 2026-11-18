@@ -5139,3 +5139,109 @@ high floor share or a p90 that climbs while capacity sits full means the caps
 are too tight for the demand; a p90 near zero with idle capacity means agents
 get cores at once. The journal keeps one previous generation (about 8 MB), so
 `--since` beyond a few days may be truncated on a busy host.
+
+## Keeping builds and caches on the external volume
+
+m3 and m5studio keep build trees, ccache, dependency sources and tool caches on
+an external APFS volume (each host's own `/Volumes/<name>`); only m1 and m5
+use the internal disk. m5studio's internal Data volume reached 98% on
+2026-11-17 with `~/Library/Containers` at 159 GB, `~/.codex` 22 GB, `~/.pulp`
+21 GB and `~/.android` 16 GB, and tripped `fleet_ready`.
+
+**Policy.** When enabled, a host's fleet profile sets `[host] external_root` (the host's own
+`/Volumes/<name>`; it must contain `tart_home`). `[host] external_only_mode` is `report` only: `tartci leases acquire` for a host
+build warns on stderr, admits, and journals an `external_only_policy` /
+`would_refuse` row in the lease store's `events.jsonl`. The policy runs once per acquire,
+never fails an acquire (any error admits with a warning), and reports any path
+that resolves, after symlinks, to the internal data volume, naming the path and
+the fix. The refusing code path (exit 78, reason `external_only_internal_path`,
+never retried by `--wait-secs`) exists but is disabled; when enabled it also
+refuses (reason `external_only_device_unreadable`) if any judged path cannot be read,
+because an unreadable path cannot be proven external. No shipped host profile
+sets `external_root` yet: opting a host in is a separate data change. Judged:
+`--build-dir` and `--cache-dir` (repeatable), `TARTCI_BUILD_DIR` (with no build
+dir declared, the working directory stands in), `CCACHE_DIR` or the `cache_dir`
+of the file `CCACHE_CONFIGPATH` names or of ccache.conf (or ccache's default
+dir once it exists), `CPM_SOURCE_CACHE`, `FETCHCONTENT_BASE_DIR`,
+`PIP_CACHE_DIR`, `UV_CACHE_DIR` (pip's and uv's default dirs are judged once
+they exist and the variable is unset). A
+path under an unmounted external volume is reported too, so a build cannot write
+a copy of the cache to the boot disk. VM leases are not judged here (the disk
+axis judges their store). Callers that know their build dir pass `--build-dir`.
+
+Read-only audit on any host, and the defaults for unset caches:
+
+    python3 scripts/external_only_policy.py check
+    python3 scripts/external_only_policy.py exports   # export lines under <root>/caches/
+
+**Refuse-mode checklist (follow-up; refuse is not reachable from config).**
+Gate leases need no exemption but their callers must pass `--build-dir` (the
+working-directory stand-in would otherwise refuse them); a free-form `--kind`
+ending in `-vm` currently skips the check; judging should compare against
+`external_root` and fail closed when the internal device cannot be read; callers
+must treat exit 78 as terminal and surface stderr; and `cache_root` (below) must
+be moved. Decide the flip from the `would_refuse` journal rows.
+
+**Known gap.** m5studio's profile `cache_root` (`~/.cache/pulp-ci`, mounted into
+every lane VM) is still internal, as it is not judged by the lease check; m3's is
+already on its external volume. Moving it cold-starts the gate ccache and needs
+a lane restart at an idle boundary, so it is an owner decision, not part of this
+change.
+
+**One-time migration (owner runs it; nothing here deletes data).** Stop the
+writers first (no build, no `pulp dev`, no lane mid-job on the paths moved).
+Set `X` to the host's external volume.
+Each step copies, verifies, renames the old directory aside and symlinks; the
+`*.pre-external` directories are what you delete later to actually free space.
+
+    X=/Volumes/Example   # the host's external volume
+    # An unmounted X would be created on the internal disk and the caches copied onto it.
+    mount | grep -q " on $X (" || { echo "$X is not a mounted volume"; exit 1; }
+    move() {  # move SRC DEST
+      src="$1"; dest="$2"
+      [ -d "$src" ] && [ ! -L "$src" ] || { echo "skip $src"; return 0; }
+      mkdir -p "$dest" && rsync -a "$src"/ "$dest"/ &&
+        diff -rq "$src" "$dest" >/dev/null &&
+        mv "$src" "$src.pre-external" && ln -s "$dest" "$src" && echo "moved $src"
+    }
+    move ~/.pulp/sdk-dev            $X/caches/pulp/sdk-dev
+    move ~/.pulp/sdk                $X/caches/pulp/sdk
+    move ~/.pulp/sdk-source-dev     $X/caches/pulp/sdk-source-dev
+    move ~/.cache/vellum-gates      $X/caches/vellum-gates
+    move ~/Library/Caches/uv        $X/caches/uv
+    move ~/Library/Caches/Pulp      $X/caches/Pulp
+    move ~/Library/Caches/org.swift.swiftpm $X/caches/swiftpm
+    move ~/Library/Caches/go-build  $X/caches/go-build
+    move ~/.android                 $X/caches/android
+
+Caches that take an environment variable are better pointed than symlinked.
+Add to the interactive shell profile and the agent launcher environment (the
+`exports` command above prints the cache ones):
+
+    export CCACHE_DIR=$X/caches/ccache        # m5studio and m3 already set this in ccache.conf
+    export CPM_SOURCE_CACHE=$X/caches/cpm
+    export FETCHCONTENT_BASE_DIR=$X/caches/fetchcontent
+    export PIP_CACHE_DIR=$X/caches/pip
+    export UV_CACHE_DIR=$X/caches/uv
+    export HOMEBREW_CACHE=$X/caches/Homebrew
+    export GOCACHE=$X/caches/go-build
+
+Then verify, and only after a day of green builds delete the `*.pre-external`
+directories one by one:
+
+    python3 scripts/external_only_policy.py check
+    df -h /System/Volumes/Data
+    du -sh ~/.pulp/*.pre-external ~/.cache/*.pre-external ~/Library/Caches/*.pre-external
+
+Do not symlink the profile's `cache_root` (m5studio: `~/.cache/pulp-ci`): lane
+start refuses a symlinked cache root. Change `cache_root` in the profile to a
+physical external directory and restart the lanes at an idle boundary. On m3 the
+real root is already external and `~/.cache/pulp-ci` is a stale 4.6 GB copy its
+owner can remove.
+
+Leave `~/.codex` and `~/Library/Containers` alone: `~/.codex` is written by live
+agent sessions (move it only with every session stopped), and the containers hold
+app data. The largest on m5studio is `com.utmapp.UTM` (157 GB of VM disks);
+moving those is done from UTM, by their owner. Stale leftover: with ccache's
+`cache_dir` on the external volume, `~/Library/Caches/ccache`
+(5 GB on m5studio) is unused and can be removed by its owner.
