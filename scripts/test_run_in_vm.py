@@ -122,7 +122,10 @@ def make_exe(path: Path, text: str) -> None:
 
 class Harness(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp(prefix="rivm-test-"))
+        # run_in_vm refuses output paths under a symlinked directory. macOS
+        # TMPDIR is /var/folders/..., and /var is a symlink to /private/var,
+        # so resolve it; Linux CI's /tmp has no symlink and was unaffected.
+        self.tmp = Path(tempfile.mkdtemp(prefix="rivm-test-")).resolve()
         self.addCleanup(subprocess.run, ["rm", "-rf", str(self.tmp)], check=False)
         self.bin = self.tmp / "bin"
         self.state = self.tmp / "state"

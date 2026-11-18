@@ -980,6 +980,148 @@ class HappyPathTests(Base):
         self.assertFalse((self.cfg.state_dir / "last.json").exists())
 
 
+class BehindMainAlertTests(Base):
+    """A host far behind main is STARVED whatever held it, and says so once."""
+
+    def behind_main_for(self, seconds: float) -> None:
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
+    def opened(self) -> list[str]:
+        return [title for kind, title in self.issues if kind == "open"]
+
+    def skew(self, behind: float | None, state: str = "behind") -> dict:
+        oldest = None if behind is None else su._iso(NOW - self.cfg.soak_seconds - behind)
+        return {"state": state, "behind": 3, "installed": INSTALLED, "oldest_undeployed": oldest}
+
+    def scheduled_apply(self) -> int:
+        return su.plan_or_apply(self.cfg, self.sys, apply=True, scheduled=True,
+                                target_ref="origin/main")
+
+    def test_a_deferred_host_far_behind_is_loud_once(self) -> None:
+        # m3, 2026-11-17: ten hours behind, held by refusals that never
+        # reach defer(), and nothing said STARVED.
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.scheduled_apply())
+            self.assertDeferred(self.scheduled_apply())
+        self.assertIn("STARVED", out.getvalue())
+        self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertIn("STARVED", self.opened()[0])
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(1, events.count("self_update_behind"))
+
+    def test_an_update_that_catches_up_closes_its_issue(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.assertUpdated(self.scheduled_apply())
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+
+    def test_a_host_inside_the_bound_is_quiet(self) -> None:
+        # Control, same instrument: ten minutes short of the bound.
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS - 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.scheduled_apply())
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+
+    def test_catching_up_closes_the_issue(self) -> None:
+        su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS + 60), NOW)
+        su.behind_alert(self.cfg, self.skew(None, state="current"), NOW + 60)
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+        self.assertFalse((self.cfg.state_dir / su.BEHIND_ALERT_NAME).exists())
+
+    def test_at_most_one_issue_per_repeat_window(self) -> None:
+        bound = su.BEHIND_STARVED_SECONDS + 60
+        su.behind_alert(self.cfg, self.skew(bound), NOW)
+        su.behind_alert(self.cfg, self.skew(0.0), NOW + 600)  # caught up, closed
+        su.behind_alert(self.cfg, self.skew(bound), NOW + 1200)  # behind again, inside 6 h
+        self.assertEqual(1, len(self.opened()))
+        later = NOW + su.BEHIND_ALERT_REPEAT_SECONDS + 60
+        su.behind_alert(self.cfg, self.skew(bound - 3600 + (later - NOW)), later)
+        self.assertEqual(2, len(self.opened()))
+
+    def test_a_refusal_before_measuring_uses_the_last_skew(self) -> None:
+        # A checkout that will not refresh returns before measure_skew; the
+        # last measured skew still says how far behind the host is.
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        out = io.StringIO()
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(su.EXIT_UNKNOWN, self.scheduled_apply())
+            self.assertEqual(1, len(self.opened()), self.issues)
+            # That run wrote an unknown skew.json; the next one still knows.
+            out.truncate(0)
+            out.seek(0)
+            self.assertEqual(su.EXIT_UNKNOWN, self.scheduled_apply())
+        self.assertIn("STARVED", out.getvalue())
+        self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertIn(
+            f"~/.tartci/state/self-update/{su.BEHIND_SKEW_NAME}", self.bodies[0])
+        self.assertNotIn(
+            "~/.tartci/state/self-update/skew.json`:", self.bodies[0])
+
+    def test_an_unreadable_installed_commit_does_not_alert_from_saved_skew(self) -> None:
+        su._write_json(self.cfg.state_dir / su.BEHIND_SKEW_NAME,
+                       self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        with mock.patch.object(su, "installed_commit",
+                               side_effect=su.Refused("installed commit unreadable")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.issues)
+
+    def test_a_saved_skew_without_installed_commit_does_not_alert(self) -> None:
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       {**self.skew(su.BEHIND_STARVED_SECONDS + 600), "installed": None})
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.issues)
+
+    def test_a_skew_from_before_an_install_is_not_used(self) -> None:
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       {**self.skew(su.BEHIND_STARVED_SECONDS + 600), "installed": "9" * 40})
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.opened())
+
+    def test_an_unknown_skew_says_nothing(self) -> None:
+        su.behind_alert(self.cfg, {"state": "unknown", "oldest_undeployed": None}, NOW)
+        self.assertEqual([], self.issues)
+
+    def test_a_plan_never_alerts(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.plan()
+        self.assertEqual([], self.opened())
+
+    def test_a_manual_apply_never_opens_a_behind_main_alert(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists())
+
+    def test_exactly_four_hours_is_inside_the_bound(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS), NOW)
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+
+    def test_a_manual_recovery_closes_an_existing_episode(self) -> None:
+        su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS + 60), NOW)
+        su.behind_alert_for_apply(self.cfg, self.skew(0.0), NOW + 60, scheduled=False)
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+
+
 class QueueLightTests(Base):
     """A host drains for an update only while the gate backlog it serves is light."""
 

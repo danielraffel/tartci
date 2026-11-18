@@ -2551,6 +2551,106 @@ def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: fl
         print(f"self-update: drain-timeout alert failed: {type(exc).__name__}: {exc}", flush=True)
 
 
+# A host this long behind main (its oldest undeployed commit's age past the
+# soak) is STARVED whatever held it: a step-aside, a host fault, the rate
+# limit, a pause or no turn. Those paths never reach defer(), so on
+# 2026-11-17 m3 sat ten hours behind with no STARVED line anywhere.
+BEHIND_STARVED_SECONDS = 4 * 3600
+# At most one behind-main issue per host in this long, across episodes.
+BEHIND_ALERT_REPEAT_SECONDS = 6 * 3600
+BEHIND_ALERT_NAME = "behind-alert.json"
+BEHIND_ALERT_LAST_NAME = "behind-alert-last.json"
+# The last skew that measured how far behind the host is. skew.json is
+# overwritten with an unknown state when the checkout or the measurement
+# fails, and a run that stops there still needs the age.
+BEHIND_SKEW_NAME = "behind-skew.json"
+
+
+def behind_main_seconds(skew: dict, soak_seconds: int, now: float) -> float | None:
+    """How long a soaked main commit has waited for this host, or None when
+    the skew does not say (installed commit unknown, main unread)."""
+    if skew.get("state") == "current":
+        return 0.0
+    oldest = _ts(skew.get("oldest_undeployed")) if skew.get("oldest_undeployed") else 0.0
+    if not oldest:
+        return None
+    return max(0.0, now - oldest - soak_seconds)
+
+
+def behind_alert(cfg: Config, skew: dict, now: float) -> None:
+    """A loud STARVED line every attempt while this host is more than
+    BEHIND_STARVED_SECONDS behind main, and one event and issue per episode,
+    at most one issue per BEHIND_ALERT_REPEAT_SECONDS. The issue closes once
+    the host is back inside the bound. Best effort: never raises."""
+    try:
+        behind = behind_main_seconds(skew, cfg.soak_seconds, now)
+        if behind is None:
+            return
+        _write_json(cfg.state_dir / BEHIND_SKEW_NAME, skew)
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        me = self_host_id(cfg)
+        path = cfg.state_dir / BEHIND_ALERT_NAME
+        last_path = cfg.state_dir / BEHIND_ALERT_LAST_NAME
+        active = behind > BEHIND_STARVED_SECONDS
+        state = host_off._read_json(path) or {}
+        since = state.get("since") or _iso(now)
+        last = _ts((host_off._read_json(last_path) or {}).get("opened_at"))
+        repeat_ok = bool(state.get("issue")) or now - last >= BEHIND_ALERT_REPEAT_SECONDS
+        if active:
+            print(f"self-update: STARVED: {behind / 3600:.1f} h behind main (oldest undeployed "
+                  f"{skew.get('oldest_undeployed')}, {skew.get('behind')} commits), past the "
+                  f"{BEHIND_STARVED_SECONDS // 3600} h bound", flush=True)
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}` has run tartci {str(skew.get('installed') or '')[:12]} while main moved "
+                f"on: {skew.get('behind')} commits behind, the oldest undeployed from "
+                f"{skew.get('oldest_undeployed')}, {behind / 3600:.1f} h past its soak.", "",
+                "## Evidence",
+                f"- `~/.tartci/state/self-update/{BEHIND_SKEW_NAME}`: "
+                f"{render_skew(skew)[:300]}",
+                "- the newest receipts in `~/.tartci/state/self-update/attempts/` say why "
+                "each attempt did not update (stepped aside, refused, deferred, rate limited)", "",
+                "## Fix", "```sh",
+                "tartci fleet-macos self-update --plan   # every gate that holds the turn",
+                "tartci pool status                      # waiting / stepped-aside line",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Each gate that refuses protects serving capacity or the host's store; "
+                "fix the named gate.", "",
+                "## How to verify",
+                f"`tartci fleet-macos self-update --plan` reports the host current or under "
+                f"{BEHIND_STARVED_SECONDS // 3600} h behind; this issue then closes itself.",
+            ])
+            title = (f"[tartci] {me} self-update STARVED: {behind / 3600:.1f} h behind main")
+            marker = tartci_incident.marker(me, "self_update_behind", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        out = host_off.episode_alert(
+            path, active=active, resolved=not active, since=since if active else None,
+            raise_event=lambda: host_off.event(
+                cfg.state_dir, "self_update_behind",
+                f"{behind / 3600:.1f} h behind main since {skew.get('oldest_undeployed')}"[:300],
+                {"behind": skew.get("behind"), "installed": str(skew.get("installed"))[:12]}, now),
+            render=render,
+            issues_enabled=os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") != "0" and repeat_ok)
+        if active and out.get("issue") and not state.get("issue"):
+            _write_json(last_path, {"opened_at": _iso(now), "issue": out["issue"]})
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: behind-main alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+def behind_alert_for_apply(cfg: Config, skew: dict, now: float, *, scheduled: bool) -> None:
+    """Alert on scheduled applies; let a manual recovery close an open episode."""
+    if scheduled:
+        behind_alert(cfg, skew, now)
+        return
+    behind = behind_main_seconds(skew, cfg.soak_seconds, now)
+    if behind is not None and behind <= BEHIND_STARVED_SECONDS:
+        behind_alert(cfg, skew, now)
+
+
 # A gate-demand snapshot older than this is not used: the bound falls back.
 GATE_DEMAND_FRESH_SECONDS = 10 * 60
 
@@ -3524,9 +3624,26 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   reinstall: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
+    # The last measured skew, for the behind-main alert on the paths that
+    # return before measuring it (blocked, interrupted, checkout refused).
+    last_skew = _read_json(cfg.state_dir / "skew.json") or {}
+
+    def early_alert() -> None:
+        if not apply or not scheduled:
+            return
+        skew = (last_skew if behind_main_seconds(last_skew, cfg.soak_seconds, now) is not None
+                else _read_json(cfg.state_dir / BEHIND_SKEW_NAME) or {})
+        try:
+            running = installed_commit(cfg)[0]
+        except Exception:  # noqa: BLE001 - without proof, do not alert from stale skew
+            return
+        if not skew.get("installed") or skew["installed"] != running:
+            return  # measured before an install moved the host, or lacks provenance
+        behind_alert_for_apply(cfg, skew, now, scheduled=scheduled)
     blocked, interrupted = previous_run_state(cfg, sys_)
     if blocked:
         print(f"self-update: REFUSED: {blocked}")
+        early_alert()
         return EXIT_REFUSED
     if interrupted:
         if not apply:
@@ -3534,6 +3651,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   + ", ".join(p.name for p in interrupted))
         else:
             recover_interrupted(cfg, sys_, interrupted)
+            early_alert()
             return EXIT_FAILED
     if apply:
         recover_left_off(cfg, sys_)
@@ -3551,6 +3669,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.finish("refused", reason)
         else:
             print(f"self-update: REFUSED {reason}")
+        early_alert()
         return EXIT_REFUSED
     try:
         installed, source = installed_commit(cfg)
@@ -3570,6 +3689,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         print(f"self-update: UNKNOWN: {exc}")
         _write_json(cfg.state_dir / "skew.json", {"state": "unknown", "reason": str(exc),
                                                   "measured_at": _iso(now)})
+        early_alert()
         return EXIT_UNKNOWN
     try:
         skew = measure_skew(cfg, sys_, installed, now, target_ref, explicit=explicit)
@@ -3587,6 +3707,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         receipt.step("refused", reason, ok=False)
         receipt.finish("refused", reason)
         print(f"self-update: REFUSED {reason}")
+        early_alert()
         return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")
@@ -3595,6 +3716,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
               f"@{selected_source['commit'][:12]} (installed from "
               f"{_source_name(installed_fleet_source_commit(cfg))}; {selected_source['why']})")
     print(f"self-update: {render_skew(skew)}")
+    if apply:
+        behind_alert_for_apply(cfg, skew, now, scheduled=scheduled)
     if skew.get("explicit"):
         print(f"self-update: selected {skew.get('selected_target') or 'none'} "
               f"(requested {skew.get('requested_target')}; {skew.get('selection_reason', 'same')})")
@@ -3939,7 +4062,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
                   helper=helper, approval=approval, excluded=survey.excluded,
-                  previous_fleet_source=previous_fleet_source, auto_ack=auto_ack)
+                  previous_fleet_source=previous_fleet_source, auto_ack=auto_ack,
+                  scheduled=scheduled)
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
@@ -4277,11 +4401,12 @@ class Run:
                  repository: str | None = None,
                  excluded: list[str] | None = None,
                  previous_fleet_source: dict[str, Any] | None = None,
-                 auto_ack: bool = False) -> None:
+                 auto_ack: bool = False, scheduled: bool = False) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         # The launcher change was acknowledged automatically, not by a person
         # waiting to grant Removable Volumes: a lost grant rolls back.
         self.auto_ack = auto_ack
+        self.scheduled = scheduled
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
@@ -4323,6 +4448,8 @@ class Run:
             skew["recorded_by"] = "verified_apply"
             _write_json(self.cfg.state_dir / "skew.json", skew)
             self.receipt.step("skew", render_skew(skew))
+            # Caught up: close a STARVED issue now, not at the next attempt.
+            behind_alert_for_apply(self.cfg, skew, self.sys.now(), scheduled=self.scheduled)
         except Exception as exc:  # noqa: BLE001 - never turn a success into a failure
             self.receipt.step("skew", f"not recorded: {type(exc).__name__}: {exc}", ok=False)
 
