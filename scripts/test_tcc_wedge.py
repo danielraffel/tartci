@@ -406,6 +406,7 @@ class HealTests(unittest.TestCase):
             "heredoc tag with dots": f"cat <<E.O.F\n{v1}\n{v2}\nE.O.F\n" + old,
             "multi-line array": f"a=(\n  {v1}\n  {v2}\n)\n" + old,
             "appended array": f"a+=(\n  {v1}\n  {v2}\n)\n" + old,
+            "unparsable heredoc then a third kill": f"{v1}\n{v2}\ncat <<E\\OF\nEOF\n{v1.replace('tccd', 'launchd')}\n",
             "inside a quoted $( )": f"x='$({v1})'\ny='$({v2})'\n" + old,
         }
         for name, body in not_executed.items():
@@ -420,6 +421,9 @@ class HealTests(unittest.TestCase):
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
         # An array that closes does not end command position for what follows.
         self.wrapper.write_text(f"#!/bin/bash\na=(\n  x\n)\n{v1}\n{v2}\n")
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+        # A $( ) inside an array starts its own commands.
+        self.wrapper.write_text(f"#!/bin/bash\na=( $(\n{v1}\n{v2}\n) )\n")
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
         # `!` and a `{ }` group still run their command.
         self.wrapper.write_text(f"#!/bin/bash\n! {v1}\n{{ {v2}; }}\n")

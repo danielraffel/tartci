@@ -923,6 +923,7 @@ def kill_vectors(text: str) -> list[str]:
     stack = ["code"]  # "code", "paren" (code inside $( )), "dq", "sq"
     pending: list[tuple[str, bool]] = []  # here-document (tag, tab-stripping)
     cmd = True  # the next word is at a command position
+    saved: list[int] = []  # `arrays` of the code a $( ) interrupted
     arrays = 0  # open `name=( ... )`: its words are values, even across lines
     n, i = len(text), 0
     while i < n:
@@ -939,6 +940,8 @@ def kill_vectors(text: str) -> list[str]:
                 stack.pop()
             elif text.startswith("$(", i):
                 stack.append("paren")
+                saved.append(arrays)
+                arrays = 0
                 cmd = True
                 i += 1
             i += 1
@@ -981,10 +984,13 @@ def kill_vectors(text: str) -> list[str]:
             i += 1
         elif text.startswith("$(", i):
             stack.append("paren")
+            saved.append(arrays)
+            arrays = 0
             cmd = True
             i += 2
         elif c == ")" and top == "paren":
             stack.pop()
+            arrays = saved.pop()
             cmd = False
             i += 1
         elif c in ";|" or (c == "&" and text[i - 1:i] not in ("<", ">") and text[i + 1:i + 2] != ">"):
@@ -1007,7 +1013,10 @@ def kill_vectors(text: str) -> list[str]:
                 pending.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
                 i = m.end()
             else:
-                break  # an unparsable here-document: the rest is not counted
+                # An unparsable here-document: the rest cannot be placed, so
+                # the result must not read as complete.
+                calls.append("<unparsed here-document>")
+                break
         elif c in "<>&":
             i += 1
         elif cmd and c in "!{" and text[i + 1:i + 2] in (" ", "\t"):
