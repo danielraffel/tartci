@@ -64,6 +64,22 @@ class ValidateCommandTests(unittest.TestCase):
     def test_all_profiles_validate_clean(self) -> None:
         self.assertEqual(P.cmd_validate(_ns(name=None)), 0)
 
+    def test_retired_macpro_targets_are_listed_but_never_selected(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        retired = {tid for tid, row in profile["targets"].items() if row.get("retired")}
+        self.assertEqual(retired, {tid for tid in profile["targets"] if tid.startswith("macpro.")})
+        self.assertEqual(len(retired), 5)
+        seen = 0
+        for repo in ("Generous-Corp/pulp", "Generous-Corp/vellum"):
+            for lane in P.resolve_lanes(profile, repo):
+                if not any(str(t["id"]).startswith("macpro.") for t in lane["targets"]):
+                    continue
+                seen += 1
+                self.assertFalse(str(lane["selected_now"]["id"]).startswith("macpro."), lane["lane"])
+                self.assertEqual(lane["selected_now"]["provider"], "github", lane["lane"])
+                self.assertNotIn("macpro", lane["selected_runs_on_json"], lane["lane"])
+        self.assertEqual(seen, 6)
+
     def test_pulp_pr_linux_prefers_distinct_pr_safe_macpro_contract(self) -> None:
         _, profile = P.load_profile("normal-local-fast")
         lane = P.resolve_lanes(profile, "Generous-Corp/pulp")

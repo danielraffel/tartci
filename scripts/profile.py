@@ -106,7 +106,10 @@ def resolve_lanes(profile: dict[str, Any], repo: str) -> list[dict[str, Any]]:
                     if row.get("provider") != "github" and not row.get("ephemeral"):
                         warnings.append(f"{row['id']} is not marked ephemeral for coverage")
             github_variable = lane_cfg.get("github_variable") or PULP_DEFAULT_VARS.get((context, lane_name))
-            concrete = next((row for row in target_rows if not row.get("missing")), None)
+            # A retired target stays in the catalog and in the lane's order, so
+            # bringing its host back is one deleted key, but it is never selected.
+            concrete = next((row for row in target_rows
+                             if not row.get("missing") and not row.get("retired")), None)
             lanes.append(
                 {
                     "context": context,
