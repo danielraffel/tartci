@@ -6,4 +6,3 @@ profiles/m3-macos-fleet.toml	host profile; becomes a template once hosts read th
 profiles/m5-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
 profiles/m5studio-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
 scripts/test_macos_fleet_lanes.py	asserts the checked-in host profiles; becomes a template test with them
-scripts/test_external_only_policy.py	asserts which external volume each host profile opts in with

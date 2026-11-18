@@ -25,14 +25,6 @@ ssh = "m3"
 python = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Workshop/VMs"
-# External-only host: a host build whose build dir or cache dir resolves to the
-# internal data volume is reported (refuse mode is not enabled yet) at
-# `tartci leases acquire` (scripts/external_only_policy.py). The fleet's internal
-# volumes filled up on 2026-11-17. Rollback: delete these two lines and re-render.
-external_root = "/Volumes/Workshop"
-# Report-only: warn, admit and journal a would_refuse row. Refuse mode is not
-# reachable from config yet (runbook: Keeping builds and caches on the external volume).
-external_only_mode = "report"
 # The CI cache (gate ccache, artifact cache, pip wheelhouse) lives on Workshop
 # with the Tart store, not on the boot volume, which held 10 GiB of it. The
 # old ~/.cache/pulp-ci is a symlink here, for tools that default to it.

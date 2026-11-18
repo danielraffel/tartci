@@ -432,6 +432,30 @@ class SafeAndRefuseTests(unittest.TestCase):
                                     home="/nonexistent", device=unreadable)
         self.assertEqual(refusal["reason"], eop.REASON_UNREADABLE)
 
+    def test_an_unread_path_is_refused_in_refuse_mode_and_admitted_in_report_mode(self) -> None:
+        import contextlib, io
+
+        def device(path: str) -> int:
+            # The internal device is readable; only this one path is not.
+            if path.startswith("/Users/x/b"):
+                raise PermissionError("EPERM")
+            return fake_device(path)
+
+        def acquire(mode: str):
+            a = args()
+            a.build_dir = ["/Users/x/b"]
+            with mock.patch.object(eop, "ccache_reported_dir", return_value=None), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                return a, eop.check_acquire(a, EXT_ROOT, mode=mode, env={},
+                                            home="/nonexistent", device=device)
+
+        a, refusal = acquire("refuse")
+        self.assertEqual(refusal["reason"], eop.REASON_UNREADABLE)
+        self.assertTrue(refusal["unread"])
+        a, admitted = acquire("report")  # report mode stays fail-open
+        self.assertIsNone(admitted)
+        self.assertTrue(a.external_policy_unread)
+
     def test_check_acquire_defaults_to_report(self) -> None:
         import contextlib, io
         a = args()
@@ -521,16 +545,6 @@ class ShippedProfileTests(unittest.TestCase):
                 res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
                                       str(path)], cwd=ROOT, capture_output=True, text=True)
                 self.assertEqual(res.returncode, 0, res.stderr)
-
-    def test_m3_and_m5studio_opt_in_in_report_mode(self) -> None:
-        # Without external_root the policy returns at once and no report row ever appears.
-        expected = {"m3-macos-fleet.toml": "/Volumes/Workshop",
-                    "m5studio-macos-fleet.toml": "/Volumes/Atelier"}
-        for name, root in expected.items():
-            path = str(ROOT / "profiles" / name)
-            with self.subTest(profile=name):
-                self.assertEqual(host_profile.external_root_setting(path), root)
-                self.assertEqual(host_profile.external_only_mode_setting(path), "report")
 
     def test_refuse_mode_is_rejected_by_the_validator(self) -> None:
         source = (ROOT / "profiles" / "m5studio-macos-fleet.toml").read_text()

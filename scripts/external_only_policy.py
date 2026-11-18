@@ -291,12 +291,14 @@ def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "repor
     unread = internal_errors + verdict["unread"]
     internal_unknown = not verdict["internal_device_known"]
     if unread or internal_unknown:
-        if mode == "refuse" and internal_unknown:
+        if mode == "refuse":
+            # Fail closed: a path whose location cannot be read cannot be
+            # proven external, whether or not the internal device is known.
             return {
                 "ok": False,
                 "reason": REASON_UNREADABLE,
                 "message": unread_message(unread, external_root, mode="refuse",
-                                           internal_unknown=True),
+                                           internal_unknown=internal_unknown),
                 "external_root": external_root,
                 "violations": verdict["violations"],
                 "unread": unread,

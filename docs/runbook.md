@@ -5155,7 +5155,10 @@ build warns on stderr, admits, and journals an `external_only_policy` /
 never fails an acquire (any error admits with a warning), and reports any path
 that resolves, after symlinks, to the internal data volume, naming the path and
 the fix. The refusing code path (exit 78, reason `external_only_internal_path`,
-never retried by `--wait-secs`) exists but is disabled. Judged:
+never retried by `--wait-secs`) exists but is disabled; when enabled it also
+refuses (reason `external_only_unreadable`) if any judged path cannot be read,
+because an unreadable path cannot be proven external. No shipped host profile
+sets `external_root` yet: opting a host in is a separate data change. Judged:
 `--build-dir` and `--cache-dir` (repeatable), `TARTCI_BUILD_DIR` (with no build
 dir declared, the working directory stands in), `CCACHE_DIR` or the `cache_dir`
 of the file `CCACHE_CONFIGPATH` names or of ccache.conf (or ccache's default
