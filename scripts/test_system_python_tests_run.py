@@ -200,6 +200,12 @@ ALLOWED = {
      "UnreachableConcurrencyTests.test_validate_check_reserve_exits_nonzero"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
+     "UnreachableConcurrencyTests.test_live_slot_lending_override_can_disable_profile_lending"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "NoReserveTests.test_summary_keeps_unreachable_problem_when_gate_reserve_is_not_applicable"):
+        LANES,
+    ("test_gate_reserve_fit.py",
      "ValidateCliTests"):
         LANES,
     ("test_external_only_policy.py",
