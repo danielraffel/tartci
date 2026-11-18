@@ -1519,7 +1519,10 @@ refresh_after_serve(){
     case ",${2:-}," in *-merge-group,*) printf '%s\n' 1; return 0 ;; esac
     # Not after the lane's first class: that class is what the refresh looks
     # for, and nothing is created when one of its jobs ends.
-    if [ "${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1 ] \
+    # Tier loop only, as the profile validator requires; a hand-set env on a
+    # single-label or event-class-v2 lane stays off.
+    if [ "${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1 ] && [ -n "${TIER_LABELS_CONFIG:-}" ] \
+       && [ "${ASSIGNMENT_MODE:-legacy}" != event-class-v2 ] \
        && [ "${2##*,}" != "$(printf '%s\n' "$TIER_LABELS_CONFIG" | sed -n '1p')" ]; then
       printf '%s\n' 1; return 0
     fi

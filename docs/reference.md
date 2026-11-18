@@ -748,8 +748,9 @@ set `refresh_after_every_serve = true` (below). Roll out in this order:
    a runner of the class only once a job requests it, so none is online before);
 3. set the repository variable.
 
-Roll back in the reverse order: unset the variable first, then delete the
-tier. A job that requests a label no lane registers queues forever.
+Roll back in the reverse order: unset the variable first, wait until no
+queued job requests the label, then delete the tier. A job that requests a
+label no lane registers queues forever.
 
 After a lane serves a job whose class label ends in `-merge-group`, or any job
 on a lane with `refresh_after_every_serve = true` (env
@@ -778,9 +779,11 @@ scan just published. That is about 5 to 14 API calls per served job.
 
 There is no refresh after a job of the lane's first class: that class is what
 the refresh looks for, and nothing is queued when one of its jobs ends. The
-lane renders `TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR` (fleet-wide, 8 for
-Vellum), and `queue_scan.py` adds those discoveries to its fleet API budget
-check.
+lane with `refresh_after_every_serve` must also set `forced_discoveries_per_hour`: its repository's post-serve
+discoveries an hour, fleet-wide (Vellum: 8). The lane renders it as
+`TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR`, and `queue_scan.py` adds those
+discoveries to its fleet API budget check. That check has about 136 calls, or 9
+discoveries, of headroom, which every repository that sets the key shares.
 
 The refresh reorders nothing: the tier order, the merge-group quota and the
 oldest-run reservation are the same as on an unforced scan.

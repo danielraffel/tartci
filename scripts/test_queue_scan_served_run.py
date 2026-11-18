@@ -10,6 +10,7 @@ reads its jobs first, from the same --max-job-fetches cap.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -167,8 +168,10 @@ class ServedRunPropertyTests(unittest.TestCase):
     """Random queues and settings: --priority-run only moves the served run.
 
     For every case: the cap holds, no run is read twice, the served run is
-    first, every merge-group run the quota reads without the flag is still
-    read with it, and the oldest-run reservation's target is still read.
+    first, every merge-group run the quota reads is still read, and the run
+    the oldest-run reservation picks is still read. Runs carry page groups and
+    half the cases start with a reservation already spent, so the reservation
+    and the rotation take distinct picks.
     """
 
     def test_random_queues(self) -> None:
@@ -184,8 +187,12 @@ class ServedRunPropertyTests(unittest.TestCase):
             runs = []
             for index in range(rng.randint(1, 14)):
                 event = rng.choice(("pull_request", "pull_request", "merge_group", "push"))
-                runs.append(_run(1000 + index, now - timedelta(minutes=rng.randint(1, 600)),
-                                 event, rng.choice(("queued", "in_progress"))))
+                run = _run(1000 + index, now - timedelta(minutes=rng.randint(1, 600)),
+                           event, rng.choice(("queued", "in_progress")))
+                # Page groups as the live listing tags them, so the rotation
+                # and the reservation take distinct picks.
+                run["_page_key"] = rng.choice(("queued:1", "queued:2", "in_progress:1"))
+                runs.append(run)
             served = rng.choice(runs)["id"]
 
             def scanner(priority: int) -> Any:
@@ -199,10 +206,15 @@ class ServedRunPropertyTests(unittest.TestCase):
 
             rng_quota = rng.randint(0, 3)
             with self.subTest(case=case):
-                base_state: dict[str, Any] = {}
-                base, _ = scanner(0)._candidate_runs([dict(r) for r in runs], base_state)
-                state: dict[str, Any] = {}
-                got, _ = scanner(served)._candidate_runs([dict(r) for r in runs], state)
+                # Half the cases start with the oldest run's reservation spent.
+                prior: dict[str, Any] = {}
+                if rng.random() < 0.5:
+                    oldest = min(runs, key=lambda r: r["created_at"])
+                    prior = {"oldest_reserved_at": {str(oldest["id"]): int(now.timestamp())}}
+                base_state = json.loads(json.dumps(prior))
+                base, base_picked = scanner(0)._candidate_runs([dict(r) for r in runs], base_state)
+                state = json.loads(json.dumps(prior))
+                got, picked = scanner(served)._candidate_runs([dict(r) for r in runs], state)
                 ids = [int(r["id"]) for r in got]
                 self.assertLessEqual(len(ids), cap)
                 self.assertEqual(len(ids), len(set(ids)))
@@ -212,8 +224,9 @@ class ServedRunPropertyTests(unittest.TestCase):
                 bound = max(0, cap - newest_quota - (1 if base_state.get("oldest_reserved_at") else 0) - 1)
                 for run_id in quota_runs[:min(rng_quota, bound)]:
                     self.assertIn(run_id, ids)
-                for run_id in base_state.get("oldest_reserved_at") or {}:
+                for run_id in set(base_state.get("oldest_reserved_at") or {}) - set(prior.get("oldest_reserved_at") or {}):
                     self.assertIn(int(run_id), ids)
+
 
 if __name__ == "__main__":
     unittest.main()

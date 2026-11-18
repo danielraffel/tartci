@@ -332,9 +332,9 @@ guest_heartbeat_stale_seconds = 600
 # longer be handed another pull request's 30-minute proof (median 11.1 min,
 # p90 63.5 queued for 1.4 min of work, 2026-11-04..18). With no demand in a
 # class the lane serves the next one on the same scan.
-# Rollback: unset Vellum's VELLUM_LOCAL_MACOS_STERILE_RUNS_ON_JSON first (a
-# journey requesting a label no lane registers queues forever), then delete
-# this tier and re-render.
+# Rollback: unset Vellum's VELLUM_LOCAL_MACOS_STERILE_RUNS_ON_JSON first, wait
+# until no queued job requests vellum-sterile-consumer (a journey requesting a
+# label no lane registers queues forever), then delete this tier and re-render.
 [[lane.tier]]
 label = "vellum-sterile-consumer"
 workflow = "Locked macOS GPU proof"

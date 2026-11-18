@@ -115,10 +115,19 @@ class ProfileTests(unittest.TestCase):
             path.write_text(base.replace(aged, aged.replace("= 0", "= 600")))
             with self.assertRaisesRegex(ValueError, "refresh_after_every_serve"):
                 fleet.load(path)
+            # The budget share is required with the key, and only with it.
+            forced = "forced_discoveries_per_hour = 8\n"
+            self.assertEqual(base.count(forced), 1)
+            for text in (base.replace(forced, ""), base.replace(forced, "forced_discoveries_per_hour = -1\n"),
+                         base.replace(forced, 'forced_discoveries_per_hour = "8"\n'),
+                         base.replace(line, "")):
+                path.write_text(text)
+                with self.assertRaisesRegex(ValueError, "forced_discoveries_per_hour"):
+                    fleet.load(path)
             # An event-class-v2 lane (pulp-gate) has no tier-loop refresh either.
             v2 = 'assignment_mode = "event-class-v2"\n'
             self.assertEqual(base.count(v2), 1)
-            path.write_text(base.replace(v2, v2 + line))
+            path.write_text(base.replace(v2, v2 + line + forced))
             with self.assertRaisesRegex(ValueError, "refresh_after_every_serve"):
                 fleet.load(path)
             # A single-label lane has no tier loop to refresh.
@@ -309,6 +318,15 @@ class RefreshAfterEveryServeTests(unittest.TestCase):
                        for name, body in fleet.rendered_plists(fleet.load(PROFILES[host])).items()
                        if name.endswith(".vellum-gate.plist"))
             self.assertEqual(env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"], "8", host)
+
+    def test_the_runner_refuses_it_off_the_tier_loop(self) -> None:
+        """A hand-set env on a single-label or event-class-v2 lane stays off."""
+        self.assertEqual(self.run_bash(
+            "TARTCI_REFRESH_AFTER_EVERY_SERVE=1 TIER_LABELS_CONFIG= "
+            f"refresh_after_serve 1 \"$LABELS,{PR_HEAD}\""), "0")
+        self.assertEqual(self.run_bash(
+            "TARTCI_REFRESH_AFTER_EVERY_SERVE=1 ASSIGNMENT_MODE=event-class-v2 "
+            f"refresh_after_serve 1 \"$LABELS,{PR_HEAD}\""), "0")
 
     def test_off_by_default_and_never_without_a_served_job(self) -> None:
         self.assertEqual(self.run_bash(f"refresh_after_serve 1 \"$LABELS,{PR_HEAD}\""), "0")
