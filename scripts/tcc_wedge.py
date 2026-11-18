@@ -902,76 +902,115 @@ def wrapper_sends_sigkill(wrapper: str) -> bool:
 
 
 _KILL_WORD = '"$KILLALL"'
-_COMMAND_LEADERS = ("", ";", "&", "|", "(", "{", "!", "exec", "then", "do", "else", "elif")
-_HEREDOC = re.compile(r"<<-?\s*(?:'([^']+)'|\"([^\"]+)\"|\\?(\w+))")
+_LEADER_KEYWORDS = frozenset({"exec", "then", "do", "else", "elif"})
+_WORD = re.compile(r"[A-Za-z_]\w*(?=[\s;&|)]|$)")
+_HEREDOC = re.compile(r"<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|\\?(\w+))(?=[\s;&|)]|$)")
 
 
 def kill_vectors(text: str) -> list[str]:
-    """Each `"$KILLALL" ...` the wrapper would execute, in order, redirections dropped.
+    """Each `"$KILLALL" ...` that appears at a command position, in order,
+    redirections dropped.
 
-    A small shell scanner, not a regex over lines: a call counts only in code
-    that runs (top level or inside `$( )`), at a command position. Quoted
-    strings, comments and here-document bodies are skipped, so a wrapper that
-    merely prints or stores the two vectors is not credited with running them.
-    Anything it cannot place is left uncounted, which reads as stale.
+    A small shell scanner, not a regex over lines. It tracks whether the next
+    word starts a command (line start, after an unescaped `;` `&` `|` `$(` or a
+    subshell `(`, after `exec`/`then`/`do`/`else`/`elif`), so a vector that is
+    an argument to `echo`/`printf`, stored in an array, quoted, in a comment, or
+    in a here-document body is not counted. It is a static read: it does not
+    know whether the line is reachable. Anything it cannot place is left
+    uncounted, which reads as stale.
     """
     calls: list[str] = []
     stack = ["code"]  # "code", "paren" (code inside $( )), "dq", "sq"
-    pending: list[tuple[str, bool]] = []  # here-document tags awaiting their bodies
+    pending: list[tuple[str, bool]] = []  # here-document (tag, tab-stripping)
+    cmd = True  # the next word is at a command position
     n, i = len(text), 0
     while i < n:
         c, top = text[i], stack[-1]
         if top == "sq":
             if c == "'":
                 stack.pop()
-        elif top == "dq":
+            i += 1
+            continue
+        if top == "dq":
             if c == "\\":
                 i += 1
             elif c == '"':
                 stack.pop()
             elif text.startswith("$(", i):
                 stack.append("paren")
+                cmd = True
                 i += 1
-        elif c == "\n" and pending:
             i += 1
-            while pending and i <= n:
+            continue
+        if c == "\n":
+            cmd = True
+            i += 1
+            while pending and i <= n:  # bodies start on the next line
+                tag, dash = pending[0]
                 end = text.find("\n", i)
                 end = n if end < 0 else end
-                tag, dash = pending[0]
                 if (text[i:end].lstrip("\t") if dash else text[i:end]) == tag:
                     pending.pop(0)
                 i = end + 1
             continue
-        elif c == "\\":
+        if c in " \t":
             i += 1
+        elif c == "\\":
+            if text.startswith("\\\n", i):  # a continuation joins the lines
+                i += 2
+            else:
+                cmd = False
+                i += 2
         elif c == "#" and (i == 0 or text[i - 1] in " \t\n;"):
             end = text.find("\n", i)
             i = n if end < 0 else end
-            continue
         elif text.startswith(_KILL_WORD, i):
-            lead = re.split(r"[\n]|\$\(|&&|\|\||[;&|({!]", text[:i])[-1].strip()
-            raw = re.match(r'(?:[^)\n;&|<>]|\d*>&?[-\w/]*)*', text[i:]).group(0)
-            if lead in _COMMAND_LEADERS:
+            if cmd:
+                raw = re.match(r'(?:[^)\n;&|<>]|\d*>&?[-\w/]*)*', text[i:]).group(0)
                 calls.append(_REDIRECTIONS.sub("", raw).strip())
+            cmd = False
             i += len(_KILL_WORD)
-            continue
         elif c == "'":
             stack.append("sq")
+            cmd = False
+            i += 1
         elif c == '"':
             stack.append("dq")
+            cmd = False
+            i += 1
         elif text.startswith("$(", i):
             stack.append("paren")
-            i += 1
+            cmd = True
+            i += 2
         elif c == ")" and top == "paren":
             stack.pop()
-        elif text.startswith("<<", i) and not text.startswith("<<<", i):
+            cmd = False
+            i += 1
+        elif c in ";|" or (c == "&" and text[i - 1:i] not in ("<", ">") and text[i + 1:i + 2] != ">"):
+            cmd = True
+            i += 1
+        elif c == "(":
+            # A subshell at a command position; otherwise an array assignment
+            # or arithmetic, whose words are not commands.
+            i += 1
+        elif text.startswith("<<<", i):
+            i += 3
+        elif text.startswith("<<", i):
             m = _HEREDOC.match(text, i)
             if m:
-                pending.append((m.group(1) or m.group(2) or m.group(3),
-                                text.startswith("<<-", i)))
+                pending.append((m.group(2) or m.group(3) or m.group(4), m.group(1) == "-"))
                 i = m.end()
-                continue
-        i += 1
+            else:
+                i += 2
+        elif c in "<>&":
+            i += 1
+        else:
+            word = _WORD.match(text, i) if cmd else None
+            if word and word.group(0) in _LEADER_KEYWORDS:
+                i = word.end()  # still at a command position
+            else:
+                cmd = False
+                i += 1
     return calls
 
 

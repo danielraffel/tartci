@@ -396,6 +396,10 @@ class HealTests(unittest.TestCase):
             "as an argument": f"echo {v1}\necho {v2}\n" + old,
             "exec as an echo argument": f"echo exec {v1}\necho exec {v2}\n" + old,
             "padded heredoc terminator": f"cat <<EOF\nnote\n EOF \n{v1}\n{v2}\nEOF\n" + old,
+            "printf continuation": f"printf '%s\\n' \\\n  {v1}\nprintf '%s\\n' \\\n  {v2}\n" + old,
+            "escaped separator": f"echo \\; {v1}\necho \\; {v2}\n" + old,
+            "bang or brace argument": f"echo would run ! {v1}\necho {{ {v2}\n" + old,
+            "array storage": f"a=({v1})\nb=( {v2} )\n" + old,
             "inside a quoted $( )": f"x='$({v1})'\ny='$({v2})'\n" + old,
         }
         for name, body in not_executed.items():
@@ -404,6 +408,9 @@ class HealTests(unittest.TestCase):
                 self.assertFalse(tw.wrapper_sends_sigkill(str(self.wrapper)), name)
         # An executed call after a heredoc is still found.
         self.wrapper.write_text(f"#!/bin/bash\ncat <<EOF\nnote\nEOF\n{v1}\n{v2}\n")
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+        # A here-string is not a here-document: the calls after it still run.
+        self.wrapper.write_text(f'#!/bin/bash\ntr a b <<<"$x"\n{v1}\n{v2}\n')
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
         # `<<-` strips leading tabs from the terminator, and only then.
         self.wrapper.write_text(f"#!/bin/bash\ncat <<-EOF\nnote\n\tEOF\n{v1}\n{v2}\n")
