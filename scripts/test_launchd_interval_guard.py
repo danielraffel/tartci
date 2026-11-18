@@ -230,10 +230,14 @@ class IntervalKickTests(GuardCase):
         self.assertEqual(self.launchd.jobs["com.danielraffel.tartci.reap"]["runs"], 11)
 
 
-class SelfUpdatePauseTests(GuardCase):
+class SelfUpdateDuringStallTests(GuardCase):
     SELF_UPDATE = "com.danielraffel.tartci.self-update"
 
-    def test_self_update_is_not_kicked_while_a_stall_episode_is_open(self) -> None:
+    def test_self_update_is_kicked_while_a_stall_episode_is_open(self) -> None:
+        # m3 from 2026-11-18T07:11Z: launchd starts no timer on its own. An
+        # update now demand-spawns its own lanes back (fleet_self_update.py
+        # Run._demand_spawn), so self-update is kicked like any other agent
+        # rather than held until a reboot.
         self.interval_agent(self.SELF_UPDATE, 1800)
         self.interval_agent("com.danielraffel.tartci.reap", 300)
         self.interval_agent("com.danielraffel.tartci.launchd-watchdog", 300)
@@ -243,15 +247,17 @@ class SelfUpdatePauseTests(GuardCase):
             self.clock.now += 300
             receipt = g.pass_once()
         self.assertTrue(receipt["episode"]["active"])
-        self.assertNotIn(self.SELF_UPDATE, self.launchd.kicks())
+        self.assertIn(self.SELF_UPDATE, self.launchd.kicks())
         self.assertIn("com.danielraffel.tartci.reap", self.launchd.kicks())
-        self.assertEqual([row["label"] for row in receipt["paused"]], [self.SELF_UPDATE])
-        # Still counted: a stuck self-update is part of the domain stall.
+        self.assertEqual(receipt["paused"], [])
+        # Still counted: a run the guard caused is not launchd making progress.
         self.assertIn(self.SELF_UPDATE, receipt["episode"]["labels"])
         value = lig.status(self.state, now=self.clock.now)
         line = lig.describe(value)
-        self.assertIn("self-update paused: launchd timers stalled; a reboot resumes it", line)
-        self.assertIn("self-update paused", fd.check_launchd_timers(value).detail)
+        self.assertNotIn("paused", line)
+        self.assertNotIn("reboot resumes", line)
+        self.assertIn("self-update included, so nothing needs doing", line)
+        self.assertNotIn("paused", fd.check_launchd_timers(value).detail)
 
     def test_an_overdue_self_update_is_kicked_when_no_episode_is_open(self) -> None:
         self.interval_agent(self.SELF_UPDATE, 1800)
@@ -490,7 +496,7 @@ class DomainStallTests(GuardCase):
         line = lig.describe(value)
         self.assertIn("launchd timers: STALLED", line)
         self.assertIn("macOS launchd stopped starting timer jobs", line)
-        self.assertIn("a reboot clears it", line)
+        self.assertIn("nothing needs doing; the next reboot clears it", line)
         finding = fd.check_launchd_timers(value)
         self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "launchd_timers_stalled"))
         self.assertIn("likely a stalled automatic macOS install", finding.detail)

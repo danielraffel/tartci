@@ -139,9 +139,15 @@ class PeerStall(unittest.TestCase):
         self.assertEqual(out["peers"]["studio"]["hours"], 97.3)
         self.assertEqual([t for t, _ in self.opened], [TITLE])
         body = self.opened[0][1].splitlines()
+        # The receipt is from a generation that still paused self-update:
+        # say so, with the one kick that installs the stall-safe update.
         self.assertIn("The guard lists self-update as paused", body[0])
+        self.assertIn("launchctl kickstart gui/$(id -u)/com.danielraffel.tartci.self-update",
+                      body[0])
         self.assertEqual(body[1], "Run: ssh m3 'tartci doctor fleet'")
-        self.assertTrue(body[2].startswith("Fix: reboot studio when its lanes are idle"))
+        self.assertTrue(body[2].startswith("Fix: nothing; it heals itself."), body[2])
+        self.assertIn("do not reboot only for it", body[2])
+        self.assertNotIn("Do not kickstart", self.opened[0][1])
         self.assertFalse(out["peers"]["m5"]["active"])
         self.assertEqual(out["peers"]["studio"]["why"], "primary")
         self.assertNotIn("m1", out["peers"], "a host never reads itself")

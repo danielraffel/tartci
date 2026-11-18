@@ -2547,11 +2547,13 @@ cpu/mem pin, each with a test (planning `2026-10-08-vm-saved-state-trial.md`).
 
 A stalled macOS automatic install can leave a host's launchd refusing every
 non-demand spawn. The interval guard (`scripts/launchd_interval_guard.py`)
-keeps the timers running from inside a lane supervisor, but it pauses
-self-update for the whole episode, and the stalled host opened no issue: m3
-was stalled from 2026-10-05T05:41Z for 97 h and 44 commits behind before
-anyone looked. A host in that state is the wrong one to rely on for its own
-alert, so its peers raise it.
+keeps the timers running from inside a lane supervisor, self-update included,
+and an update during the stall starts and verifies its own lanes (see
+`docs/gotchas.md`, "Timer jobs stop running while the lanes look healthy").
+The host needs nothing, but the stalled host opens no issue of its own: m3 was
+stalled from 2026-10-05T05:41Z for 97 h before anyone looked (self-update was
+then paused for the episode; it no longer is). A host in that state is the
+wrong one to rely on for its own alert, so its peers raise it.
 
 - **Who reads.** Every fleet host's launchd watchdog runs
   `scripts/peer_stall_alert.py` after its heal work, at most once every
@@ -2564,10 +2566,13 @@ alert, so its peers raise it.
 - **When it alerts.** A stall episode open for 6 h
   (`TARTCI_PEER_STALL_ALERT_SECS`) opens one issue:
   `[tartci] <peer> launchd stalled / self-update paused since <episode start>`.
-  The body says whether self-update is paused, gives
-  `Run: ssh <peer> 'tartci doctor fleet'`, and the fix: reboot the host when
-  its lanes are idle (a reboot clears the stall), and do not kickstart
-  self-update while it lasts. The watchdog log prints a
+  The title is kept as it was because readers on every generation adopt the
+  open issue by its exact title. The body gives
+  `Run: ssh <peer> 'tartci doctor fleet'` and the fix: nothing; the host heals
+  itself, and the next planned reboot clears the stall. Only when the peer's
+  guard still lists self-update as paused (a generation from before the
+  stall-safe update) does the body name the one `launchctl kickstart` of its
+  self-update that installs the fix. The watchdog log prints a
   `WARN peer-stall` line each read while it holds.
 - **One reader acts.** Every watchdog runs on the same cadence, so reads of a
   peer line up. The peer's primary reader, the lowest published host id other
@@ -3005,9 +3010,8 @@ fleet`), and check GitHub's job history against it with
   `handoff-kick` step, and never sent after a failed, rolled-back, refused or
   deferred run, so a failed canary does not speed up the rest of the fleet.
   A kick is a demand start, which launchd still honours during a timer
-  stall, so a scheduled self-update now refuses by itself while the interval
-  guard holds it for a stall (`self-update PAUSED by the launchd timer
-  stall`). A run started by hand without `--scheduled` is not held.
+  stall, and the kicked run updates like any other: during a stall it
+  demand-spawns its own lanes back after `pool on`.
 - **A host the capacity floor refuses steps aside.** The floor is read
   before a host defers. When it refuses (the host is the last server of a
   required label and no peer can mint it on demand), the host cannot take a

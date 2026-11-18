@@ -259,10 +259,10 @@
       "why": "The interval guard compares each StartInterval agent's run counter with its interval every minute, and no two agents have gone twice their interval without launchd starting them."
     },
     "launchd_timers_stalled": {
-      "summary": "macOS launchd stopped starting timer jobs, likely a stalled automatic macOS install; the supervisor is starting them; a reboot clears it.",
-      "why": "On m3 (2026-10-04) a macOS automatic install that never finished left launchd refusing every non-demand spawn: StartInterval agents showed `pended nondemand spawn = interval` with frozen run counters for 16 h, and a lane that exited was not respawned for an hour. Lane supervisors started before the stall kept serving, so nothing else looked down. The interval guard inside the supervisors kicks each overdue agent with `launchctl kickstart`, which still works, and keeps this finding open while launchd itself starts nothing. Self-update is paused for the episode: an update stops every supervisor, so no guard would run and a lane restart left to launchd would pend unattended. A reboot resumes it.",
-      "remedy": "Reboot the host when its lanes are idle (or let the pending macOS install finish); the finding clears once launchd starts the timers on its own. Until then the guard keeps them running: see interval_agent_kicked events in ~/.tartci/state/launchd-interval-guard/events.jsonl.",
-      "do_not": "Do not read `serving: ok` or a loaded label as proof that launchd still runs the host's timers, and do not bootout/bootstrap lanes to fix it: a re-bootstrapped agent is a non-demand spawn and pends."
+      "summary": "macOS launchd stopped starting timer jobs, likely a stalled automatic macOS install; the supervisor is starting them, self-update included, so nothing needs doing; the next reboot clears it.",
+      "why": "On m3 (2026-10-04) a macOS automatic install that never finished left launchd refusing every non-demand spawn: StartInterval agents showed `pended nondemand spawn = interval` with frozen run counters for 16 h, and a lane that exited was not respawned for an hour. Lane supervisors started before the stall kept serving, so nothing else looked down. The interval guard inside the supervisors kicks each overdue agent with `launchctl kickstart`, which still works, and keeps this finding open while launchd itself starts nothing. Self-update keeps running: the guard kicks it like any other timer, and an update that finds the stall open starts every lane it stopped with `launchctl kickstart` and verifies each lane and the guard running again, rolling back the same way if one does not start. Nothing is left to launchd, so the stall costs no capacity and no update.",
+      "remedy": "Nothing: the host heals itself and keeps updating. The guard keeps every timer running, self-update included, for as long as the stall lasts, and the next reboot (planned, with the lanes drained, such as the next macOS install) clears it. The finding closes once launchd starts the timers on its own. Evidence: interval_agent_kicked events in ~/.tartci/state/launchd-interval-guard/events.jsonl, and `demand-spawn` steps in the self-update receipts.",
+      "do_not": "Do not reboot or log out a host only to clear this, do not read `serving: ok` or a loaded label as proof that launchd still runs the host's timers, and do not bootout/bootstrap lanes by hand: a re-bootstrapped agent is a non-demand spawn and pends until something kickstarts it."
     },
     "launchd_timers_unreadable": {
       "summary": "The interval guard's receipt could not be read.",
@@ -558,12 +558,6 @@
     "self_update_current": {
       "summary": "This host runs main's tartci, or its undeployed commits are recent and the last self-update did not fail.",
       "why": "Hosts fell weeks behind main unnoticed; tartci's skew is measured against first-parent main and shown here even when the self-update agent is off."
-    },
-    "self_update_paused": {
-      "summary": "tartci's self-update has not run since a launchd timer stall began: launchd starts no timer job on its own and the interval guard deliberately does not kick self-update, so the host stays behind main and self-update writes no attempt or log line of its own.",
-      "why": "During a stall (launchd_timers_stalled) an update would stop every supervisor, so no guard would run and any lane restart left to launchd would pend unattended; the guard therefore holds self-update for the episode. On m3 from 2026-10-05 that left self-update silent for days, 44 commits behind, while its finding read like a failed update: there was no receipt to read because it never ran.",
-      "remedy": "The operator reboots the host when its lanes are idle (or lets the pending macOS install finish); tartci never does. The stall clears, launchd starts self-update on its next interval, and it updates from its own clean checkout. Afterwards `launchctl print gui/$(id -u)/com.danielraffel.tartci.self-update` shows the run count moving and no `pended nondemand spawn` line.",
-      "do_not": "Do not kickstart self-update by hand during the stall: its pool off and on re-bootstrap every lane, and on a stalled launchd a re-bootstrapped agent pends with no guard alive to kick it."
     },
     "self_update_problem": {
       "summary": "This host runs stale tartci code, its skew could not be measured, or the last self-update failed.",

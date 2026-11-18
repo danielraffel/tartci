@@ -3141,108 +3141,235 @@ class VmDhcpVerifyTests(Base):
         self.assertEqual(self.sys.vm_verify_calls, [])
 
 
-class PausedByStallTests(Base):
-    """A self-update the launchd guard holds for a timer stall says so itself."""
+LANES = ("com.danielraffel.tartci.tart-runner-macos-fleet.pulp-gate-01",
+         "com.danielraffel.tartci.tart-runner-macos-fleet.forge-gate-01")
+
+
+class StalledLaunchdSystem(FakeSystem):
+    """FakeSystem over a launchd gui domain in a timer stall (m3, 2026-11-18).
+
+    The lanes are a small job table. `pool off` boots them out; `pool on`
+    loads them again, and in a stalled domain that load is a non-demand spawn
+    that never starts, the way `pended nondemand spawn` agents sat on m3. Only
+    `launchctl kickstart`, a demand spawn, starts a lane. A started lane's
+    supervisor runs the interval guard, which writes a pass.
+    """
+
+    def __init__(self, home: Path, *, guard_dir: Path, **kw) -> None:
+        super().__init__(home, **kw)
+        self.stalled = True
+        self.guard_dir = guard_dir
+        self.lanes = {label: {"loaded": True, "running": True, "runs": 3, "pid": 100 + i}
+                      for i, label in enumerate(LANES)}
+        # label -> generation(s) on which its kickstart does not take
+        self.kick_fails: dict[str, set[str]] = {}
+        self.kickstarts: list[str] = []
+        self.guard_runs = True     # a started supervisor runs the guard
+
+    def _start(self, label: str) -> None:
+        lane = self.lanes[label]
+        lane.update(running=True, runs=lane["runs"] + 1, pid=500 + lane["runs"])
+        if self.guard_runs:
+            self.guard_dir.mkdir(parents=True, exist_ok=True)
+            receipt = self.guard_dir / "status.json"
+            value = json.loads(receipt.read_text()) if receipt.exists() else {}
+            value["ts"] = self.clock
+            receipt.write_text(json.dumps(value))
+
+    def run(self, argv, *, cwd=None, env=None, timeout=900):
+        a = list(argv)
+        if a[:2] == ["launchctl", "print"] and a[2].rsplit("/", 1)[-1] in self.lanes:
+            self.calls.append((a, cwd))
+            lane = self.lanes[a[2].rsplit("/", 1)[-1]]
+            if not lane["loaded"]:
+                return su.Result(113, "", "Could not find service")
+            lines = [f"{a[2]} = {{", "\tactive count = 0",
+                     f"\tstate = {'running' if lane['running'] else 'not running'}",
+                     f"\truns = {lane['runs']}"]
+            if lane["running"]:
+                lines.append(f"\tpid = {lane['pid']}")
+            else:
+                lines.append("\tpended nondemand spawn = keepalive")
+            return ok("\n".join(lines + ["}"]) + "\n")
+        if a[:2] == ["launchctl", "kickstart"]:
+            self.calls.append((a, cwd))
+            label = a[-1].rsplit("/", 1)[-1]
+            self.kickstarts.append(label)
+            if label not in self.lanes or not self.lanes[label]["loaded"]:
+                return su.Result(113, "", "Could not find service")
+            generation = "previous" if self.running() == INSTALLED else "target"
+            if generation in self.kick_fails.get(label, set()):
+                return ok()  # accepted, and the lane exits before it runs
+            if not self.lanes[label]["running"]:
+                self._start(label)
+            return ok()
+        result = super().run(argv, cwd=cwd, env=env, timeout=timeout)
+        if a[:3] == ["./tartci", "pool", "off"] and "--plan" not in a and result.rc == 0:
+            text = []
+            for label, lane in self.lanes.items():
+                if lane["loaded"]:
+                    text.append(f"  booted out {label}")
+                lane.update(loaded=False, running=False, pid=None)
+            return su.Result(0, "\n".join(text + [result.out]))
+        if a[0].endswith(".local/bin/tartci") and a[1:3] == ["pool", "on"] and result.rc == 0:
+            for label, lane in self.lanes.items():
+                lane["loaded"] = True
+                if not self.stalled and not lane["running"]:
+                    self._start(label)  # a healthy domain starts a loaded KeepAlive job
+            return su.Result(0, "\n".join(f"  enabled {label}" for label in self.lanes)
+                             + "\nstate: on; participation: 1\nopted IN")
+        return result
+
+
+class StallSafeUpdateTests(Base):
+    """A self-update during a launchd timer stall brings its own lanes back."""
 
     STARTED = NOW - 4 * 86400
-
     SELF = "com.danielraffel.tartci.self-update"
 
-    def guard(self, *, paused=(SELF,), active=True, age=60, directory=None):
-        directory = directory or self.cfg.state_dir.parent / "launchd-interval-guard"
+    def setUp(self) -> None:
+        super().setUp()
+        self.guard_path = self.cfg.state_dir.parent / "launchd-interval-guard"
+        self.sys = StalledLaunchdSystem(self.home, guard_dir=self.guard_path)
+
+    def guard(self, *, active=True, age=60, directory=None):
+        directory = directory or self.guard_path
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "status.json").write_text(json.dumps({
             "ts": time.time() - age, "agents_checked": 18, "errors": [], "kicked": [],
-            "stalled": [{"label": self.SELF, "interval": 1800}],
-            "paused": [{"label": label, "interval": 1800} for label in paused],
+            "stalled": [{"label": self.SELF, "interval": 1800}], "paused": [],
             "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
 
-    def stale_skew(self):
+    def scheduled(self) -> int:
+        return su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                                scheduled=True)
+
+    def steps(self, name: str) -> list[dict]:
+        steps = json.loads(Path(self.last()["receipt"]).read_text())["steps"]
+        return [step for step in steps if step.get("step") == name]
+
+    def assertLanesRunning(self) -> None:
+        self.assertEqual({label: lane["running"] for label, lane in self.sys.lanes.items()},
+                         {label: True for label in LANES})
+
+    def test_a_scheduled_update_during_a_stall_brings_every_lane_back(self):
+        # m3 from 2026-11-18T07:11Z: launchd refuses every non-demand spawn.
+        # The update runs, demand-spawns each lane pool on loaded, and sees
+        # each one and the interval guard running again.
+        self.guard()
+        self.assertUpdated(self.scheduled())
+        self.assertEqual(self.sys.running(), T_OLD)
+        self.assertLanesRunning()
+        self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
+        self.assertNotIn("-k", [arg for argv, _ in self.sys.calls for arg in argv
+                                if argv[:2] == ["launchctl", "kickstart"]])
+        details = [step["detail"] for step in self.steps("demand-spawn")]
+        self.assertIn(f"{len(LANES)} lanes running after pool on", " ".join(details))
+        self.assertIn("interval guard running again", " ".join(details))
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(receipt["launchd_stall"], su._iso(self.STARTED))
+
+    def test_the_stall_is_latched_though_the_guard_stops_writing_at_pool_off(self):
+        # After pool off no supervisor runs the guard and its receipt ages.
+        # The demand-spawn decision was taken before, so it still holds.
+        self.guard()
+
+        def hook(argv) -> None:
+            if argv[:3] == ["./tartci", "pool", "off"] and "--plan" not in argv:
+                self.guard(age=3 * 3600)
+        self.sys.hook = hook
+        self.assertUpdated(self.scheduled())
+        self.assertLanesRunning()
+        self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
+
+    def test_a_lane_that_will_not_start_rolls_back_through_the_same_path_and_alerts(self):
+        # The new generation's lane exits before it runs; the previous one's
+        # starts. The rollback demand-spawns too, and the host serves.
+        self.guard()
+        self.sys.kick_fails[LANES[1]] = {"target"}
+        rc = self.scheduled()
+        self.assertEqual(rc, su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "rolled_back", self.last())
+        self.assertEqual(self.sys.running(), INSTALLED)
+        self.assertLanesRunning()
+        self.assertIn("lanes did not start after pool on", self.last()["error"])
+        self.assertIn(LANES[1], self.last()["error"])
+        self.assertFalse(self.last()["host_off"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("lanes did not start during a launchd stall" in t for t in opened),
+                        self.issues)
+        failed = [s for s in self.steps("demand-spawn") if s.get("ok") is False]
+        self.assertTrue(failed and LANES[1] in failed[0]["detail"])
+
+    def test_a_lane_no_generation_can_start_is_alerted_not_reinstalled(self):
+        self.guard()
+        self.sys.kick_fails[LANES[0]] = {"target", "previous"}
+        rc = self.scheduled()
+        self.assertEqual(rc, su.EXIT_FAILED)
+        last = self.last()
+        self.assertEqual(last["status"], "failed")
+        self.assertEqual(last["pool_state"], su.LANES_DOWN)
+        self.assertIn("lanes are NOT RUNNING", last["error"])
+        self.assertEqual(self.steps("reinstall-for-pool-on"), [])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("lanes NOT RUNNING" in t for t in opened), self.issues)
+
+    def test_a_guard_that_does_not_come_back_fails_the_update(self):
+        self.guard()
+        self.sys.guard_runs = False
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        self.assertIn("interval guard wrote no pass", self.last()["error"])
+
+    def test_pool_on_naming_no_lane_after_pool_off_stopped_some_fails_closed(self):
+        self.guard()
+        original = self.sys.run
+
+        def run(argv, **kw):
+            result = original(argv, **kw)
+            if argv[0].endswith(".local/bin/tartci") and argv[1:3] == ["pool", "on"]:
+                for lane in self.sys.lanes.values():
+                    lane.update(running=True, pid=7)  # running, but unnamed
+                return su.Result(result.rc, "state: on")
+            return result
+        self.sys.run = run
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        self.assertIn("pool on named no lane it enabled", self.last()["error"])
+
+    def test_outside_a_stall_the_update_kicks_nothing(self):
+        # Control: a healthy domain starts what pool on loads; the update
+        # neither kickstarts a lane nor waits for the guard.
+        self.guard(active=False)
+        self.sys.stalled = False
+        self.assertUpdated(self.scheduled())
+        self.assertLanesRunning()
+        self.assertEqual(self.sys.kickstarts, [])
+        self.assertEqual(self.steps("demand-spawn"), [])
+
+    def test_no_pause_is_reported_during_a_stall(self):
+        import fleet_doctor
         su._write_json(self.cfg.state_dir / "skew.json", {
             "state": "behind", "behind": 44, "stale": True, "installed": INSTALLED,
             "target": T_OLD, "oldest_undeployed": "2026-10-05T05:21:21Z",
             "measured_at": su._iso(time.time())})
-
-    def test_a_paused_self_update_says_why_everywhere(self):
-        # m3 from 2026-10-05: behind and stale, no attempt since, the guard
-        # holding it. Its status and doctor read like a failed update.
-        import fleet_doctor
-        self.stale_skew()
         self.guard()
-        since = su._iso(self.STARTED)
-        lines = su.status_lines(self.cfg.state_dir)
-        self.assertTrue(any(l.startswith(f"self-update PAUSED by the launchd timer stall since {since}")
-                            for l in lines), lines)
-        summary = su.summary(self.home)
-        self.assertIn("a reboot resumes it", summary["paused"])
-        finding = fleet_doctor.check_self_update(summary)
-        self.assertEqual((finding.state, finding.code), (fleet_doctor.PROBLEM, "self_update_paused"))
-        self.assertIn("self_update_paused", fleet_doctor.load_reasons())
+        self.assertFalse(any("PAUSED" in line for line in su.status_lines(self.cfg.state_dir)))
+        self.assertNotIn("paused", su.summary(self.home))
+        self.assertNotIn("self_update_paused", fleet_doctor.load_reasons())
 
-    def test_a_scheduled_run_refuses_during_the_stall(self):
-        # A demand start (a peer's handoff kick) still spawns self-update in a
-        # stall; the guard's pause held only because nobody kicked it.
-        self.guard()
-        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
-                              scheduled=True)
-        self.assertEqual(rc, su.EXIT_REFUSED)
-        self.assertEqual(self.sys.mutations(), [])
-        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
-        self.assertIn("PAUSED by the launchd timer stall",
-                      json.loads(receipts[-1].read_text())["error"])
-
-    def test_a_kicked_run_refuses_even_when_the_guard_lists_it_running(self):
-        # The guard omits a running self-update from `paused`; the open
-        # episode is what holds it.
-        self.guard(paused=())
-        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
-                              scheduled=True)
-        self.assertEqual(rc, su.EXIT_REFUSED)
-        self.assertEqual(self.sys.mutations(), [])
-
-    def test_a_stall_that_opens_after_the_first_check_refuses_before_the_drain(self):
-        # The stagger, checkout, preflight and build take minutes; the guard
-        # can open an episode meanwhile. Opened here at validate.
-        def hook(argv) -> None:
-            if "validate" in argv:
-                self.guard()
-        self.sys.hook = hook
-        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
-                              scheduled=True)
-        self.assertEqual(rc, su.EXIT_REFUSED)
-        self.assertEqual(self.sys.mutations(), [])
-        self.assertFalse((self.cfg.state_dir / "active.json").exists())
-
-    def test_a_scheduled_run_outside_a_stall_still_updates(self):
-        # Control: the same scheduled run with no live episode goes ahead.
-        self.guard(active=False)
-        self.sys.on_sleep = None
-        self.assertUpdated(su.plan_or_apply(self.cfg, self.sys, apply=True,
-                                            target_ref="origin/main", scheduled=True))
-
-    def test_the_guard_dir_override_is_honoured(self):
-        other = self.home / "guard-elsewhere"
-        self.guard(directory=other)
-        with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
-            self.assertIsNotNone(su.paused_line(self.cfg.state_dir))
-        self.assertIsNone(su.paused_line(self.cfg.state_dir))
-
-    def test_not_paused_unless_the_guard_holds_self_update_in_a_live_stall(self):
-        import fleet_doctor
-        self.stale_skew()
-        for name, kwargs in (("another agent paused, not self-update",
-                              {"paused": ("com.danielraffel.tartci.launchd-watchdog",)}),
-                             ("nothing paused", {"paused": ()}),
-                             ("no active episode", {"active": False}),
-                             ("stale guard receipt", {"age": 10 * 3600})):
+    def test_stall_since_reads_only_a_live_episode(self):
+        self.assertIsNone(su.stall_since(self.cfg.state_dir))
+        for name, kwargs, want in (("live", {}, su._iso(self.STARTED)),
+                                   ("no active episode", {"active": False}, None),
+                                   ("stale guard receipt", {"age": 10 * 3600}, None)):
             with self.subTest(case=name):
                 self.guard(**kwargs)
-                self.assertIsNone(su.paused_line(self.cfg.state_dir))
-                self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
-                                 "self_update_problem")
-
-    def test_no_guard_receipt_is_not_paused(self):
-        self.assertIsNone(su.paused_line(self.cfg.state_dir))
+                self.assertEqual(su.stall_since(self.cfg.state_dir), want)
+        other = self.home / "guard-elsewhere"
+        self.guard(directory=other)
+        (self.guard_path / "status.json").unlink()
+        with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
+            self.assertIsNotNone(su.stall_since(self.cfg.state_dir))
+        self.assertIsNone(su.stall_since(self.cfg.state_dir))
 
 
 class AgentTemplateTests(unittest.TestCase):

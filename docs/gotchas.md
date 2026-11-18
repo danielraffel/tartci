@@ -85,14 +85,30 @@ it heals on its own. To spot it, compare the age of the newest entry in
 `~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
 not the exit code.
 
-The one agent the guard does not kick is self-update, for as long as the stall
-lasts (`PAUSE_DURING_STALL`): an update stops every supervisor, so no guard
-would run and any lane restart left to launchd would pend. Self-update then
-writes no log line and no attempt for days (m3 from 2026-10-05, 44 commits
-behind). `tartci fleet-macos self-update --status` and `tartci doctor fleet`
-say so (`self_update_paused`, with the stall's start) rather than reading like
-a failed update. The remedy is the stall's: reboot when the lanes are idle.
-Do not kickstart self-update during the stall.
+Self-update is kicked like any other timer, stall or not. Until 2026-11-18 it
+was the one exception (`PAUSE_DURING_STALL`): an update stops every
+supervisor, so no guard runs while it does, and a lane restart left to
+launchd would pend. That left m3 not updating for days (from 2026-10-05, 44
+commits behind; again from 2026-11-18T07:11Z), with a reboot as the only
+remedy. Now an update reads the stall before its `pool off` and keeps that
+answer for the whole run: after every `pool on` (forward, rollback, recovery)
+it kickstarts each lane `pool on` enabled, waits up to 120 s for each to run
+(a pid, or its run count moving), re-kicking one that has not, and then waits
+for the interval guard to write a pass again. A lane that does not start fails
+the update and rolls back through the same path; if the rollback's lanes do
+not start either, the host is left with its pool on, reported as lanes not
+running, and an issue opens (`self_update_lanes_not_started`). The receipt's
+`launchd-stall` and `demand-spawn` steps show each step.
+
+**Remedy: nothing; the host heals itself.** The guard keeps every timer
+running for as long as the stall lasts, self-update included. Do not reboot
+or log out only to clear it: the next planned reboot (the next macOS install,
+with the lanes drained) clears it. A sealed host still on a generation from
+before this change picks it up by itself whenever its self-update runs: the
+run hands off to the target commit's own orchestration before any stall check
+(m3 on 2026-11-18 ran and refused every 30 min with main's old check). Only a
+host whose self-update has not run at all during the stall needs one
+`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`.
 
 The entries are grouped by the kind of failure they describe. If a fresh host
 does not behave as expected, start with the matching symptom and run the

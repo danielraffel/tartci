@@ -33,11 +33,12 @@ when that supervisor exits. Each pass reads the fleet's LaunchAgents
     interval_kick_ceiling / keepalive_kick_ceiling once, so a job that
     cannot start fails loud instead of being kicked forever. The ceiling
     clears when the agent next runs or advances on its own;
-  * does not kick self-update (PAUSE_DURING_STALL) while a domain stall
-    episode is open: an update stops every supervisor, so no guard runs and
-    any lane restart it leaves to launchd would pend unattended. Outside an
-    episode launchd starts it on its own, and an overdue one is kicked like
-    any other. It still counts toward the domain stall;
+  * kicks an overdue self-update like any other timer agent, stall or not.
+    An update stops every supervisor, so no guard runs while it does; during
+    a stall episode self-update therefore starts every lane it stopped with
+    `launchctl kickstart` itself and verifies them and this guard back
+    (fleet_self_update.py, Run._demand_spawn) instead of leaving any start to
+    launchd;
   * opens a domain-wide episode when two or more interval agents have gone
     2x their interval without launchd starting them on its own (event
     launchd_interval_spawns_stalled, once per episode), and closes it
@@ -74,11 +75,6 @@ except ImportError:  # pragma: no cover - not on macOS/Linux
     fcntl = None  # type: ignore[assignment]
 
 LABEL_PREFIXES = ("com.danielraffel.", "com.pulp.")
-# Not kicked while a domain stall episode is open (still observed, and still
-# counted toward the stall). Self-update stops every supervisor, so during the
-# update no guard runs, and a lane restart left to launchd would pend.
-PAUSE_DURING_STALL = ("self-update",)
-PAUSED_HINT = "self-update paused: launchd timers stalled; a reboot resumes it"
 # The only KeepAlive agents kicked: the fleet runner lanes.
 KEEPALIVE_KICK = ("tart-runner-macos-fleet",)
 STALL_FACTOR = 2
@@ -93,7 +89,8 @@ PASS_BUDGET_S = 40.0
 # A receipt this old means no supervisor on the host is running the guard.
 RECEIPT_STALE_S = 10 * 60
 STALL_HINT = ("macOS launchd stopped starting timer jobs, likely a stalled automatic "
-              "macOS install; the supervisor is starting them; a reboot clears it")
+              "macOS install; the supervisor is starting them, self-update included, so "
+              "nothing needs doing; the next reboot clears it")
 
 Run = Callable[[List[str], float], Tuple[int, str, str]]
 
@@ -196,7 +193,6 @@ class Guard:
         self.event_log = event_log
         self.runner = runner
         self.owner_pid = owner_pid if owner_pid is not None else os.getpid()
-        self._deferred: List[Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], float]] = []
         self.participation_file = participation_file or (
             pathlib.Path.home() / ".config" / "tartci" / "native-build-participation")
         self.disabled: Optional[set] = None
@@ -253,7 +249,6 @@ class Guard:
         stalled: List[Dict[str, Any]] = []
         kicked: List[Dict[str, Any]] = []
         errors: List[str] = []
-        self._deferred = []
         checked = 0
         # Enablement is read once per pass; None (unreadable) kicks no lane.
         rc, out, _ = self.run(["launchctl", "print-disabled", self.domain], CALL_TIMEOUT_S)
@@ -290,19 +285,13 @@ class Guard:
                        "labels": current.get("labels", []) if isinstance(current, dict) else []}
             if isinstance(current, dict):
                 episode["started_ts"] = current.get("started_ts")
-        # Decided after the episode, so a pass that opens one never kicks.
-        paused: List[Dict[str, Any]] = []
-        for agent, obs, mem, since in self._deferred:
-            if episode.get("active"):
-                paused.append({"label": agent["label"], "interval": agent["interval"],
-                               "seconds_since_progress": int(since)})
-            else:
-                self._kick_interval(agent, obs, mem, now, since, kicked, errors)
         self._write(self.state_path, state)
+        # `paused` stays in the receipt, always empty, for readers on older
+        # generations (peer_stall_alert on a peer, doctor) that still read it.
         receipt = {
             "ts": now, "owner_pid": self.owner_pid, "runner": self.runner,
             "agents_checked": checked, "stalled": stalled, "kicked": kicked,
-            "errors": errors, "episode": episode, "paused": paused,
+            "errors": errors, "episode": episode, "paused": [],
         }
         self._write(self.receipt_path, receipt)
         return receipt
@@ -350,9 +339,6 @@ class Guard:
         since = now - float(mem.get("progress_ts", now))
         if obs["running"] or since < limit:
             return
-        if any(part in label for part in PAUSE_DURING_STALL):
-            self._deferred.append((agent, obs, mem, since))
-            return
         self._kick_interval(agent, obs, mem, now, since, kicked, errors)
 
     def _kick_interval(self, agent: Dict[str, Any], obs: Dict[str, Any],
@@ -392,8 +378,7 @@ class Guard:
                    memory: Dict[str, Any], now: float, kicked: List[Dict[str, Any]],
                    errors: List[str]) -> None:
         label = agent["label"]
-        if not any(part in label for part in KEEPALIVE_KICK) \
-                or any(part in label for part in PAUSE_DURING_STALL):
+        if not any(part in label for part in KEEPALIVE_KICK):
             return
         mem = memory.get(label)
         if not isinstance(mem, dict):
@@ -590,8 +575,7 @@ def describe(value: Dict[str, Any]) -> str:
         age = "" if not isinstance(since, (int, float)) else \
             f" for {(time.time() - since) / 3600:.1f}h"
         return (f"launchd timers: STALLED{age}, {len(labels)} agents not started by "
-                f"launchd ({', '.join(labels)}); {STALL_HINT}"
-                + (f"; {PAUSED_HINT}" if value.get("paused") else ""))
+                f"launchd ({', '.join(labels)}); {STALL_HINT}")
     kicked = value.get("kicked") or []
     tail = f", kicked {len(kicked)} this pass" if kicked else ""
     return (f"launchd timers: ok ({value.get('agents_checked')} fleet agents checked "
