@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -137,7 +138,11 @@ def unreachable_concurrency(profile: Dict[str, Any], host: Dict[str, Any]) -> Li
     last macOS slot is held to the lease capacity instead (leases.py, "VM slot
     lending"), and that is the budget used here.
     """
-    lending = bool((profile.get("leases") or {}).get("vm_slot_lending"))
+    lending = bool(host.get("vm_slot_lending",
+                           (profile.get("leases") or {}).get("vm_slot_lending")))
+    raw_lending = os.environ.get("TARTCI_VM_SLOT_LENDING")
+    if raw_lending in ("0", "1"):
+        lending = raw_lending == "1"
     per_job = int(host.get("per_compile_job_mem_mb") or PER_JOB_MEM_MB)
     cores_key, mem_key = (("lease_capacity_cores", "lease_capacity_mem_mb") if lending
                           else ("non_gate_capacity_cores", "non_gate_capacity_mem_mb"))
