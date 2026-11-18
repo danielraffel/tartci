@@ -91,6 +91,9 @@ class FakeSystem(su.System):
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
         self.peer_status_errors: dict[str, str] = {}
+        # handoff kicks: (ssh target, remote command, state of this host's active.json then)
+        self.kicks: list[tuple[str, str, bool]] = []
+        self.kick_rc: dict[str, int] = {}
         # A peer's launchd watchdog store-health.json, keyed by SSH target.
         # Absent: a healthy reading taken just now. None: no file. An int: ssh exit code.
         self.peer_store: dict[str, object] = {}
@@ -376,6 +379,12 @@ class FakeSystem(su.System):
                     return su.Result(255, "", self.peer_status_errors[peer])
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
+            if "launchctl kickstart" in a[-1]:
+                active = (self.home / ".tartci" / "state" / "self-update" / "active.json").exists()
+                self.kicks.append((peer, a[-1], active))
+                rc = self.kick_rc.get(peer, 0)
+                return su.Result(rc, "kicked\n" if rc == 0 else "",
+                                 "" if rc == 0 else "Connection timed out")
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
             ticket = self.peer_waiting.get(peer)
@@ -1372,6 +1381,56 @@ class OneAtATimeTests(Base):
     def test_stagger_is_stable_and_bounded(self) -> None:
         self.assertEqual(su.stagger_seconds("m5"), su.stagger_seconds("m5"))
         self.assertTrue(0 <= su.stagger_seconds("studio") < 600)
+
+
+class HandoffKickTests(Base):
+    """After a succeeded turn, queued peers start their next attempt now
+    instead of at their next 30 min tick."""
+
+    def test_a_succeeded_turn_kicks_every_peer_after_its_marker_is_gone(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual(sorted(peer for peer, _, _ in self.sys.kicks), ["m3", "m5"])
+        self.assertFalse(any(active for _, _, active in self.sys.kicks),
+                         "a peer kicked while this host's marker is live would just defer")
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(receipt["status"], "succeeded")
+        self.assertIn("handoff-kick", [step["step"] for step in receipt["steps"]])
+
+    def test_the_kick_is_plain_kickstart_gated_on_a_queued_place(self) -> None:
+        self.assertUpdated(self.apply())
+        command = self.sys.kicks[0][1]
+        self.assertIn('launchctl kickstart "gui/$(id -u)/com.danielraffel.tartci.self-update"',
+                      command)
+        self.assertNotIn("kickstart -k", command, "-k would SIGTERM a peer mid-update")
+        self.assertIn('test -s "$d/waiting.json"', command)
+        self.assertIn('test -s "$d/waiting-aside.json"', command)
+
+    def test_a_failed_kick_does_not_change_the_result(self) -> None:
+        self.sys.kick_rc["m5"] = 255
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(receipt["status"], "succeeded")
+        detail = next(s["detail"] for s in receipt["steps"] if s["step"] == "handoff-kick")
+        self.assertIn("m5: kick failed (exit 255)", detail)
+        self.assertIn("studio: kicked", detail)
+
+    def test_no_kick_on_a_deferred_refused_or_planned_run(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.floor = {"allowed": True, "reason": "", "findings": []}
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        self.assertEqual(self.sys.kicks, [])
+
+    def test_no_kick_after_a_rolled_back_turn(self) -> None:
+        # A failed canary never speeds up the rest of the fleet.
+        self.sys.broken_target = True
+        rc = self.apply()
+        self.assertNotEqual(rc, su.EXIT_OK)
+        self.assertIn(self.last()["status"], ("rolled_back", "failed"))
+        self.assertEqual(self.sys.kicks, [])
 
 
 class FloorTests(Base):

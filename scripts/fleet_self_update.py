@@ -3619,6 +3619,46 @@ def rollback_target_error(cfg: Config, sys_: System, helper: dict, app: Path, pr
     return None
 
 
+SELF_UPDATE_LABEL = "com.danielraffel.tartci.self-update"
+HANDOFF_KICK_TIMEOUT = 30
+# Run on each peer after this host's turn succeeded: start that peer's
+# scheduled self-update now when it has a place in the queue (published or
+# kept aside), instead of at its next StartInterval tick, up to 30 min later.
+# Plain `kickstart` is a no-op on a job that is already running; `-k` would
+# SIGTERM a peer mid-drain or mid-install and is never used. The peer's plist
+# has not changed, so the cached-spec rule in launchd/README.md (bootout +
+# bootstrap after a plist edit) does not apply.
+HANDOFF_KICK_COMMAND = (
+    'd="${TARTCI_HOME:-$HOME/.tartci}/state/self-update"; '
+    'if test -s "$d/waiting.json" || test -s "$d/' + STEPPED_ASIDE_NAME + '"; then '
+    'launchctl kickstart "gui/$(id -u)/' + SELF_UPDATE_LABEL + '" && echo kicked; '
+    'else echo "nothing queued"; fi')
+
+
+def kick_waiting_peers(cfg: Config, sys_: System, me: str, receipt: Receipt) -> None:
+    """After a succeeded turn: start every queued peer's next attempt now.
+
+    Best effort and once per turn. It never changes this run's result, and
+    it runs only after a real success with this host's update marker gone,
+    so a failed canary never speeds up the rest of the fleet. The peers still
+    take turns through the queue and announce protocol as on any tick.
+    """
+    outcomes = []
+    for peer, target in sorted(published_peers(cfg, sys_).items()):
+        if peer == me:
+            continue
+        ssh = peer_ssh(target)
+        if ssh is None:
+            outcomes.append(f"{peer}: {refused_destination(peer, target)}")
+            continue
+        result = sys_.run([*ssh, HANDOFF_KICK_COMMAND], timeout=HANDOFF_KICK_TIMEOUT)
+        said = (result.out or "").strip().splitlines()
+        outcomes.append(f"{peer}: " + (said[-1] if result.rc == 0 and said else
+                                       f"kick failed (exit {result.rc}): {result.text[:120]}"))
+    receipt.step("handoff-kick", "; ".join(outcomes) or "no peers")
+    _write_json(receipt.path, receipt.value)
+
+
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   explicit: bool = False, scheduled: bool = False,
                   reinstall: bool = False) -> int:
@@ -4067,6 +4107,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
+            try:
+                kick_waiting_peers(cfg, sys_, me, receipt)
+            except Exception as exc:  # noqa: BLE001 - best effort; the turn already succeeded
+                print(f"self-update: handoff-kick skipped: {type(exc).__name__}: {exc}")
         return rc
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)

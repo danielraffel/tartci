@@ -2953,6 +2953,15 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A finished turn starts the next one.** After a self-update succeeds and
+  its update marker is gone, the host runs a plain `launchctl kickstart` of
+  `com.danielraffel.tartci.self-update` on each peer over SSH, only when that
+  peer has a place in the queue (`waiting.json` or `waiting-aside.json`). The
+  next host attempts within its stagger (up to 10 min) instead of at its next
+  30 min tick. Plain `kickstart` does nothing to a job already running; `-k`
+  is never used. A kick is best effort, recorded as the receipt's
+  `handoff-kick` step, and never sent after a failed, rolled-back, refused or
+  deferred run, so a failed canary does not speed up the rest of the fleet.
 - **A host the capacity floor refuses steps aside.** The floor is read
   before a host defers. When it refuses (the host is the last server of a
   required label and no peer can mint it on demand), the host cannot take a
