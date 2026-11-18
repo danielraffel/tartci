@@ -797,6 +797,10 @@ class SeedTests(Base):
                 "golden_config_sha256": "a" * 64, "compiler": "Apple clang version 17.0.0"}
 
     def setUp(self) -> None:
+        # Before any fixture: a skip from setUp never reaches tearDown.
+        bsd_tar = bsd_tar_path()
+        if bsd_tar is None:
+            self.skipTest("the peer pull script needs BSD tar; no bsdtar here")
         super().setUp()
         # Outside Base's "ccache-layer-*" temp dir: the guard refuses any root
         # with a component starting "ccache".
@@ -811,9 +815,6 @@ class SeedTests(Base):
         # macOS hosts, so the script uses BSD tar flags (--no-mac-metadata,
         # -s); where the local tar is GNU tar (the Linux CI runner), put
         # bsdtar first on the script's PATH as "tar", or skip without one.
-        bsd_tar = bsd_tar_path()
-        if bsd_tar is None:
-            self.skipTest("the peer pull script needs BSD tar; no bsdtar here")
         shim = self.tmp / "peer-bin"
         shim.mkdir()
         (shim / "tar").symlink_to(bsd_tar)
