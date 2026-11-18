@@ -5174,6 +5174,8 @@ Each step copies, verifies, renames the old directory aside and symlinks; the
 `*.pre-external` directories are what you delete later to actually free space.
 
     X=/Volumes/Example   # the host's external volume
+    # An unmounted X would be created on the internal disk and the caches copied onto it.
+    mount | grep -q " on $X (" || { echo "$X is not a mounted volume"; exit 1; }
     move() {  # move SRC DEST
       src="$1"; dest="$2"
       [ -d "$src" ] && [ ! -L "$src" ] || { echo "skip $src"; return 0; }

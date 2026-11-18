@@ -297,6 +297,37 @@ class ProfileSettingTests(unittest.TestCase):
             self.assertIsNone(host_profile.external_root_setting(str(Path(td) / "missing.toml")))
 
 
+class AuditStatusTests(unittest.TestCase):
+    def verdict(self, **kw):
+        base = {"external_root": EXT_ROOT, "internal_device_known": True,
+                "internal_device_errors": [], "judged": [], "violations": [], "unread": []}
+        base.update(kw)
+        return base
+
+    def run_check(self, verdict):
+        import contextlib, io
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(eop, "judge", return_value=verdict), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = eop._main(["check", "--external-root", EXT_ROOT])
+        return code, out.getvalue()
+
+    def test_a_clean_audit_is_ok(self) -> None:
+        code, out = self.run_check(self.verdict())
+        self.assertEqual(code, 0)
+        self.assertIn("ok:", out)
+
+    def test_an_unreadable_probe_is_not_reported_as_ok(self) -> None:
+        code, out = self.run_check(self.verdict(unread=[{"label": "x", "path": "/p", "error": "EPERM"}]))
+        self.assertEqual(code, 2)
+        self.assertNotIn("ok:", out)
+
+    def test_an_unknown_internal_device_is_not_reported_as_ok(self) -> None:
+        code, out = self.run_check(self.verdict(internal_device_known=False))
+        self.assertEqual(code, 2)
+        self.assertNotIn("ok:", out)
+
+
 class CliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

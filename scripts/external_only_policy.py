@@ -372,13 +372,20 @@ def _main(argv: Optional[List[str]] = None) -> int:
         print(unread_message(verdict["internal_device_errors"] + verdict["unread"], root,
                              mode="report", internal_unknown=not verdict["internal_device_known"]),
               file=sys.stderr)
+    incomplete = bool(not verdict["internal_device_known"] or verdict["internal_device_errors"]
+                      or verdict["unread"])
     if args.json:
         print(json.dumps(verdict, indent=2, sort_keys=True))
     elif verdict["violations"]:
         print(refusal_message(verdict["violations"], root))
+    elif incomplete:
+        print("incomplete: some paths could not be read, so this is not proof that "
+              "none are on the internal volume")
     else:
         print(f"ok: {len(verdict['judged'])} paths checked, none on the internal volume")
-    return 1 if verdict["violations"] else 0
+    if verdict["violations"]:
+        return 1
+    return 2 if incomplete else 0
 
 
 if __name__ == "__main__":
