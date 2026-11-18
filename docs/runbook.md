@@ -572,6 +572,22 @@ all is `unavailable`, never "no alert". Then:
   Allow`, opened when the alert is up and either a store open waits on it or
   the alert followed a Shipyard install, and closed when the alert is gone
   (`TARTCI_TCC_PROMPT_ISSUE=0` keeps the WARN line and opens no issue);
+- only the owner can click Allow, so the same pass, after the fallback heal
+  (and not on the pass a heal ran and dropped the alert), also tells him once
+  per alert episode on the fleet Discord channel ("Click
+  Allow on <host>", with the issue link, or the issue title if the issue is
+  not open yet), through the webhook file fleet-health and fleet-liveness use
+  (`~/.config/pulp/secrets/fleet/discord-machine-room.webhook`). The host is
+  the only sender. The send is recorded in
+  `~/.tartci/state/tcc-prompt-notify.json` only once it succeeds, so a failed
+  post is retried on the next pass; a post that reached Discord but timed out
+  is sent again (at least once, not exactly once). The WARN line says
+  `owner told`, or `owner NOT told: <why>` until a send succeeds. Nothing on
+  this path touches /Volumes (the store volume a prompt wedge hangs): the
+  webhook file, the receipt, the watchdog's program, generation and log all
+  live under the home directory. `TARTCI_OWNER_NOTIFY=0`
+  turns it off. On 2026-11-18 the issue alone (tartci #960) waited about 4 h
+  for a click;
 - the consent-alert pass owns the fallback heal: once a store open has waited
   on the alert for `PROMPT_HEAL_AFTER_S` (15 min) it runs the same scoped heal
   once per alert episode, sharing the store-health heal record as one budget
@@ -588,7 +604,10 @@ it. Nothing in tartci answers, dismisses or changes a privacy decision.
 
 The heal is one scoped root action and nothing broader:
 `sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs
-exactly `/usr/bin/killall tccd sandboxd` (launchd relaunches both on demand),
+exactly `/usr/bin/killall -KILL tccd`, then `/usr/bin/killall -KILL sandboxd` when
+sandboxd is running (launchd relaunches both on demand; SIGKILL because both
+daemons defer SIGTERM until idle, and a wedged tccd never is; an absent sandboxd
+does not fail the heal),
 takes no arguments (its sudoers grant has an empty argument spec, so sudo
 refuses any), runs at most once per 30 minutes (stamp in the root-only
 `/var/db/tartci-heal-tcc`, plus tartci's own `last_heal` record) and at most
@@ -601,8 +620,19 @@ and records the result; a store that answers again is `action: tcc-healed`.
 re-reads the PIDs of tccd and sandboxd about 5 s later: if they are all the same
 processes the outcome is `heal ineffective` (event `tcc_heal_ineffective` and a
 `WARN tcc-heal ineffective` line), the page continues, and nothing stronger is
-tried. A stronger signal or a wider root helper is the owner's decision.
-It is installed by hand, once per host:
+tried. A wider root helper is the owner's decision. An `ineffective` heal
+whose installed wrapper's sha256 is a known old SIGTERM version also records
+`stale_wrapper`: the live copy in `/usr/local/sbin` predates the SIGKILL change.
+A wrapper whose hash is in neither list (a local edit) records
+`unknown_wrapper`, a notice with the same install command, never a problem. A
+repo change reaches a host only when the installer below is re-run there, and
+the new file's sha256 replaces the old one in `WRAPPER_CURRENT_SHA256`
+(scripts/tcc_wedge.py) in the same change; a test fails until it does.
+Merging a wrapper change changes nothing on a host until
+`sudo fleet/ops/install-tartci-heal-tcc.sh --apply` runs there; `tartci doctor
+fleet` reports `heal_wrapper_stale` (known old version) or the notice
+`heal_wrapper_unknown` until it does. It is installed by hand, once
+per host, and again after each wrapper change:
 
 ```sh
 fleet/ops/install-tartci-heal-tcc.sh             # plan
@@ -2564,11 +2594,15 @@ alert, so its peers raise it.
   issue.
 - **Shipyard drift.** The same read prints the peer's
   `~/.tartci/state/tool-freshness/state.json`. A peer more than one Shipyard
-  release (`TARTCI_SHIPYARD_DRIFT_RELEASES`, 1) or more than 6 h
-  (`TARTCI_SHIPYARD_DRIFT_HOURS`, 6, counted on the peer's clock from the
-  first release newer than what it runs) behind the latest release opens
-  `[tartci] <peer> Shipyard behind the latest release since <that time>`. So
-  does a peer whose freshness was last measured more than 6 h ago, since a
+  release (`TARTCI_SHIPYARD_DRIFT_RELEASES`, 1) or more than 3 h
+  (`TARTCI_SHIPYARD_DRIFT_HOURS`, 3, counted on the peer's clock from the
+  pass at which the peer first saw the first release newer than what it runs
+  published, `behind_published_since`; a peer on an older TartCI reports only
+  the tag time, `behind_since`) behind the latest release opens
+  `[tartci] <peer> Shipyard behind the latest release since <that time>`. A
+  Shipyard tag sits in draft until its macOS assets are uploaded, and that
+  window is not rollout time. So
+  does a peer whose freshness was last measured more than 3 h ago, since a
   host whose watchdog stopped cannot report itself. The body quotes the
   peer's own apply line (`waiting for steward host studio: ...`), so it names
   the gate that holds it. It closes when a fresh reading says `current`, and
@@ -2583,7 +2617,15 @@ alert, so its peers raise it.
   is `ssh <peer> 'tartci launchd heal'`. A fresh sample closes the episode.
   This check is deliberately peer-driven because a watchdog cannot report its
   own StartInterval stall. Its receipt is recorded beside the existing peer
-  alert state as `<peer>.host-vitals.json`.
+  alert state as `<peer>.host-vitals.json`. The issue links any open
+  privacy-prompt or store-stall issue for the same host, and gets a comment
+  when that set changes later (`<peer>.host-vitals-links.json`; a failed issue
+  read changes nothing); with a privacy prompt open it names that as the
+  likely cause. Readers never message the owner: the stalled host's own
+  prompt pass is the one sender, so a wedge is announced once. A reader can
+  only see a prompt issue the host opened, in the same pass that sends the
+  message; the one gap is a host whose first post failed and that then stopped
+  running its watchdog before a retry.
 
 ### System resolver dead while TCP is alive (`resolver_dead`)
 
@@ -2888,7 +2930,11 @@ fleet`), and check GitHub's job history against it with
   overcommitted pair is printed as `gate_reserve_overcommitted lane=...
   axis=... demand=... reserve=...` on every update, and `tartci pool status`
   and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
-  the installed profile. The update is refused only when the target profile's
+  the installed profile.
+  The same check also refuses a non-gate lane (for example Vellum) whose
+  `supervisors x` VM cores exceed the non-gate lease budget (`lane_concurrency_unreachable`,
+  `scripts/gate_reserve_fit.py`): its slots could never run together, whatever the load.
+  A host with `vm_slot_lending` is held to its lease capacity instead. The update is refused only when the target profile's
   overcommit on some (lane, axis) is strictly greater than the installed
   profile's, both against the same live reserve (`gate_reserve_worse`). This is
   a ratchet because a host whose installed profile overcommits (m1: 2 x 3
@@ -2953,6 +2999,19 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A finished turn starts the next one.** After a self-update succeeds and
+  its update marker is gone, the host runs a plain `launchctl kickstart` of
+  `com.danielraffel.tartci.self-update` on each peer over SSH, only when that
+  peer has a queue ticket file (`waiting.json` or `waiting-aside.json`). The
+  next host attempts within its stagger (up to 10 min) instead of at its next
+  30 min tick. Plain `kickstart` does nothing to a job already running; `-k`
+  is never used. A kick is best effort, recorded as the receipt's
+  `handoff-kick` step, and never sent after a failed, rolled-back, refused or
+  deferred run, so a failed canary does not speed up the rest of the fleet.
+  A kick is a demand start, which launchd still honours during a timer
+  stall, so a scheduled self-update now refuses by itself while the interval
+  guard holds it for a stall (`self-update PAUSED by the launchd timer
+  stall`). A run started by hand without `--scheduled` is not held.
 - **A host the capacity floor refuses steps aside.** The floor is read
   before a host defers. When it refuses (the host is the last server of a
   required label and no peer can mint it on demand), the host cannot take a
@@ -2968,8 +3027,13 @@ fleet`), and check GitHub's job history against it with
   floor refusal does. A host that cannot read the whole fleet cannot take a
   turn, so it must not hold one. Each peer still refuses on its own reads, so
   this never lets two hosts go out at once. The starvation bound runs on the
-  kept place as on a published ticket: the event, the issue and exit 3, and
-  `pool status` says `STARVED, stepped aside`. On 2026-11-18 only m1's route to
+  kept place as on a published ticket, also when the capacity floor refuses
+  the same host: the event, the issue and exit 3, and `pool status` says
+  `STARVED, stepped aside`. A peer already excluded as dark does not count as
+  unread. When a peer is dark to every host, every host steps aside and no
+  ticket is published, so the first host to run after the exclusion goes,
+  whatever its place. That costs one turn per episode: the others defer on
+  its update marker, publish their kept places, and take turns in order. On 2026-11-18 only m1's route to
   m5studio was dark; m1 held the oldest ticket for 3.5 h while m5 and m3,
   which read every peer, yielded to it at every attempt and no host updated.
 - **A host drains only while its gate queue is light.** Once the peers and
@@ -3201,7 +3265,8 @@ fleet`), and check GitHub's job history against it with
   with an exit code; only a slow volume reaches the deadline, and the error
   says so.
 - **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
-  every 30 min, `--apply --scheduled` with a per-host stagger, ExitTimeOut 120)
+  every 30 min, `--apply --scheduled` with a per-host stagger of at most 2 min,
+  ExitTimeOut 120)
   is not installed by default: `scripts/install_self_update_agent.sh` prints
   the plan and the resolved peers, and `--install` loads it.
 
@@ -3258,7 +3323,14 @@ arrive, and a host that did not get it is loud:
   prints fseventsd from the host-vitals sensor's published reading
   (`~/.local/state/pulp/host_vitals.json`), warning above 1024 MB; the remedy is
   `sudo killall fseventsd`, which nothing here runs.
-- **When it refreshes.** Every watchdog pass, at most every 30 minutes;
+- **When it refreshes.** Every watchdog pass, at most every 30 minutes, and
+  on every 5-minute watchdog pass (an interval of 240 s, under the pass
+  interval, so no pass is skipped) while a release is in motion on the host:
+  a tool `waiting` for its apply age, the canary, a steward host or a steward
+  verdict, a release not ready yet, or a steward verdict pending in
+  `steward.json`. Each host then acts on its gate within one 5-minute pass
+  instead of up to 30 minutes per hop. A hold, a
+  spent attempt or a rejected release keeps the 30-minute interval;
   `tartci fleet-macos tool-freshness --refresh` measures now.
 - **Cached lines carry an age limit.** Every status line read from a cached
   measurement is flagged once it is older than three of its refresher's
@@ -3315,14 +3387,23 @@ arrive, and a host that did not get it is loud:
 
 - **One host goes first (canary gate).** Both automatic applies follow the
   rollout roles in `fleet/tool-rollout.json`, published into
-  `fleet/advertised-labels.json` as `tool_rollout` (`canary`, default `m5`, the
-  least loaded build host; `steward_hosts`, the hosts that run the merge
+  `fleet/advertised-labels.json` as `tool_rollout` (`canary`, `m5studio`: always on,
+  and the Mac whose release script can install a Shipyard release at
+  publication (its fleet stage covers only its own host class); the m5 laptop
+  was the canary until 2026-11-18, and every host waited while it slept; `steward_hosts`, the hosts that run the merge
   steward, `studio`). Every host reads the same committed copy, so no two can
   name different canaries; the generator refuses a role that is not a
   published host and an empty `steward_hosts` (which would drop the steward
   stage fleet-wide), and `tool-freshness.toml` cannot set either. A missing or
   unreadable role list fails closed: no host applies. To move the canary,
   edit `fleet/tool-rollout.json`, regenerate the published file and merge.
+  List the old canary in `former_canaries` there until every host runs a
+  TartCI generation that names the new one: a former canary still applies
+  first, so a host on the older generation, which waits for it, is never left
+  waiting on a host that in turn waits for it. Readers wait only for
+  `canary`. A former canary does not wait for the new one, so while it is
+  listed, pausing the rollout means holding both. Remove the entry once `tartci fleet-macos self-update --plan`
+  reports every host current.
   The canary applies a release at 30 minutes, as above. Every other host
   applies it only once the canary's `events.jsonl` shows a `tool_deployed` for
   the tool's CLI with `to` equal to the release and `verify` current or behind,
@@ -3331,16 +3412,32 @@ arrive, and a host that did not get it is loud:
   away from it), and a health signal: when the canary runs the merge steward
   (its deploy event carries `steward_host: true`), a `tool_steward_verified`
   for the release recorded after that deploy; otherwise `canary_soak_hours`
-  (2) on the canary's clock since the deploy. A deploy first recorded with
+  on the canary's clock since the deploy: 0.5 for Shipyard, whose steward
+  stage below is the real health check, and 2 for pulp. A deploy first recorded with
   another `verify` (the re-read right after the swap failed) is re-recorded
   (`rerecorded: true`) on the canary's next pass that measures it, so one
   failed read does not strand the fleet.
   For Shipyard there is a second stage: a host that is neither the canary nor
   a steward host also waits for every steward host to have deployed the
   release and recorded `tool_steward_verified` for it, whatever its deploy
-  event says. With the defaults the order is m5, then m3 (after m5's 2 h),
-  then m1 and m5s (after m3's clean tick), so a release that breaks the
-  steward stops on m3. pulp does not wait for the steward hosts.
+  event says. With the defaults the order is m5s, then m3 (30 minutes after
+  m5s's deploy), then m1 (after m3's clean tick), so a release that breaks the
+  steward stops on m3. m5 follows m3 like m1 once it is no longer listed in
+  `former_canaries`; while it is listed it applies first with m5s, and a
+  former canary's deploy also clears the canary step for the hosts behind it
+  (a new canary still on the older TartCI waits for m5 and for m3, so m3 must
+  not wait for the new canary alone). Every host is on a Shipyard release
+  within about 1 h 45 min of publication: the canary sees it on its next pass
+  (up to 30 minutes, or at publication when the release script installed it
+  there), soaks 30 minutes, m3 applies on its next 5-minute pass, the next
+  complete steward tick judges it (10 to 15 minutes with the pass that reads
+  it), and m1 then applies on its next pass. The drift alert below fires at
+  3 h, counted from publication.
+  To pause the whole rollout, hold the canary (`[tools.shipyard] auto_apply =
+  false` in m5s's `tool-freshness.toml`, and in m5's while m5 is listed in
+  `former_canaries`): every host waits behind it. A bad
+  release that reached m3 is rolled back there automatically; to roll back a
+  host by hand, run its `shipyard runner fleet-update --to <previous release>`. pulp does not wait for the steward hosts.
   Of the soaked releases a host applies the newest one every host it waits
   for cleared. Those hosts are read over fleet ssh (`ssh -n -o BatchMode=yes
   <target> tail events.jsonl`, once per pass each); the target is the host's
@@ -3348,7 +3445,7 @@ arrive, and a host that did not get it is loud:
   fails closed: an unreadable host or an unsafe target waits, and a host that
   cannot name itself (no fleet profile `host.id` and no `host_class`) waits
   without reading anyone, since it cannot tell whether it is the canary or a
-  steward host. None of them applies. The wait reads `waiting for canary m5: ...` (or `steward host
+  steward host. None of them applies. The wait reads `waiting for canary m5studio: ...` (or `steward host
   studio`) on the tool's line, is appended to the stale problem once the tool
   goes STALE, and every waiting pass writes exactly one line to
   `~/.tartci/state/tool-freshness/canary-gate.log`. There is no urgent-release
@@ -3357,7 +3454,7 @@ arrive, and a host that did not get it is loud:
   host that is held, retired or down stalls the automatic applies behind it,
   and says so on every host.
 
-      # tool-freshness.toml
+      # tool-freshness.toml (overrides every tool's own soak on this host)
       # canary_soak_hours = 2
 
 - **The steward judges each Shipyard swap where it runs.** On a published
@@ -3505,6 +3602,73 @@ arrive, and a host that did not get it is loud:
    only to override a target.
 3. On the new machine: install, then `tartci fleet-macos self-update --peers`
    to see every peer it will check and the target it resolves to.
+
+### Runner agent age in the goldens (`tartci doctor runner-age`)
+
+Every job VM is cloned from a golden that carries the GitHub Actions runner
+agent at `~/actions-runner`. GitHub retires old runner versions; a retired
+agent registers, prints `Runner version vX is deprecated and cannot receive
+messages` and exits, so every clone of a golden that carries it fails the same
+way. A Linux pool stopped for 13 days this way with nothing alerting.
+
+- **What it reports.** Per golden on this host (`pulp-build-runner`,
+  `pulp-linux-build`), the runner its VMs run and a verdict. `fail`: a runner
+  log shows GitHub refusing that version (`Runner version vX is deprecated and
+  cannot receive messages`). The watchdog pass remembers a refusal in
+  `~/.tartci/state/golden-runner/<golden>.refused.json`, so the alert stays
+  after the log ages out or the lane stops trying, and clears only when the
+  version changes. `warn`: the version
+  trails the latest `actions/runner` release by two minor versions or more.
+  `ok` otherwise. `unknown`: the version has no record, the latest release
+  could not be read, or the local Tart images could not be listed (then nothing
+  is judged, because the host may not hold the golden).
+- **One rule.** The lag verdict comes from `scripts/runner_version.py`, the rule
+  the macOS pin check already uses, so the two cannot disagree about how far
+  behind is too far. Refusals are read from every lane's recent runner logs,
+  including the fleet lanes' directories under `state/macos-fleet/`. There is no
+  date arithmetic: GitHub's actual retirement dates do not follow a fixed
+  number of days after a release, and the refusal line is the direct signal.
+- **Where the version comes from.** Nothing boots a golden to read it.
+  For `pulp-build-runner` it is the supervisor's pin
+  (`providers/tart-macos/runner.sh --print-runner-version`), because the macOS
+  lane installs that pin into every VM and the golden's own copy never runs.
+  For a Linux golden it is a record in
+  `~/.tartci/state/golden-runner/<golden>.json`. `providers/tart-linux/provision.sh`
+  writes one when the golden it provisions already carries a runner; it does
+  not install or update the runner.
+- **Where it shows.** `tartci doctor runner-age [--json]` (exit 1 on `fail`), a
+  section in bare `tartci doctor`, and the tool-freshness refresh the launchd
+  watchdog runs.
+- **What alerts.** Only `fail`, a live refusal. It joins the tool-freshness
+  problem, which reaches `tartci doctor fleet` as `tool_freshness_stale` and the
+  watchdog WARN. `warn` and `unknown` are doctor output and never a problem: a
+  lag warning would fire on every host whenever upstream ships two releases,
+  its text would change with each release, and it depends on a release lookup
+  that can be stale. The problem text names only the refused version.
+- **Setting** in `~/.config/tartci/tool-freshness.toml`:
+
+      [runner_age]
+      goldens = ["pulp-build-runner", "pulp-linux-build"]
+
+- **Runtime symptom.** The macOS supervisor backs off and records
+  `runner_version_deprecated` when a listener says it is retired. The Linux
+  supervisor also logs a named `runner_version_deprecated:` line for the same
+  output, whatever the runner's exit status.
+- **Remedy, macOS.** Bump `DEFAULT_RUNNER_VERSION` and its checksum in
+  `providers/tart-macos/runner.sh`.
+- **Remedy, Linux.** Boot the golden, replace `~/actions-runner` with the
+  current `actions-runner-linux-arm64` release (keep `.env` and `.path`), shut
+  it down, then record what it now carries:
+
+      python3 scripts/runner_age.py record --golden pulp-linux-build --version <version> --source operator
+      tartci fleet-macos tool-freshness --refresh
+
+  `~/actions-runner/bin/Runner.Listener --version` inside the golden prints the
+  version. The record is per host, so repeat it on every host that holds the
+  golden, including after a golden sync. Recording a version other than the
+  refused one clears the `fail`, unless a log written after the record still
+  shows a refusal; the refresh makes the watchdog's stored result catch up at
+  once.
 
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 

@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import hashlib
 import json
 import math
 import os
@@ -109,6 +110,23 @@ BUDGET_OUTCOMES = frozenset({"ran", "ineffective", "not_permitted", "timeout", "
 HEALED_PROCESSES = ("tccd", "sandboxd")
 HEAL_SETTLE_S = 5.0
 PGREP = "/usr/bin/pgrep"
+# The wrapper's one command vector since it sends SIGKILL (fleet/ops/tartci-heal-tcc).
+INSTALLER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "fleet", "ops", "install-tartci-heal-tcc.sh")
+# Installed-wrapper identity is a hash, not a reading of its source: a script
+# that decides what a root wrapper does by parsing shell can be fooled by any
+# quoting trick. Add the new hash here in the same change that edits
+# fleet/ops/tartci-heal-tcc (a test fails until you do). Replace the old
+# hash rather than adding to it, so a host still on the old copy is reported.
+WRAPPER_CURRENT_SHA256 = frozenset({
+    "657941360b74b612eb251cb4e88145fde85c5e62864a8435c79e011bb7bfc3e8",
+})
+# Versions that reached main and send SIGTERM, which tccd and sandboxd defer
+# until idle, so a heal through them cannot restart a wedged daemon.
+WRAPPER_STALE_SHA256 = frozenset({
+    "ded836e75858502c75d83ed06ab66582499f410ccad951493fcbe27dcce54da5",  # e40651e
+    "5f56cd2c96d8da689c241fc49fb49ae7b4f27f98087177b3b9b9f449dd932e7a",  # f2712f3
+})
 
 
 def _iso(epoch: float) -> str:
@@ -871,6 +889,33 @@ def unchanged_pids(before: dict[str, list[int]], after: dict[str, list[int]]) ->
     return all(before.get(name, []) == after.get(name, []) for name in HEALED_PROCESSES)
 
 
+def classify_wrapper(data: bytes, current: Optional[frozenset] = None,
+                     stale: Optional[frozenset] = None) -> str:
+    """`current` (a known-good version), `stale` (a known SIGTERM version) or
+    `unknown` (anything else, such as a local edit; never treated as broken),
+    by the sha256 of the bytes alone."""
+    current = WRAPPER_CURRENT_SHA256 if current is None else current
+    stale = WRAPPER_STALE_SHA256 if stale is None else stale
+    digest = hashlib.sha256(data).hexdigest()
+    if digest in current:
+        return "current"
+    if digest in stale:
+        return "stale"
+    return "unknown"
+
+
+def wrapper_state(wrapper: str, current: Optional[frozenset] = None,
+                  stale: Optional[frozenset] = None) -> str:
+    """classify_wrapper for the installed file (read only; it is 0755), or
+    `unreadable`: nothing is claimed about a file this cannot see."""
+    try:
+        with open(wrapper, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return "unreadable"
+    return classify_wrapper(data, current, stale)
+
+
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
          runner: Optional[Callable[[list, float], tuple]] = None,
          wrapper: Optional[str] = None, sudo: Optional[str] = None,
@@ -881,9 +926,11 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
     """Run the scoped root wrapper once. Never anything broader.
 
     `ran` means the wrapper exited 0 AND the daemons it restarts are different
-    processes a few seconds later. If every PID is unchanged the signal was
-    delivered and ignored (m3, 2026-11-16: tccd 10784 and 10970 and sandboxd
-    35552 survived a heal that returned 0), so the outcome is `ineffective`.
+    processes a few seconds later. If every PID is unchanged the outcome is
+    `ineffective`. A wrapper installed before it sent SIGKILL sent SIGTERM,
+    which both daemons defer until idle (m3, 2026-11-16 and 11-17: tccd 10784
+    and 10970 and sandboxd 35552 survived heals that returned 0); the record
+    names that stale wrapper and the reinstall step.
     """
     now = time.time() if now is None else now
     runner = run_privileged_bounded if runner is None else runner
@@ -930,6 +977,18 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
             record["detail"] = ("killall returned 0 but tccd/sandboxd are the same processes "
                                 f"{settle_s:g}s later (pids {before_pids}); the heal did not "
                                 "restart them")
+            state = wrapper_state(wrapper)
+            if state == "stale":
+                record["stale_wrapper"] = True
+                record["detail"] += (f"; {wrapper} does not send SIGKILL (an install from before "
+                                     "the SIGKILL change, whose SIGTERM the daemons defer): "
+                                     "reinstall it with sudo "
+                                     f"{INSTALLER} --apply")
+            elif state == "unknown":
+                record["unknown_wrapper"] = True
+                record["detail"] += (f"; {wrapper} is not a version this checkout knows "
+                                     "(a local edit or a newer install); to rule it out, "
+                                     f"reinstall: sudo {INSTALLER} --apply")
         else:
             record["outcome"] = "ran"
     elif rc == 75:

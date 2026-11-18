@@ -822,6 +822,133 @@ class ToolFreshnessTests(unittest.TestCase):
                 mock.patch.object(tf, "fetch_feed", side_effect=AssertionError("fetched")):
             self.assertEqual(len(tf.summary(self.home)["lines"]), 3)
 
+    def test_a_release_in_motion_refreshes_every_watchdog_pass(self) -> None:
+        # Four hosts in a row each waiting up to a 30-minute pass for its gate
+        # kept every Shipyard release more than 4 h from the last host.
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        self.feeds["danielraffel/Shipyard"] = feed(("v0.221.0", NOW - 30 * HOUR),
+                                                   ("v0.221.1", NOW - 10 * 60))
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertTrue(row["apply"].startswith("waiting"), row["apply"])
+        before = len(host.calls)
+        self.refresh(host, NOW + 120, if_older=1800)
+        self.assertEqual(len(host.calls), before, "inside the rollout interval: cached")
+        # The next watchdog pass, which can land a few seconds under 300 s after
+        # the cached measurement, must refresh rather than wait a second pass.
+        self.refresh(host, NOW + 295, if_older=1800)
+        self.assertGreater(len(host.calls), before, "a waiting release refreshes every pass")
+
+    def test_a_pending_steward_verdict_refreshes_every_watchdog_pass(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(host)
+        before = len(host.calls)
+        self.refresh(host, NOW + 310, if_older=1800)
+        self.assertEqual(len(host.calls), before, "current and nothing pending: 30 min")
+        state = tf.state_dir_for(self.home)
+        (state / "steward.json").write_text(json.dumps(
+            {"shipyard": {"version": "0.221.1", "deployed_at": tf._iso(NOW)}}))
+        self.refresh(host, NOW + 320, if_older=1800)
+        self.assertGreater(len(host.calls), before)
+        before = len(host.calls)
+        (state / "steward.json").write_text(json.dumps(
+            {"shipyard": {"version": "0.221.1", "gave_up": True}}))
+        self.refresh(host, NOW + 640, if_older=1800)
+        self.assertEqual(len(host.calls), before, "a rollback given up on is not motion")
+
+    def test_a_release_not_ready_yet_refreshes_every_watchdog_pass(self) -> None:
+        # The not-ready line reads "... not ready yet (...), waiting", which does
+        # not start with "waiting"; a failed download is still a rollout in motion.
+        cached = {"tools": {"shipyard": {
+            "state": "behind", "apply": "v0.221.1 not ready yet (download failed), waiting",
+            "not_ready": {"target": "v0.221.1", "since": "t", "hours": 0.1}}}}
+        self.assertTrue(tf.rollout_in_motion(cached, {}))
+
+    def test_drift_is_dated_from_the_pass_that_first_saw_the_release(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        # fleet-update fails here (no apply_installs), and a failed apply
+        # re-measures the tool: the first sighting must survive that.
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "current")
+        self.assertEqual(row["published_seen"], {})
+        # v0.221.2 was tagged 2 h ago (a long draft) and is first seen ready now.
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 20 * HOUR),
+            ("v0.221.2", NOW - 2 * HOUR))
+        later = NOW + 1900
+        row = self.refresh(host, later, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_since"], tf._iso(NOW - 2 * HOUR))
+        self.assertEqual(row["behind_published_since"], tf._iso(later))
+        # The first sighting is kept, not moved by later passes.
+        row = self.refresh(host, later + 1900, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], tf._iso(later))
+
+    def test_the_first_sighting_survives_its_release_leaving_the_feed(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        first = self.refresh(host)["tools"]["shipyard"]["behind_published_since"]
+        # The bounded feed rotates: v0.221.1 drops out, a newer release arrives.
+        self.feeds["danielraffel/Shipyard"] = feed(("v0.221.2", NOW + 1000))
+        row = self.refresh(host, NOW + 1900, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "behind")
+        self.assertEqual(row["behind_published_since"], first)
+
+    def test_the_first_sighting_survives_an_unreadable_pass(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(host)  # current: the map starts here
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.221.1", NOW - 20 * HOUR), ("v0.221.2", NOW - 2 * HOUR))
+        first = self.refresh(host, NOW + 1900, if_older=1800)["tools"]["shipyard"][
+            "behind_published_since"]
+        self.assertEqual(first, tf._iso(NOW + 1900))
+        feeds = self.feeds
+        self.feeds = {}  # every feed read fails: the row is unknown
+        row = self.refresh(host, NOW + 3800, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "unknown")
+        self.feeds = feeds
+        row = self.refresh(host, NOW + 5700, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], first)
+
+    def test_the_first_sighting_survives_a_failed_asset_probe(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(host)
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.221.1", NOW - 20 * HOUR), ("v0.221.2", NOW - 2 * HOUR))
+        first = self.refresh(host, NOW + 1900, if_older=1800)["tools"]["shipyard"][
+            "behind_published_since"]
+        # The probe misses v0.221.2 for a pass: the host reads current.
+        probe = lambda tool, releases: [r for r in releases if r[1] != "v0.221.2"]  # noqa: E731
+        with mock.patch.object(tf, "published_releases", probe):
+            row = tf.refresh(self.home, NOW + 3800, settings=settings(), run=host.run,
+                             feed=self.feed, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "current")
+        row = self.refresh(host, NOW + 5700, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], first)
+
+    def test_an_older_release_landing_keeps_the_fast_refresh(self) -> None:
+        # Two releases out, only the older one past the apply age: it lands, and
+        # the newer one is applied on a 5-minute pass, not 30 minutes later.
+        cached = {"tools": {"shipyard": {"state": "behind", "apply": "applied v0.221.1: ok"}}}
+        self.assertTrue(tf.rollout_in_motion(cached, {}))
+        failed = {"tools": {"shipyard": {"state": "behind",
+                                         "apply": "already attempted v0.221.1 at t: ok"}}}
+        self.assertFalse(tf.rollout_in_motion(failed, {}))
+
+    def test_a_row_without_the_map_falls_back_to_the_tag_time(self) -> None:
+        # The first pass after TartCI updates has no record of when the release
+        # was first seen: the tag time is the safe (earliest) answer.
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], tf._iso(NOW - 20 * HOUR))
+
+    def test_held_or_spent_releases_keep_the_normal_interval(self) -> None:
+        for apply in ("HELD: auto_apply = false in x until y",
+                      "already attempted v0.221.1 at t: FAILED",
+                      "not retrying v0.221.1 here: rejected"):
+            cached = {"tools": {"shipyard": {"state": "behind", "apply": apply}}}
+            self.assertFalse(tf.rollout_in_motion(cached, {}), apply)
+        self.assertTrue(tf.rollout_in_motion(
+            {"tools": {"shipyard": {"state": "behind", "apply": "waiting for canary m5studio"}}},
+            {}))
+
     def test_a_disabled_tool_is_neither_run_nor_reported(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.305.0"})
         tools = dict(tf.DEFAULT_TOOLS)

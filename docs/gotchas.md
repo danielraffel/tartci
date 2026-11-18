@@ -252,8 +252,8 @@ first; list it only when what it asserts really needs tomllib.
   the directory. → *Fix:* `scripts/tcc_wedge.py` names the cause past the
   failure threshold (internal control path answers + signature in the bounded
   log window + optional TCC-context probe) and the watchdog runs the one scoped
-  root action, `sudo -n /usr/local/sbin/tartci-heal-tcc` (`killall tccd
-  sandboxd`, once per 30 min), then reprobes. The lanes, the doctor
+  root action, `sudo -n /usr/local/sbin/tartci-heal-tcc` (SIGKILL tccd and
+  sandboxd, once per 30 min), then reprobes. The lanes, the doctor
   (`tcc_wedge_*`) and the fleet check name the cause and the heal outcome.
   → *Read:* `tartci doctor fleet`, `python3 scripts/tcc_wedge.py --state`.
   → *Do not:* widen the grant, kill tccd in a loop, or reboot before reading

@@ -108,6 +108,34 @@
       "summary": "Agents exec a generation path directly, so a staged generation reaches them.",
       "why": "This is the delivery shape in which install means what it appears to mean: the next generation replaces what execs."
     },
+    "heal_wrapper_current": {
+      "summary": "The installed tartci-heal-tcc wrapper matches this checkout.",
+      "why": "The root-owned copy in /usr/local/sbin is byte-identical to fleet/ops/tartci-heal-tcc."
+    },
+    "heal_wrapper_unknown": {
+      "summary": "The installed tartci-heal-tcc wrapper is not a version this checkout knows.",
+      "why": "Its sha256 is neither a current version nor a known SIGTERM one (a local edit or a newer install), so nothing says the heal is broken: a notice, not a problem.",
+      "remedy": "Reinstall when convenient: sudo fleet/ops/install-tartci-heal-tcc.sh --apply (an owner step).",
+      "do_not": "Do not treat this as a broken heal or page the owner for it."
+    },
+    "heal_wrapper_not_installed": {
+      "summary": "This host has no tartci-heal-tcc wrapper.",
+      "why": "/usr/local/sbin/tartci-heal-tcc does not exist, so the watchdog's TCC heal reports wrapper_missing.",
+      "remedy": "Only hosts with an external Tart store need it: sudo fleet/ops/install-tartci-heal-tcc.sh --apply.",
+      "do_not": "Do not add a broader sudo grant instead."
+    },
+    "heal_wrapper_stale": {
+      "summary": "The installed tartci-heal-tcc wrapper still sends SIGTERM, so a heal cannot restart tccd.",
+      "why": "The wrapper is a root-owned copy installed by hand, so a merged change reaches a host only when the installer is re-run there. A copy from before the SIGKILL change sends SIGTERM, which tccd defers while wedged, so every heal is ineffective.",
+      "remedy": "On this host, from a checkout at the deployed commit: sudo fleet/ops/install-tartci-heal-tcc.sh --apply (an owner step: it needs the owner's sudo password).",
+      "do_not": "Do not copy the file into /usr/local/sbin by hand or loosen its ownership: the installer checks the root-owned chain and validates the sudoers grant."
+    },
+    "heal_wrapper_unreadable": {
+      "summary": "The doctor could not read the installed or the repo heal wrapper.",
+      "why": "Reading /usr/local/sbin/tartci-heal-tcc or fleet/ops/tartci-heal-tcc failed; the detail names the error.",
+      "remedy": "Check the file modes (the installer leaves the wrapper root:wheel 0755).",
+      "do_not": "Do not read this as current."
+    },
     "hold_receipt_malformed": {
       "summary": "The held-idle receipt could not be read, or is not exactly held-idle.",
       "why": "The receipt is compared exactly. A near-miss is not a weaker yes, it is a no, and drain will refuse on it.",
@@ -605,9 +633,9 @@
       "do_not": "Do not read an old measurement as current; the line carries its measured time."
     },
     "tool_freshness_stale": {
-      "summary": "Shipyard or the pulp CLI has been behind its latest release for longer than the stale window, or its version or releases could not be read.",
-      "why": "An installed CLI can sit months behind its releases unnoticed, so every agent build and gate on the host runs without merged fixes.",
-      "remedy": "Read `tartci fleet-macos tool-freshness` and ~/.tartci/state/tool-freshness/events.jsonl; a line marked HELD is an `auto_apply = false` hold in ~/.config/tartci/tool-freshness.toml: remove it once its reason is gone (it also lifts by itself at `hold_until`, or `hold_max_hours` after `held_since`; an unreadable value keeps the hold and is reported until fixed). Otherwise update with `shipyard update --to <tag> --refresh-daemon` or the pulp release's install.sh, then `tartci fleet-macos tool-freshness --refresh`.",
+      "summary": "Shipyard or the pulp CLI has been behind its latest release for longer than the stale window, or its version or releases could not be read; or GitHub is refusing the Actions runner a golden's VMs run.",
+      "why": "An installed CLI can sit months behind its releases unnoticed, so every agent build and gate on the host runs without merged fixes. A runner version GitHub has retired stops every VM cloned from that golden from taking a job.",
+      "remedy": "Read `tartci fleet-macos tool-freshness` and ~/.tartci/state/tool-freshness/events.jsonl; a line marked HELD is an `auto_apply = false` hold in ~/.config/tartci/tool-freshness.toml: remove it once its reason is gone (it also lifts by itself at `hold_until`, or `hold_max_hours` after `held_since`; an unreadable value keeps the hold and is reported until fixed). Otherwise update with `shipyard update --to <tag> --refresh-daemon` or the pulp release's install.sh, then `tartci fleet-macos tool-freshness --refresh`. A `runner age` line means GitHub refused the Actions runner a golden's VMs run as deprecated: for `pulp-build-runner` bump `DEFAULT_RUNNER_VERSION` and its checksum in providers/tart-macos/runner.sh; for a Linux golden replace `~/actions-runner` inside the golden with the current release, then, from the tartci checkout on every host that holds that golden, run `python3 scripts/runner_age.py record --golden <name> --version <version> --source operator`. After either fix run `tartci fleet-macos tool-freshness --refresh`.",
       "do_not": "Do not install from a working copy's build directory; install the published release so every host runs the same bytes."
     },
     "tool_freshness_unmeasured": {

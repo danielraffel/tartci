@@ -7,6 +7,7 @@ removed must NOT classify, and must NOT invoke the wrapper.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -353,6 +354,81 @@ class HealTests(unittest.TestCase):
         self.assertIn("same processes", record["detail"])
         self.assertEqual(record["pids_after"], same)
         self.assertIn("ineffective", tw.BUDGET_OUTCOMES)
+        # The fixture wrapper is a local edit (neither list): a notice with the
+        # install command, never the stale-wrapper problem.
+        self.assertTrue(record.get("unknown_wrapper"))
+        self.assertNotIn("stale_wrapper", record)
+        self.assertIn(tw.INSTALLER + " --apply", record["detail"])
+        self.assertTrue(os.path.isabs(tw.INSTALLER))
+
+    def test_ineffective_heal_through_a_known_old_wrapper_is_stale(self) -> None:
+        self.wrapper.write_bytes(b"old sigterm wrapper\n")
+        digest = hashlib.sha256(b"old sigterm wrapper\n").hexdigest()
+        same = {"tccd": [10970], "sandboxd": [35552]}
+        with mock.patch.object(tw, "WRAPPER_STALE_SHA256", frozenset({digest})):
+            record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
+        self.assertEqual(record["outcome"], "ineffective")
+        self.assertTrue(record.get("stale_wrapper"))
+        self.assertNotIn("unknown_wrapper", record)
+        self.assertIn(tw.INSTALLER + " --apply", record["detail"])
+
+    def test_ineffective_heal_through_the_current_wrapper_is_not_called_stale(self) -> None:
+        self.wrapper.write_bytes((ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_bytes())
+        same = {"tccd": [10970], "sandboxd": [35552]}
+        record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
+        self.assertEqual(record["outcome"], "ineffective")
+        self.assertNotIn("stale_wrapper", record)
+        self.assertNotIn("unknown_wrapper", record)
+        self.assertNotIn("--apply", record["detail"])
+
+    def test_wrapper_state_is_decided_by_hash_alone(self) -> None:
+        repo = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_bytes()
+        cases = {
+            "the repo copy": (repo, "current"),
+            # Text that merely prints or comments the vectors is not the wrapper.
+            "repo copy plus a comment": (repo + b"# a comment\n", "unknown"),
+            "vectors only echoed": (b"#!/bin/bash\necho '\"$KILLALL\" -KILL tccd'\n"
+                                    b"/usr/bin/killall tccd sandboxd\n", "unknown"),
+            "empty": (b"", "unknown"),
+        }
+        for name, (content, want) in cases.items():
+            with self.subTest(name):
+                self.wrapper.write_bytes(content)
+                self.assertEqual(tw.wrapper_state(str(self.wrapper)), want)
+        # A hash in the stale set is stale; one in neither set is unknown.
+        self.wrapper.write_bytes(b"old sigterm wrapper\n")
+        digest = hashlib.sha256(b"old sigterm wrapper\n").hexdigest()
+        self.assertEqual(tw.wrapper_state(str(self.wrapper)), "unknown")
+        self.assertEqual(tw.wrapper_state(str(self.wrapper), stale=frozenset({digest})), "stale")
+        self.assertEqual(tw.wrapper_state(str(Path(self.wrapper).parent / "gone")), "unreadable")
+
+    def test_the_repo_wrapper_hash_is_listed_as_current(self) -> None:
+        # Fails after any edit to fleet/ops/tartci-heal-tcc until its new sha256
+        # is added to WRAPPER_CURRENT_SHA256.
+        digest = hashlib.sha256((ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_bytes()).hexdigest()
+        self.assertIn(digest, tw.WRAPPER_CURRENT_SHA256)
+        self.assertEqual(tw.wrapper_state(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")), "current")
+
+    def test_each_stale_hash_is_the_sigterm_wrapper_in_git_history(self) -> None:
+        # A typo in the list would otherwise quietly stop matching. The two
+        # commits are on main; skip only where the history is not available.
+        pins = {"e40651e": "ded836e75858502c75d83ed06ab66582499f410ccad951493fcbe27dcce54da5",
+                "f2712f3": "5f56cd2c96d8da689c241fc49fb49ae7b4f27f98087177b3b9b9f449dd932e7a"}
+        self.assertEqual(set(pins.values()), set(tw.WRAPPER_STALE_SHA256))
+        for commit, digest in pins.items():
+            with self.subTest(commit):
+                shown = subprocess.run(["git", "show", f"{commit}:fleet/ops/tartci-heal-tcc"],
+                                       cwd=ROOT, capture_output=True)
+                if shown.returncode != 0:
+                    self.skipTest(f"{commit} not in this clone's history")
+                self.assertEqual(hashlib.sha256(shown.stdout).hexdigest(), digest)
+                self.assertEqual(tw.classify_wrapper(shown.stdout), "stale")
+                self.assertIn(b'"$KILLALL" tccd sandboxd', shown.stdout)
+
+    def test_hash_lists_are_well_formed_and_disjoint(self) -> None:
+        for digest in tw.WRAPPER_CURRENT_SHA256 | tw.WRAPPER_STALE_SHA256:
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+        self.assertFalse(tw.WRAPPER_CURRENT_SHA256 & tw.WRAPPER_STALE_SHA256)
 
     def test_changed_pids_after_a_zero_exit_are_ran(self) -> None:
         record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([
@@ -661,6 +737,48 @@ class LaneAndDoctorTests(unittest.TestCase):
         self.assertIn("wrapper_missing",
                       fd.check_tcc_wedge(self.wedge_state("wrapper_missing"), now=NOW).detail)
 
+    def test_doctor_names_a_stale_installed_heal_wrapper(self) -> None:
+        # The live wrapper is a root-owned copy installed by hand: a merged
+        # change reaches a host only when the installer is re-run there.
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo-wrapper"
+            repo.write_text("#!/bin/bash\n# repo copy\n")
+            installed = Path(td) / "installed-wrapper"
+            old = '#!/bin/bash\n"$KILLALL" tccd sandboxd\n'
+            old_sha = hashlib.sha256(old.encode()).hexdigest()
+            cases = [
+                (None, fd.NOT_APPLICABLE, "heal_wrapper_not_installed"),
+                (repo.read_text(), fd.OK, "heal_wrapper_current"),
+                # Any other difference (a comment, a local edit) is a notice.
+                (repo.read_text() + "# a newer comment\n", fd.OK, "heal_wrapper_unknown"),
+                # Only a hash listed as an old SIGTERM version is a problem.
+                (old, fd.PROBLEM, "heal_wrapper_stale"),
+            ]
+            for text, state, code in cases:
+                with self.subTest(code=code), \
+                        mock.patch.object(tw, "WRAPPER_STALE_SHA256", frozenset({old_sha})):
+                    if text is None:
+                        installed.unlink(missing_ok=True)
+                    else:
+                        installed.write_text(text)
+                    finding = fd.check_heal_wrapper(installed=installed, repo_copy=repo)
+                    self.assertEqual((finding.state, finding.code), (state, code))
+                    self.assertIn(code, fd.CODES)
+                    self.assertIn(code, fd.load_reasons())
+            self.assertIn(str(fd.ROOT / "fleet" / "ops" / "install-tartci-heal-tcc.sh") + " --apply",
+                          finding.detail)
+            self.assertIn("SIGTERM", finding.detail)
+            installed.write_text("x")
+            unreadable = fd.check_heal_wrapper(installed=installed, repo_copy=Path(td) / "gone")
+            self.assertEqual((unreadable.state, unreadable.code),
+                             (fd.UNKNOWN, "heal_wrapper_unreadable"))
+            self.assertIn("heal_wrapper_unreadable", fd.CODES)
+            self.assertIn("heal_wrapper_unreadable", fd.load_reasons())
+
+    def test_doctor_runs_the_heal_wrapper_check(self) -> None:
+        source = (ROOT / "scripts" / "fleet_doctor.py").read_text()
+        self.assertIn("findings.append(check_heal_wrapper())", source)
+
     def test_runner_names_the_cause_and_keeps_the_plain_deferral(self) -> None:
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
         gate = runner[runner.index("tartci_storage_health_check(){"):]
@@ -686,8 +804,14 @@ class WrapperSourceTests(unittest.TestCase):
     def test_wrapper_is_fixed_argument_less_and_rate_limited(self) -> None:
         text = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_text()
         self.assertIn('[[ $# -eq 0 ]] || die "takes no arguments"', text)
-        self.assertIn('"$KILLALL" tccd sandboxd', text)
-        self.assertEqual(text.count('"$KILLALL"'), 1, "one fixed command vector")
+        self.assertIn('"$KILLALL" -KILL tccd', text)
+        self.assertIn('"$KILLALL" -KILL sandboxd', text)
+        self.assertEqual(text.count('"$KILLALL"'), 2, "two fixed command vectors")
+        # The lock is lockf's fd form: a fixed binary, no interpreter, no
+        # caller-controlled argument.
+        self.assertIn("LOCKF=/usr/bin/lockf", text)
+        self.assertIn('"$LOCKF" -s -t 0 9 ||', text)
+        self.assertNotIn("perl", text)
         self.assertIn("MIN_INTERVAL=1800", text)
         self.assertIn("STAMP=$STAMP_DIR/last-heal", text)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin", text)

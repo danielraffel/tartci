@@ -623,6 +623,30 @@ def paused_line(state_dir: Path, now: float | None = None) -> str | None:
             "has written no attempt since; a reboot resumes it")
 
 
+def stall_refusal(state_dir: Path) -> str | None:
+    """Why a scheduled self-update must not run now: the interval guard holds
+    self-update (PAUSE_DURING_STALL) for as long as a launchd timer-stall
+    episode is open. Read from the episode itself, not the guard's `paused`
+    list, which omits self-update while it runs (as a demand-started run
+    does). None when no live episode or the receipt is missing, stale or
+    unreadable: the guard then holds nothing either."""
+    try:
+        import launchd_interval_guard as guard  # noqa: PLC0415 - sibling module
+        directory = (Path(os.environ["TARTCI_INTERVAL_GUARD_DIR"])
+                     if os.environ.get("TARTCI_INTERVAL_GUARD_DIR")
+                     else state_dir.parent / "launchd-interval-guard")
+        value = guard.status(directory)
+    except Exception:  # noqa: BLE001 - an unreadable guard holds nothing
+        return None
+    if value.get("state") != "stalled":
+        return None
+    started = (value.get("episode") or {}).get("started_ts")
+    since = _iso(float(started)) if isinstance(started, (int, float)) else "an unknown time"
+    return (f"self-update PAUSED by the launchd timer stall since {since}: an update stops "
+            "every supervisor and lane restarts left to launchd would pend; a scheduled "
+            "run (a tick or a kick) waits until the stall ends")
+
+
 def summary(home: Path | None = None) -> dict:
     """Cached skew + last attempt for status surfaces. Never fetches or raises."""
     state = state_dir_for(home or Path.home())
@@ -2830,7 +2854,15 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float, *,
     return EXIT_REFUSED
 
 
-def stagger_seconds(host_id: str, window: int = 600) -> int:
+# Two minutes. The stagger predates the update queue and the announce
+# protocol, which now decide who goes and settle near-simultaneous starts; it
+# only spreads the hosts' reads a little. At 600 s m3 ("studio") hashed to
+# 596 s and slept almost 10 min in every scheduled attempt, between its peer
+# survey and its checkout (the "checkout 9.9 min" in its receipts).
+STAGGER_WINDOW_SECONDS = 120
+
+
+def stagger_seconds(host_id: str, window: int = STAGGER_WINDOW_SECONDS) -> int:
     """A stable per-host offset so scheduled runs on different hosts spread out."""
     return int(hashlib.sha256(host_id.encode()).hexdigest(), 16) % window
 
@@ -3654,6 +3686,48 @@ def rollback_target_error(cfg: Config, sys_: System, helper: dict, app: Path, pr
     return None
 
 
+SELF_UPDATE_LABEL = "com.danielraffel.tartci.self-update"
+HANDOFF_KICK_TIMEOUT = 30
+# Run on each peer after this host's turn succeeded: start that peer's
+# scheduled self-update now when it has a queue ticket file (published or
+# kept aside; a stale one costs one extra ordinary run), instead of at its
+# next StartInterval tick, up to 30 min later. A peer whose launchd timers
+# are stalled refuses the kicked run itself (stall_refusal).
+# Plain `kickstart` is a no-op on a job that is already running; `-k` would
+# SIGTERM a peer mid-drain or mid-install and is never used. The peer's plist
+# has not changed, so the cached-spec rule in launchd/README.md (bootout +
+# bootstrap after a plist edit) does not apply.
+HANDOFF_KICK_COMMAND = (
+    'd="${TARTCI_HOME:-$HOME/.tartci}/state/self-update"; '
+    'if test -s "$d/waiting.json" || test -s "$d/' + STEPPED_ASIDE_NAME + '"; then '
+    'launchctl kickstart "gui/$(id -u)/' + SELF_UPDATE_LABEL + '" && echo "kickstart sent"; '
+    'else echo "nothing queued"; fi')
+
+
+def kick_waiting_peers(cfg: Config, sys_: System, me: str, receipt: Receipt) -> None:
+    """After a succeeded turn: start every queued peer's next attempt now.
+
+    Best effort and once per turn. It never changes this run's result, and
+    it runs only after a real success with this host's update marker gone,
+    so a failed canary never speeds up the rest of the fleet. The peers still
+    take turns through the queue and announce protocol as on any tick.
+    """
+    outcomes = []
+    for peer, target in sorted(published_peers(cfg, sys_).items()):
+        if peer == me:
+            continue
+        ssh = peer_ssh(target)
+        if ssh is None:
+            outcomes.append(f"{peer}: {refused_destination(peer, target)}")
+            continue
+        result = sys_.run([*ssh, HANDOFF_KICK_COMMAND], timeout=HANDOFF_KICK_TIMEOUT)
+        said = (result.out or "").strip().splitlines()
+        outcomes.append(f"{peer}: " + (said[-1] if result.rc == 0 and said else
+                                       f"kick failed (exit {result.rc}): {result.text[:120]}"))
+    receipt.step("handoff-kick", "; ".join(outcomes) or "no peers")
+    _write_json(receipt.path, receipt.value)
+
+
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   explicit: bool = False, scheduled: bool = False,
                   reinstall: bool = False) -> int:
@@ -3837,6 +3911,14 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             paused = scheduled_pause(cfg.state_dir)
             if paused:
                 raise Refused(paused)
+            # During a launchd timer stall the interval guard holds
+            # self-update (PAUSE_DURING_STALL): an update stops every
+            # supervisor, and lane restarts left to launchd would pend. A
+            # demand start (a peer's handoff kick, a hand kickstart) still
+            # spawns it, so a scheduled run refuses here itself.
+            stalled = stall_refusal(cfg.state_dir) if scheduled else None
+            if stalled:
+                raise Refused(stalled)
             halted = halt_reason(cfg.state_dir)
             if halted:
                 raise Refused(halted)
@@ -3980,6 +4062,14 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                                "peers do not yield to it", aside=True)
             if apply and floor_refusal is None:
                 raise Deferred(refusal)
+            if apply and survey.unread:
+                # The floor reads peers over the same routes, so a dark route
+                # often refuses both ways. The starvation bound still runs on
+                # the kept place: a quiet step-aside here never alerted.
+                # The peer reason leads, so the starvation issue names the peer.
+                raise Deferred(f"{refusal}; stepped aside: this host cannot read "
+                               f"{', '.join(survey.unread)}, so it cannot take a turn and "
+                               f"peers do not yield to it (also: {floor_refusal})", aside=True)
             if apply:
                 raise SteppedAside(f"{floor_refusal}; stepped aside so peers do not "
                                    f"yield to it (also: {refusal})", quiet=bool(busy))
@@ -4104,6 +4194,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          f"{installed[:12]} and verify it")
             receipt.finish("planned")
             return EXIT_OK
+        # A stall can open during the stagger, checkout, preflight or build:
+        # check again at the last step before the drain.
+        stalled = stall_refusal(cfg.state_dir) if scheduled else None
+        if stalled:
+            raise Refused(stalled)
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
@@ -4113,6 +4208,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
+            try:
+                kick_waiting_peers(cfg, sys_, me, receipt)
+            except Exception as exc:  # noqa: BLE001 - best effort; the turn already succeeded
+                print(f"self-update: handoff-kick skipped: {type(exc).__name__}: {exc}")
         return rc
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)

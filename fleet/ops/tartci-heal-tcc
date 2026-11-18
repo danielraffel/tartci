@@ -8,8 +8,16 @@
 # granting NOPASSWD for this path with an EMPTY argument spec, so sudo itself
 # refuses any argument.
 #
-# WHAT IT DOES, EXACTLY: /usr/bin/killall tccd sandboxd. launchd relaunches both
-# on demand. No path, label, signal or argument is accepted; nothing else runs.
+# WHAT IT DOES, EXACTLY: /usr/bin/killall -KILL tccd, then /usr/bin/killall
+# -KILL sandboxd (a sandboxd that is not running is not a failure). launchd
+# relaunches both on demand. No path, label, signal or argument is accepted;
+# nothing else runs.
+#
+# WHY SIGKILL: both daemons catch SIGTERM and exit only once they are idle, and
+# a wedged tccd is never idle. On m3 the system tccd (pid 10970, started
+# 2026-11-09) survived every heal since, each of which exited 0 (2026-11-14,
+# 11-16, 11-17), and on 11-17 it sat at ~90% CPU with the store still hung.
+# SIGKILL cannot be caught or deferred.
 #
 # WHY A ROOT ACTION AT ALL: every open() of an external volume from a launchd
 # job needs a Removable Volumes authorization from sandboxd, which asks the
@@ -18,8 +26,10 @@
 # 2026-11-11). Restarting the two daemons clears it without a reboot.
 #
 # THREAT MODEL, STATED PLAINLY: restarting tccd drops in-flight privacy prompts
-# and makes apps re-ask; it changes no grant and reads no database. A principal
-# able to run this can do so at most once per 30 minutes (a stamp in a
+# and makes apps re-ask; it changes no grant and reads no database. TCC.db is
+# SQLite, which survives a killed writer (an uncommitted transaction rolls
+# back); a decision being written at that instant is lost and is asked again.
+# A principal able to run this can do so at most once per 30 minutes (a stamp in a
 # root-only directory under /var/db). The command vector is fixed, so
 # it cannot be bent into any other root action. tartci invokes it only when
 # its three readings agree the hang is tccd (scripts/tcc_wedge.py); the wrapper
@@ -32,6 +42,7 @@ STAMP_DIR=/var/db/tartci-heal-tcc
 STAMP=$STAMP_DIR/last-heal
 LOG=/var/log/tartci-heal-tcc.log
 KILLALL=/usr/bin/killall
+LOCKF=/usr/bin/lockf
 
 die() { printf 'tartci-heal-tcc: %s\n' "$1" >&2; exit "${2:-64}"; }
 
@@ -47,17 +58,44 @@ if [[ $EUID -ne 0 ]]; then
   STAMP_DIR=$(dirname "$STAMP")
   LOG="${TARTCI_HEAL_TCC_LOG:?TARTCI_HEAL_TCC_LOG is required under test}"
   KILLALL=killall
+  LOCKF=lockf
   export PATH="${TARTCI_HEAL_TCC_PATH:-$PATH}"
 fi
 
+# Resolve this after the unprivileged test overrides above.
+LOCK=$STAMP_DIR/heal.flock
 umask 077
 [[ -d "$STAMP_DIR" ]] || mkdir -m 0700 "$STAMP_DIR"
 [[ ! -L "$STAMP_DIR" && ! -L "$STAMP" ]] || die "refusing a symlinked stamp path: $STAMP" 70
+# One heal at a time: an exclusive flock(2) on fd 9, taken before the stamp is
+# read and held until this process exits, so concurrent authorized callers
+# cannot both spend the budget. The kernel drops the lock when the process
+# ends however it ends (timeout, SIGKILL, crash), so no stale lock can block
+# a later heal. /usr/bin/lockf in its file-descriptor form (no command, no
+# interpreter, fixed arguments) takes the lock on the open file description fd
+# 9 shares with this shell; the shell keeps holding it after lockf exits. The
+# directory is root-only (0700), so nobody else can plant a link in it.
+[[ ! -L "$LOCK" ]] || die "refusing a symlinked lock path: $LOCK" 70
+exec 9>>"$LOCK" || die "cannot open the lock file: $LOCK" 70
+# Only contention (75) means another heal; any other lockf status (a usage
+# error from a lockf without the fd form, a bad descriptor) is a failure,
+# never a benign "busy".
+lock_rc=0
+"$LOCKF" -s -t 0 9 || lock_rc=$?
+if (( lock_rc == 75 )); then
+  die "another heal is already in progress" 75
+elif (( lock_rc != 0 )); then
+  die "cannot take the lock: lockf exited $lock_rc" 70
+fi
+# Every command substitution below that runs pgrep, stat or killall closes
+# fd 9 first (`exec 9>&-` inside it), so neither its subshell nor that command
+# keeps the lock: a child that hangs cannot keep it alive after this shell
+# is gone.
 
 now=$(date +%s)
 stamp_age=""
 if [[ -e "$STAMP" ]]; then
-  last=$(stat -f %m "$STAMP" 2>/dev/null || echo 0)
+  last=$(exec 9>&-; stat -f %m "$STAMP" 2>/dev/null || echo 0)
   stamp_age=$(( now - last ))
   if (( stamp_age >= 0 && stamp_age < MIN_INTERVAL )); then
     printf '%s rate-limited uid=%s sudo_user=%s last_heal=%ss_ago\n' \
@@ -69,19 +107,37 @@ fi
 # Stamp BEFORE acting, so a failed attempt still spends the budget.
 : >"$STAMP"
 
-before_tccd=$(pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
-before_sandboxd=$(pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
+before_tccd=$(exec 9>&-; pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
+before_sandboxd=$(exec 9>&-; pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
 rc=0
-output=$("$KILLALL" tccd sandboxd 2>&1) || rc=$?
+output=$(exec 9>&-; exec "$KILLALL" -KILL tccd 2>&1) || rc=$?
+# sandboxd is launched on demand and may not be running. Its kill is always
+# issued (a daemon that started after the snapshot above is killed too); the
+# one tolerated failure is killall's no-match exit (1, "No matching
+# processes"), recorded as `absent`. Any other failure fails the heal.
+sandboxd_rc=0
+sandboxd_output=$(exec 9>&-; exec "$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?
+if [[ "$sandboxd_rc" == 1 && "$sandboxd_output" == *"No matching processes"* ]]; then
+  sandboxd_rc=absent
+fi
 {
-  printf '%s heal uid=%s sudo_user=%s rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$rc" \
+  printf '%s heal uid=%s sudo_user=%s rc=%s sandboxd_rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$rc" "$sandboxd_rc" \
     "${before_tccd% }" "${before_sandboxd% }"
-  [[ -z "$output" ]] || printf '  killall: %s\n' "$(tr '\n' '|' <<<"$output")"
+  [[ -z "$output" ]] || printf '  killall tccd: %s\n' "$(tr '\n' '|' <<<"$output")"
+  [[ -z "$sandboxd_output" ]] || printf '  killall sandboxd: %s\n' "$(tr '\n' '|' <<<"$sandboxd_output")"
 } >>"$LOG" 2>/dev/null || true
 
 if (( rc != 0 )); then
-  die "killall tccd sandboxd exited $rc: $output" "$rc"
+  die "killall -KILL tccd exited $rc: $output" "$rc"
 fi
-printf 'tartci-heal-tcc: restarted tccd and sandboxd (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
-  "${before_tccd% }" "${before_sandboxd% }"
+if [[ "$sandboxd_rc" != 0 && "$sandboxd_rc" != absent ]]; then
+  die "killall -KILL sandboxd exited $sandboxd_rc: $sandboxd_output" "$sandboxd_rc"
+fi
+if [[ "$sandboxd_rc" == absent ]]; then
+  restarted="tccd (sandboxd was not running)"
+else
+  restarted="tccd and sandboxd"
+fi
+printf 'tartci-heal-tcc: restarted %s (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
+  "$restarted" "${before_tccd% }" "${before_sandboxd% }"

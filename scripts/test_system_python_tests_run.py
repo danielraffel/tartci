@@ -188,6 +188,18 @@ ALLOWED = {
      "RatchetTests.test_the_373_sizing_is_refused_against_the_installed_profile"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
+     "UnreachableConcurrencyTests.test_every_shipped_profile_is_reachable"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "UnreachableConcurrencyTests.test_the_previous_m3_vellum_sizing_is_refused"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "UnreachableConcurrencyTests.test_slot_lending_raises_the_budget_to_the_lease_capacity"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "UnreachableConcurrencyTests.test_validate_check_reserve_exits_nonzero"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
      "ValidateCliTests"):
         LANES,
     ("test_external_only_policy.py",
