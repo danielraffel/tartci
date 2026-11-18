@@ -255,11 +255,12 @@ def recorded_failure(events: list[dict], tool: str, version: str,
 
 
 def newest_deploy_at(events: list[dict], tool: str, version: str) -> float:
-    """When this host last moved up to `version` (0 when it never deployed it)."""
+    """When this host last verifiably moved up to `version` (0 when it never
+    did). An unverified redeploy does not wipe out an earlier failure."""
     times = [_epoch(e.get("at")) or 0.0 for e in events
              if e.get("event") == "tool_deployed" and e.get("tool") == tool
              and e.get("component", "cli") == "cli" and e.get("to") == version
-             and not e.get("downgrade")]
+             and e.get("verify") in ("current", "behind") and not e.get("downgrade")]
     return max(times, default=0.0)
 
 

@@ -891,6 +891,18 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertEqual(row["state"], "behind")
         self.assertEqual(row["behind_published_since"], first)
 
+    def test_the_first_sighting_survives_an_unreadable_pass(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        first = self.refresh(host)["tools"]["shipyard"]["behind_published_since"]
+        feeds = self.feeds
+        self.feeds = {}  # every feed read fails: the row is unknown
+        row = self.refresh(host, NOW + 1900, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "unknown")
+        self.feeds = feeds
+        later = NOW + 3800
+        row = self.refresh(host, later, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], first)
+
     def test_a_row_without_the_map_falls_back_to_the_tag_time(self) -> None:
         # The first pass after TartCI updates has no record of when the release
         # was first seen: the tag time is the safe (earliest) answer.

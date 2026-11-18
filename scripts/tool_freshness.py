@@ -606,6 +606,10 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
                                     list[tuple[tuple[int, int, int], str, float]]] | None = None
             ) -> dict:
     row: dict[str, Any] = {"tool": name, "repo": tool.get("repo"), "measured_at": _iso(now)}
+    if tool.get("release_assets") and isinstance((previous or {}).get("published_seen"), dict):
+        # Kept through an unreadable pass (unknown, not installed), so the
+        # next good one still knows when each release was first seen.
+        row["published_seen"] = dict(previous["published_seen"])  # type: ignore[index]
     versions = read_versions(tool, home, run)
     rc, out, installed = versions["rc"], versions["out"], versions["installed"]
     row["installed"] = _vstr(installed)

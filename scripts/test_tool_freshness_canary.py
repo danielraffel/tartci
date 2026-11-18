@@ -284,6 +284,16 @@ class CanaryGateTests(_Fleet):
             self.assertEqual(failed.fleet_updates(), [], failure["event"])
             self.assertIn(f"canary m5studio: v0.221.1 recorded {failure['event']}",
                           row["tools"]["shipyard"]["apply"])
+        # An unverified redeploy on the current canary does not clear its failure.
+        self.switch_host()
+        unverified = self.behind({
+            "m5s": canary_events(deployed("0.221.1", NOW - 50 * MIN),
+                                 {"event": "tool_apply_failed", "tool": "shipyard",
+                                  "at": iso(NOW - 45 * MIN), "target": "0.221.1"},
+                                 deployed("0.221.1", NOW - 10 * MIN, verify="unknown")),
+            "m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
+        self.refresh(unverified, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(unverified.fleet_updates(), [])
         # The steward stage still holds every host behind it.
         self.switch_host()
         later = self.behind({"m5s": canary_events(), "m5": canary_events(
