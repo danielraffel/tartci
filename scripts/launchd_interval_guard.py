@@ -316,13 +316,19 @@ class Guard:
                 or obs["runs"] < mem["runs"]:
             # First sight, or the counter reset (re-registered): start measuring now.
             memory[label] = {"runs": obs["runs"], "progress_ts": now,
-                             "natural_ts": now, "pending_kicks": 0}
+                             "natural_ts": now, "pending_kicks": 0,
+                             "run_owner": "unknown"}
             return
+        mem.setdefault("run_owner", "unknown")
         delta = obs["runs"] - mem["runs"]
         if "kicked_runs" in mem:
             # Did the last kick take? It ran (or is running) by now, or it did not.
             if obs["runs"] > int(mem.pop("kicked_runs")) or obs["running"]:
                 mem["unconfirmed"] = 0
+                if obs["running"]:
+                    # A still-running job after a kick belongs to the guard,
+                    # even if its previous run was launchd-started.
+                    mem["run_owner"] = "guard-started"
             else:
                 mem["unconfirmed"] = int(mem.get("unconfirmed", 0)) + 1
                 # A kick that started nothing caused no run, so it must not
@@ -338,12 +344,21 @@ class Guard:
                 mem["natural_ts"] = now
                 mem["unconfirmed"] = 0
                 mem.pop("ceiling_reported", None)
+            # Whose run is the latest one: launchd's, or one the guard kicked.
+            mem["run_owner"] = "guard-started" if delta <= ours else "launchd-started"
             mem["runs"] = obs["runs"]
         limit = STALL_FACTOR * interval
         natural_age = now - float(mem.get("natural_ts", now))
         if obs["running"]:
-            # Running is progress for the kick decision, never for launchd.
+            # Running is progress for the kick decision. It is progress for
+            # launchd too while the run is one launchd started: launchd does
+            # not start a StartInterval job that is still running, so a job
+            # that runs longer than 2x its interval (the fleet-pass lanes, m3
+            # 2026-11-18) froze its run count and read as a domain stall.
             mem["progress_ts"] = now
+            if mem["run_owner"] == "launchd-started":
+                mem["natural_ts"] = now
+                natural_age = 0.0
         if natural_age > limit:
             stalled.append({"label": label, "interval": interval,
                             "seconds_since_launchd_start": int(natural_age)})
@@ -365,6 +380,7 @@ class Guard:
         if ok:
             mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) + 1
             mem["kicked_runs"] = obs["runs"]
+            mem["run_owner"] = "guard-started"
             mem["progress_ts"] = now
             kicked.append({"label": label, "interval": interval,
                            "seconds_since_progress": int(since)})
