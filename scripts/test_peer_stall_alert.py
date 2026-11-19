@@ -140,10 +140,13 @@ class PeerStall(unittest.TestCase):
         self.assertEqual([t for t, _ in self.opened], [TITLE])
         body = self.opened[0][1].splitlines()
         # The receipt is from a generation that still paused self-update:
-        # say so, with the one kick that installs the stall-safe update.
+        # give the effective unscheduled migration command. A kickstart keeps
+        # the stale --scheduled argument and reaches the old refusal instead.
         self.assertIn("The guard lists self-update as paused", body[0])
-        self.assertIn("launchctl kickstart gui/$(id -u)/com.danielraffel.tartci.self-update",
+        self.assertIn("old scheduled launcher still refuses", body[0])
+        self.assertIn("ssh studio '$HOME/.local/bin/tartci fleet-macos self-update --apply'",
                       body[0])
+        self.assertNotIn("launchctl kickstart", body[0])
         self.assertEqual(body[1], "Run: ssh m3 'tartci doctor fleet'")
         self.assertTrue(body[2].startswith("Fix: nothing; it heals itself."), body[2])
         self.assertIn("do not reboot only for it", body[2])

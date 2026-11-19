@@ -3373,6 +3373,18 @@ class StallSafeUpdateTests(Base):
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertTrue(any("lanes NOT RUNNING" in t for t in opened), self.issues)
 
+    def test_a_lane_failure_without_a_confirmed_stall_skips_stall_alert(self):
+        # A healthy host can still fail to start a lane. That is not evidence
+        # that launchd timers are stalled, so the stall-specific incident must
+        # stay closed while the normal host-off path records the failure.
+        self.guard(active=False)
+        self.sys.stalled = False
+        self.sys.kick_fails[LANES[1]] = {"target", "previous"}
+        self.assertEqual(self.scheduled(), su.EXIT_FAILED)
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertFalse(any("during a launchd stall" in title for title in opened),
+                         self.issues)
+
     def test_pool_on_naming_no_lane_after_pool_off_stopped_some_fails_closed(self):
         self.guard()
         original = self.sys.run

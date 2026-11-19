@@ -79,9 +79,10 @@ for this stall could not install itself.
 
 **Fix:** `scripts/launchd_interval_guard.py` runs inside the lane supervisors
 and kicks any timer agent whose run count has not moved for twice its interval.
-A host on a generation from before that guard needs one manual
-`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`; after that
-it heals on its own. To spot it, compare the age of the newest entry in
+A host on a generation from before that guard needs the installed shim run
+once by hand, without `--scheduled`, because the old scheduled launcher refuses
+before it can hand off: `~/.local/bin/tartci fleet-macos self-update --apply`.
+After that it heals on its own. To spot it, compare the age of the newest entry in
 `~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
 not the exit code.
 
@@ -111,9 +112,9 @@ or log out only to clear it: the next planned reboot (the next macOS install,
 with the lanes drained) clears it. A sealed host still on a generation from
 before this change picks it up by itself whenever its self-update runs: the
 run hands off to the target commit's own orchestration before any stall check
-(m3 on 2026-11-18 ran and refused every 30 min with main's old check). Only a
-host whose self-update has not run at all during the stall needs one
-`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`.
+(m3 on 2026-11-18 ran and refused every 30 min with main's old check). If the
+scheduled launcher has not run at all during the stall, use the same unscheduled
+manual command above.
 
 The entries are grouped by the kind of failure they describe. If a fresh host
 does not behave as expected, start with the matching symptom and run the
