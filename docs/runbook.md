@@ -2930,7 +2930,11 @@ fleet`), and check GitHub's job history against it with
   overcommitted pair is printed as `gate_reserve_overcommitted lane=...
   axis=... demand=... reserve=...` on every update, and `tartci pool status`
   and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
-  the installed profile. The update is refused only when the target profile's
+  the installed profile.
+  The same check also refuses a non-gate lane (for example Vellum) whose
+  `supervisors x` VM cores exceed the non-gate lease budget (`lane_concurrency_unreachable`,
+  `scripts/gate_reserve_fit.py`): its slots could never run together, whatever the load.
+  A host with `vm_slot_lending` is held to its lease capacity instead. The update is refused only when the target profile's
   overcommit on some (lane, axis) is strictly greater than the installed
   profile's, both against the same live reserve (`gate_reserve_worse`). This is
   a ratchet because a host whose installed profile overcommits (m1: 2 x 3
@@ -3919,8 +3923,10 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   boost can serve a long job that shares the short job's label: the lane's
   next boot after either event logs `short_job_first_outcome` with the job the
   VM ran and `served_short=yes|no|no_job|unknown`. Keep the vellum-gate lanes
-  in shadow until sterile-consumer runs on a runner label of its own that
-  only boosted runners carry; until then `on` can hand a long GPU job the slot.
+  in shadow until sterile-consumer's own first tier (`vellum-sterile-consumer`,
+  requested once Vellum sets `VELLUM_LOCAL_MACOS_STERILE_RUNS_ON_JSON`) has been
+  measured live: a runner booted for that class can only take the journey, and
+  the tier order already serves it first.
   Rollback: set `short_job_first = "off"` (or delete the line to return to
   shadow), re-render, restart the lanes at an idle boundary.
 - **Fair share between repositories (opt-in, default off)**: `[leases]
