@@ -5874,8 +5874,9 @@ class Run:
         # update failure, not evidence for the stall-specific incident. The
         # host-off alert below still records that failure for intervention.
         confirmed_stall = self.stall and self.stall != "unknown"
-        if self.spawn_failures or self.receipt.value["host_off"] \
-                or pool_state in (LANES_DOWN, GUARD_DOWN):
+        # A host left OFF outside a stall is covered by the host-off alert below.
+        if self.spawn_failures or pool_state in (LANES_DOWN, GUARD_DOWN) \
+                or (self.receipt.value["host_off"] and confirmed_stall):
             if self.spawn_failures:
                 self.receipt.value["lanes_not_started"] = self.spawn_failures[-1]
             lane_spawn_alert(self.cfg, self.me, self.target, self.spawn_failures or [message],

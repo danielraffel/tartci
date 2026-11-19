@@ -145,6 +145,7 @@ class FakeSystem(su.System):
                                 "fleet": {"managed": True, "fleet_ready": True,
                                           "serving": {"blocked": False}}}
         self.guard_rcs = (2, 0)
+        self.guard_diff_rc = 0
         self.settling_reads = 0        # status reads that still miss a first heartbeat
         self.settling_code = "heartbeat_missing"
         self.bundle_commit = None      # what the built bundle claims (default: target)
@@ -354,6 +355,8 @@ class FakeSystem(su.System):
                 if a[-1] == "origin/main":
                     return su.Result(1 if a[-2] in self.off_main else 0)
                 return su.Result(0 if self.ancestor else 1)
+            if "diff" in a:
+                return su.Result(self.guard_diff_rc, "", "diff failed" if self.guard_diff_rc != 0 else "")
             if "log" in a:
                 # Honour `base..main` the way git does: commits newer than base.
                 base = next((x.split("..")[0] for x in a if ".." in x), None)
