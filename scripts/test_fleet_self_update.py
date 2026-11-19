@@ -3166,6 +3166,7 @@ class StalledLaunchdSystem(FakeSystem):
                       for i, label in enumerate(LANES)}
         # label -> generation(s) on which its kickstart does not take
         self.kick_fails: dict[str, set[str]] = {}
+        self.kick_command_fails: set[str] = set()
         self.kickstarts: list[str] = []
         self.guard_runs = True     # a started supervisor runs the guard
         self.on_stderr = ""        # what a successful pool on/off also writes to stderr
@@ -3213,6 +3214,8 @@ class StalledLaunchdSystem(FakeSystem):
             self.kickstarts.append(label)
             if label not in self.lanes or not self.lanes[label]["loaded"]:
                 return su.Result(113, "", "Could not find service")
+            if label in self.kick_command_fails:
+                return su.Result(1, "", "kickstart refused")
             if not self.lanes[label]["running"]:
                 self._kick(label)
             return ok()
@@ -3321,7 +3324,7 @@ class StallSafeUpdateTests(Base):
 
     def test_stale_guard_demand_spawns_after_pool_on(self):
         self.guard(age=10 * 3600)
-        self.assertUnknownGuardDemandSpawns()
+        self.assertUnknownGuardDemandSpawns("guard check skipped")
 
     def test_old_guard_pass_after_pool_on_does_not_verify_new_supervisors(self):
         self.guard()
@@ -3485,6 +3488,39 @@ class StallSafeUpdateTests(Base):
         self.assertIn("not verified (terminated", " ".join(
             step["detail"] for step in receipt["steps"] if step["step"] == "demand-spawn"))
 
+    def test_a_terminated_run_fails_when_a_kickstart_is_rejected(self):
+        self.guard()
+        receipt = su._recovery_receipt(self.cfg, self.sys)
+        run = su.Run.__new__(su.Run)
+        run.cfg, run.sys, run.receipt = self.cfg, self.sys, receipt
+        run.stopped_lanes = list(LANES)
+        run.guard_owner_before = 100
+        run.spawn_failure = run.spawn_state = None
+        run.spawn_failures = []
+        run.terminating = True
+        self.sys.kick_command_fails = set(LANES)
+        failure = run._demand_spawn("\n".join(f"enabled {label}" for label in LANES))
+        self.assertIsNotNone(failure)
+        self.assertEqual(su.LANES_DOWN, failure[1])
+        self.assertIn("kickstart failed", failure[0])
+
+    def test_partial_pool_on_lane_list_fails_closed_unless_retired(self):
+        receipt = su._recovery_receipt(self.cfg, self.sys)
+        run = su.Run.__new__(su.Run)
+        run.cfg, run.sys, run.receipt = self.cfg, self.sys, receipt
+        run.stopped_lanes = list(LANES)
+        run.guard_owner_before = None
+        run.spawn_failure = run.spawn_state = None
+        run.spawn_failures = []
+        run.terminating = False
+        self.sys.kick_command_fails = set()
+        result = run._demand_spawn(f"enabled {LANES[0]}\nstate: on")
+        self.assertEqual(su.LANES_DOWN, result[1])
+        self.assertIn("omitted lanes", result[0])
+        su._write_json(self.cfg.install_receipt, {"retired_launchd_labels": [LANES[1]]})
+        run.receipt = su._recovery_receipt(self.cfg, self.sys)
+        self.assertIsNone(run._demand_spawn(f"enabled {LANES[0]}\nstate: on"))
+
     def test_a_host_left_off_during_a_stall_says_nothing_retries(self):
         self.guard()
         self.sys.install_rcs = [1]
@@ -3515,6 +3551,23 @@ class StallSafeUpdateTests(Base):
         self.assertEqual("on", self.last()["pool_state"])
         self.assertIn("interval guard running again", path.read_text())
 
+    def test_interrupted_recovery_failure_opens_the_lane_incident(self):
+        self.guard()
+        self.sys.pool_state = "off"
+        for lane in self.sys.lanes.values():
+            lane.update(loaded=False, running=False, pid=None)
+        self.sys.kick_command_fails = set(LANES)
+        path = self.cfg.state_dir / "attempts" / "interrupted-alert.json"
+        value = {"mode": "apply", "status": "running", "pid": 999999,
+                 "target": T_NEW, "previous": INSTALLED,
+                 "launchd_stall": su._iso(self.STARTED),
+                 "steps": [{"step": "announce"}], "stopped_lanes": list(LANES),
+                 "guard_owner_before": 100}
+        su._write_json(path, value)
+        su.recover_interrupted(self.cfg, self.sys, [path])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("lanes NOT RUNNING" in title for title in opened), self.issues)
+
     def test_left_off_recovery_retains_the_off_episode_when_lanes_do_not_start(self):
         self.guard()
         self.sys.install_rcs = [1]
@@ -3530,6 +3583,8 @@ class StallSafeUpdateTests(Base):
         self.assertIn("not running", outcome["reason"])
         self.assertTrue(self.last()["host_off"])
         self.assertEqual("off", self.last()["pool_state"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("during a launchd stall" in title for title in opened), self.issues)
 
     def test_a_guard_that_does_not_come_back_is_reported_as_the_guard(self):
         self.guard()

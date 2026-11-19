@@ -106,15 +106,14 @@ launchd starts neither the watchdog nor self-update) and opens the same issue.
 A terminated run kicks each lane once and does not wait. The receipt's
 `launchd-stall` and `demand-spawn` steps show each step.
 
-**Remedy: nothing; the host heals itself.** The guard keeps every timer
-running for as long as the stall lasts, self-update included. Do not reboot
-or log out only to clear it: the next planned reboot (the next macOS install,
-with the lanes drained) clears it. A sealed host still on a generation from
-before this change picks it up by itself whenever its self-update runs: the
-run hands off to the target commit's own orchestration before any stall check
-(m3 on 2026-11-18 ran and refused every 30 min with main's old check). If the
-scheduled launcher has not run at all during the stall, use the same unscheduled
-manual command above.
+**Remedy: run the installed shim unscheduled on pre-change generations.** The
+guard keeps every timer running for as long as the stall lasts, self-update
+included. A sealed host still running the old scheduled launcher can refuse
+before handoff, so it does not pick up this fix automatically. Run
+`~/.local/bin/tartci fleet-macos self-update --apply` by hand as shown above.
+After that migration, the host heals itself. Do not reboot or log out only to
+clear the stall: the next planned reboot (the next macOS install, with the
+lanes drained) clears it.
 
 The entries are grouped by the kind of failure they describe. If a fresh host
 does not behave as expected, start with the matching symptom and run the

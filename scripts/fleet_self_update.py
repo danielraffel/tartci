@@ -630,6 +630,17 @@ def guard_receipt(state_dir: Path) -> tuple[float | None, int | None]:
             owner if isinstance(owner, int) and not isinstance(owner, bool) and owner > 0 else None)
 
 
+def fresh_guard_owner(state_dir: Path, now: float) -> int | None:
+    """Return the receipt owner only when the guard receipt is fresh."""
+    try:
+        import launchd_interval_guard as guard  # noqa: PLC0415 - sibling module
+        status = guard.status(guard_dir(state_dir), now=now)
+    except Exception:  # noqa: BLE001 - stale/unreadable guard is unknown
+        return None
+    owner = status.get("owner_pid") if status.get("state") in ("ok", "stalled") else None
+    return owner if isinstance(owner, int) and owner > 0 else None
+
+
 def stall_since(state_dir: Path, now: float | None = None) -> str | None:
     """The start of the launchd timer-stall episode the interval guard has
     open, None when a fresh receipt says there is none, or "unknown" when the
@@ -3502,6 +3513,23 @@ def _verified_recovery_pool_on(cfg: Config, sys_: System, receipt: Receipt, *,
     return Result(1, run.pool_on_text, detail)
 
 
+def _recovery_lane_spawn_alert(cfg: Config, sys_: System, value: dict,
+                               result: Result, *, target: str | None) -> None:
+    """Open the lane incident when early recovery cannot restore service."""
+    stall = value.get("launchd_stall") or stall_since(cfg.state_dir, sys_.now())
+    if not stall or stall == "unknown" or result.rc == 0:
+        return
+    try:
+        me = self_host_id(cfg)
+    except (Refused, OSError, ValueError):
+        me = os.uname().nodename.split(".")[0]
+    detail = result.text or "recovery pool on failed"
+    lane_spawn_alert(cfg, me, target or value.get("target") or "unknown", [detail],
+                     rolled_back=False,
+                     pool_state=GUARD_DOWN if "interval guard" in detail else LANES_DOWN,
+                     now=sys_.now())
+
+
 def _ts(text: str | None) -> float:
     try:
         return dt.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -3728,6 +3756,7 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
             on = _verified_recovery_pool_on(cfg, sys_, receipt,
                                             stopped_lanes=stopped_lanes,
                                             guard_owner_before=guard_owner)
+            _recovery_lane_spawn_alert(cfg, sys_, value, on, target=target)
             notes.append("host is on" if on.rc == 0
                          else f"HOST LEFT OFF: pool on failed: {on.text[:200]}")
         message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
@@ -3774,10 +3803,13 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
         stopped = prior.get("stopped_lanes") if isinstance(prior, dict) else None
         if not isinstance(stopped, list) or not all(isinstance(label, str) for label in stopped):
             stopped = ["<unknown left-off lane>"]
-        _, owner = guard_receipt(cfg.state_dir)
+        owner = fresh_guard_owner(cfg.state_dir, sys_.now())
         result = _verified_recovery_pool_on(cfg, sys_, receipt,
                                             stopped_lanes=stopped,
                                             guard_owner_before=owner)
+        _recovery_lane_spawn_alert(cfg, sys_, prior or {}, result,
+                                   target=(prior or {}).get("target") if isinstance(prior, dict)
+                                   else None)
         return result.rc, result.text
 
     if not (_read_json(cfg.state_dir / "last.json") or {}).get("host_off"):
@@ -5230,7 +5262,7 @@ class Run:
     # ── launchd timer stall ─────────────────────────────────────────────
     def _latch_stall(self) -> None:
         """Read the stall again right before a pool off, while the guard runs."""
-        self.guard_owner_before = guard_receipt(self.cfg.state_dir)[1]
+        self.guard_owner_before = fresh_guard_owner(self.cfg.state_dir, self.sys.now())
         self.receipt.value["guard_owner_before"] = self.guard_owner_before
         if not self.stall:
             self.stall = stall_since(self.cfg.state_dir, self.sys.now())
@@ -5285,8 +5317,20 @@ class Run:
             return None
         skipped = [label for label in self.stopped_lanes if label not in enabled]
         if skipped:
+            retired = set()
+            installed = _read_json(self.cfg.install_receipt)
+            if isinstance(installed, dict):
+                labels = installed.get("retired_launchd_labels")
+                if isinstance(labels, list):
+                    retired = {label for label in labels if isinstance(label, str)}
+            unexpected = [label for label in skipped if label not in retired]
+            if unexpected:
+                failure = ("pool on omitted lanes stopped by this update and they are not "
+                           f"listed as intentional generation removals: {', '.join(unexpected)}")
+                self.receipt.step("demand-spawn", failure, ok=False)
+                return failure, LANES_DOWN
             self.receipt.step("demand-spawn", "stopped but not enabled by this generation's "
-                              f"pool on (left as it is): {', '.join(skipped)}")
+                              f"pool on (retired by this generation): {', '.join(skipped)}")
         started = self.sys.now()
         kicks: dict[str, int] = {}
         kick_errors: dict[str, str] = {}
@@ -5304,6 +5348,11 @@ class Run:
             self.receipt.step("demand-spawn", f"kicked {len(enabled)} lanes once; not verified "
                               "(terminated, launchd's SIGKILL is pending)",
                               ok=not kick_errors)
+            if kick_errors:
+                failure = "terminated recovery kickstart failed: " + "; ".join(
+                    f"{label} ({error})" for label, error in sorted(kick_errors.items()))
+                self.receipt.step("demand-spawn", failure, ok=False)
+                return failure, LANES_DOWN
             return None
         pending = list(enabled)
         exited: dict[str, int] = {}
