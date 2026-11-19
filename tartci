@@ -20,6 +20,7 @@
 #   tartci run-in-vm --src DIR --owner NAME [--timeout S] [--patch-out F] -- CMD...
 #                                        # run CMD in a disposable credential-free VM (one per host)
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
+#   tartci bench-prune [--apply] [--json] # plan (default) or remove expired marked bench clones
 #   tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
@@ -1513,8 +1514,16 @@ PY
         # A lane that can never lease its VM, or identical lanes the lease
         # budget cannot run together, is configuration and not load.
         "$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
+        export TARTCI_STATUS_SCRIPTS="$HERE/scripts"
         "$status_python" - "$fleet_readiness" <<'PY'
-import json, sys
+import json, os, pathlib, sys
+scripts = os.environ.get("TARTCI_STATUS_SCRIPTS")
+if scripts:
+    sys.path.insert(0, scripts)
+try:
+    import status  # the store attribution line only; status output never depends on it
+except Exception:  # noqa: BLE001
+    status = None
 fleet = json.loads(sys.argv[1])
 if fleet["managed"]:
     print(f"fleet ready: {'yes' if fleet['fleet_ready'] else 'NO'}")
@@ -1576,6 +1585,14 @@ if fleet["managed"]:
         mark = {"ok": "ok", "warn": "WARN", "problem": "PROBLEM"}[disk["state"]]
         print(f"disk: {disk['role']} {disk['path']}: {mark} {disk['used_percent']}% used, "
               f"{disk['free_gib']} GiB free")
+        attribution = None
+        if status is not None:
+            try:
+                attribution = status.pool_disk_attribution(disk, pathlib.Path(disk["path"]))
+            except Exception:  # noqa: BLE001
+                attribution = None
+        if attribution:
+            print(attribution)
     for condition in fleet.get("host_conditions") or []:
         print(f"  host condition: {condition['code']}: {condition.get('detail', '')}")
     for problem in fleet["problems"]:
@@ -1680,6 +1697,7 @@ case "${1:-help}" in
   disk)    shift; cmd_disk "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
+  bench-prune) shift; tartci_verified_python_run "$HERE/scripts/bench_prune.py" "$@" ;;
   retention) shift; tartci_verified_python_run "$HERE/scripts/state_retention.py" "$@" ;;
   vm-dhcp) shift; tartci_verified_python_run "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
   runner-heal) shift; tartci_verified_python_run "$HERE/scripts/persistent_runner_heal.py" "$@" ;;

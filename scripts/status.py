@@ -34,6 +34,7 @@ JANITORS = (
     ("reap", REAP_LABEL, "TARTCI_REAP_", "VM janitor"),
 )
 GIB = 1024 ** 3
+VM_STORE_PROBLEM_PERCENT = 92  # macos_fleet_lanes.DISK_PROBLEM_PERCENT
 
 
 def run(argv: list[str], timeout: int = 10) -> dict[str, Any]:
@@ -54,6 +55,70 @@ def run_json(argv: list[str], timeout: int = 10) -> Any:
         return json.loads(result["stdout"] or "null")
     except json.JSONDecodeError as exc:
         return {"error": str(exc), "raw": result["stdout"]}
+
+
+ATTRIBUTION_CACHE_SECONDS = 30 * 60
+
+
+def default_attribution_cache() -> Path:
+    return Path.home() / ".tartci" / "state" / "vm-store-attribution.json"
+
+
+def pool_disk_attribution(disk: dict[str, Any], home: Path,
+                          runner=run, cache: Path | None = None,
+                          now: float | None = None) -> str | None:
+    """One bounded store breakdown, only at the VM store's percent problem floor.
+
+    pool status runs often, and the store is already near its I/O-stall
+    threshold when this fires, so one `du` answer is reused for 30 minutes.
+    """
+    if disk.get("role") != "vm_store" or disk.get("state") != "problem" \
+            or (disk.get("used_percent") or 0) < VM_STORE_PROBLEM_PERCENT:
+        return None
+    cache = cache or default_attribution_cache()
+    now = time.time() if now is None else now
+    try:
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        age = now - float(cached["at"])
+        if cached.get("home") == str(home) and 0 <= age < ATTRIBUTION_CACHE_SECONDS:
+            return str(cached["line"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    line = _measure_attribution(home, runner)
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_name(f".{cache.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"home": str(home), "at": now, "line": line}), encoding="utf-8")
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    return line
+
+
+def _measure_attribution(home: Path, runner) -> str:
+    # macOS du rejects -s with -d; -k -d 1 produces the requested KiB rows.
+    result = runner(["du", "-k", "-d", "1", str(home)], timeout=30)
+    if not result["ok"]:
+        return "disk: vm_store attribution: unavailable"
+    groups: dict[str, list[tuple[str, int]]] = {"CI": [], "other": []}
+    try:
+        for line in result["stdout"].splitlines():
+            size, raw_path = line.split("\t", 1)
+            path = Path(raw_path)
+            if path.parent != home or path.is_symlink() or not path.is_dir():
+                continue
+            kib = int(size)
+            if kib < 0:
+                raise ValueError("negative du size")
+            group = "CI" if path.name in {"vms", "goldens", "cache"} else "other"
+            groups[group].append((path.name, kib))
+    except (ValueError, OSError):
+        return "disk: vm_store attribution: unavailable"
+    for rows in groups.values():
+        rows.sort(key=lambda row: (-row[1], row[0]))
+    def describe(rows: list[tuple[str, int]]) -> str:
+        return " ".join(f"{name} {size / (1024 * 1024):.0f}G" for name, size in rows) or "-"
+    return f"disk: vm_store attribution: CI {describe(groups['CI'])} | other {describe(groups['other'])}"
 
 
 def command_presence(names: list[str]) -> dict[str, str | None]:

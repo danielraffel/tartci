@@ -186,6 +186,62 @@ class DiskSpaceTests(unittest.TestCase):
 
 
 class StatusOutputTests(unittest.TestCase):
+    def test_pool_vm_store_attribution_only_at_problem_threshold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ("vms", "goldens", "utm", "bench", "backups"):
+                (root / name).mkdir()
+            calls = []
+
+            def fake_du(argv, timeout=10):
+                calls.append((argv, timeout))
+                rows = [(161, "vms"), (55, "goldens"), (427, "utm"),
+                        (297, "bench"), (173, "backups")]
+                return {"ok": True, "stdout": "".join(
+                    f"{size * 1024 * 1024}\t{root / name}\n" for size, name in rows),
+                    "stderr": "", "returncode": 0}
+
+            self.assertIsNone(status.pool_disk_attribution(
+                {"role": "vm_store", "state": "problem", "used_percent": 91.9},
+                root, runner=fake_du, cache=root / "c1.json"))
+            self.assertEqual(calls, [])
+            line = status.pool_disk_attribution(
+                {"role": "vm_store", "state": "problem", "used_percent": 92},
+                root, runner=fake_du, cache=root / "c2.json", now=1000.0)
+            self.assertEqual(line, "disk: vm_store attribution: CI vms 161G goldens 55G | "
+                                   "other utm 427G bench 297G backups 173G")
+            self.assertEqual(calls, [(["du", "-k", "-d", "1", str(root)], 30)])
+            # One du answer serves every status call for 30 minutes, then is measured again.
+            again = status.pool_disk_attribution(
+                {"role": "vm_store", "state": "problem", "used_percent": 92},
+                root, runner=fake_du, cache=root / "c2.json", now=1000.0 + 29 * 60)
+            self.assertEqual((again, len(calls)), (line, 1))
+            status.pool_disk_attribution(
+                {"role": "vm_store", "state": "problem", "used_percent": 92},
+                root, runner=fake_du, cache=root / "c2.json", now=1000.0 + 31 * 60)
+            self.assertEqual(len(calls), 2)
+            def timed_out(argv, timeout=10):
+                return {"ok": False, "stdout": "", "stderr": "timeout", "returncode": 124}
+            self.assertEqual(status.pool_disk_attribution(
+                {"role": "vm_store", "state": "problem", "used_percent": 92},
+                root, runner=timed_out, cache=root / "c3.json"), "disk: vm_store attribution: unavailable")
+
+    def test_pool_vm_store_attribution_does_not_reuse_future_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            calls = []
+
+            def fake_du(argv, timeout=10):
+                calls.append(argv)
+                return {"ok": True, "stdout": "", "stderr": "", "returncode": 0}
+
+            cache = root / "cache.json"
+            disk = {"role": "vm_store", "state": "problem", "used_percent": 92}
+            status.pool_disk_attribution(disk, root, runner=fake_du, cache=cache, now=1000.0)
+            self.assertEqual(len(calls), 1)
+            status.pool_disk_attribution(disk, root, runner=fake_du, cache=cache, now=900.0)
+            self.assertEqual(len(calls), 2)
+
     def _quiet_main(self, argv):
         buffer = io.StringIO()
         with mock.patch.object(status, "tart_vms", return_value={}), \

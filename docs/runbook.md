@@ -4695,6 +4695,13 @@ first, then m5, m3 and m5s, one per day.
   - Both Tart stores.
   - The build trees. `tartci reclaim --fix` is the only automatic reclaim.
 
+  `tartci pool status` adds a `disk: vm_store attribution` line at the VM
+  store's 92% PROBLEM threshold, separating CI directories (`vms`, `goldens`,
+  `cache`) from other top-level directories by size; an unavailable scan is
+  reported as such. `tartci bench-prune` plans expiry for clones with a
+  `<clone>.tartci-bench.json` marker, and `--apply` deletes only expired,
+  unopened marked clones. Unmarked owner data remains listed and untouched.
+
   Sizes are measured at most every 6 h. The issue closes when the floor holds
   again.
 - **Foreign VMs.** Hourly, the VM store and `~/.tart` are judged with the
