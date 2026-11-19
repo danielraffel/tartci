@@ -73,28 +73,32 @@ def plan(store: pathlib.Path, runner: Runner = subprocess.run,
     if not store.is_dir() or store.is_symlink():
         return {"store": str(store), "entries": entries, "delete_bytes": 0,
                 "error": "bench store unavailable"}
-    for path in sorted(store.iterdir()):
-        if path.name.endswith(MARKER):
-            continue
-        marker = pathlib.Path(str(path) + MARKER)
-        row: dict[str, Any] = {"name": path.name, "path": str(path),
-                               "size_bytes": size_bytes(path)}
-        if not marker.exists() and not marker.is_symlink():
-            row.update(verdict="unmanaged", reason="no marker")
-        elif path.is_symlink():
-            row.update(verdict="keep", reason="clone is a symlink")
-        else:
-            try:
-                created, ttl = marker_created(marker)
-                if now < created + timedelta(days=ttl):
-                    row.update(verdict="keep", reason="within TTL")
-                elif in_use(path, runner):
-                    row.update(verdict="keep", reason="in use or lsof unavailable")
-                else:
-                    row.update(verdict="delete", reason="expired and not open")
-            except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
-                row.update(verdict="keep", reason=f"unreadable marker: {exc}")
-        entries.append(row)
+    try:
+        for path in sorted(store.iterdir()):
+            if path.name.endswith(MARKER):
+                continue
+            marker = pathlib.Path(str(path) + MARKER)
+            row: dict[str, Any] = {"name": path.name, "path": str(path),
+                                   "size_bytes": size_bytes(path)}
+            if not marker.exists() and not marker.is_symlink():
+                row.update(verdict="unmanaged", reason="no marker")
+            elif path.is_symlink():
+                row.update(verdict="keep", reason="clone is a symlink")
+            else:
+                try:
+                    created, ttl = marker_created(marker)
+                    if now < created + timedelta(days=ttl):
+                        row.update(verdict="keep", reason="within TTL")
+                    elif in_use(path, runner):
+                        row.update(verdict="keep", reason="in use or lsof unavailable")
+                    else:
+                        row.update(verdict="delete", reason="expired and not open")
+                except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+                    row.update(verdict="keep", reason=f"unreadable marker: {exc}")
+            entries.append(row)
+    except OSError as exc:
+        return {"store": str(store), "entries": [], "delete_bytes": 0,
+                "error": f"bench store unavailable: {exc}"}
     return {"store": str(store), "entries": entries,
             "delete_bytes": sum(row["size_bytes"] for row in entries
                                 if row["verdict"] == "delete")}

@@ -82,6 +82,15 @@ class BenchPruneTests(unittest.TestCase):
         report = bench_prune.plan(self.store, runner=failed, now=NOW)
         self.assertEqual(report["entries"][0]["verdict"], "keep")
 
+    def test_unreadable_store_returns_error_report(self):
+        store = mock.Mock(spec=pathlib.Path)
+        store.is_dir.return_value = True
+        store.is_symlink.return_value = False
+        store.iterdir.side_effect = PermissionError("denied")
+        report = bench_prune.plan(store, runner=self.lsof, now=NOW)
+        self.assertEqual(report["entries"], [])
+        self.assertIn("bench store unavailable", report["error"])
+
     def test_non_string_created_is_kept_as_unreadable(self):
         clone = self.clone("bad-created")
         pathlib.Path(str(clone) + ".tartci-bench.json").write_text(json.dumps({
@@ -131,6 +140,20 @@ class BenchPruneTests(unittest.TestCase):
                               env=env, capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("invalid TARTCI_BENCH_TTL_DAYS: 00", proc.stderr)
+        self.assertFalse((self.store / "clone.qcow2").exists())
+
+    def test_marker_failure_removes_new_clone(self):
+        golden = pathlib.Path(self.temp.name) / "goldens"
+        golden.mkdir()
+        (golden / "base-windows.qcow2").write_bytes(b"golden")
+        marker = self.store / "clone.qcow2.tartci-bench.json"
+        marker.write_text("existing")
+        env = dict(os.environ, TARTCI_GOLDENS=str(golden), TARTCI_BENCH=str(self.store))
+        proc = subprocess.run(["bash", str(ROOT / "bench/bench.sh"), "windows", "clone"],
+                              env=env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.store / "clone.qcow2").exists())
+        self.assertEqual(marker.read_text(), "existing")
 
 
 if __name__ == "__main__":

@@ -1514,9 +1514,12 @@ PY
         # A lane that can never lease its VM, or identical lanes the lease
         # budget cannot run together, is configuration and not load.
         "$status_python" "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
-        "$status_python" - "$fleet_readiness" "$HERE/scripts" <<'PY'
-import json, pathlib, sys
-sys.path.insert(0, sys.argv[2])
+        export TARTCI_STATUS_SCRIPTS="$HERE/scripts"
+        "$status_python" - "$fleet_readiness" <<'PY'
+import json, os, pathlib, sys
+scripts = os.environ.get("TARTCI_STATUS_SCRIPTS")
+if scripts:
+    sys.path.insert(0, scripts)
 try:
     import status  # the store attribution line only; status output never depends on it
 except Exception:  # noqa: BLE001

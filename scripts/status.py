@@ -69,7 +69,7 @@ def pool_disk_attribution(disk: dict[str, Any], home: Path,
                           now: float | None = None) -> str | None:
     """One bounded store breakdown, only at the VM store's percent problem floor.
 
-    `pool status` runs often, and the store is already near its I/O-stall
+    pool status runs often, and the store is already near its I/O-stall
     threshold when this fires, so one `du` answer is reused for 30 minutes.
     """
     if disk.get("role") != "vm_store" or disk.get("state") != "problem" \

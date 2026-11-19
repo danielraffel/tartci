@@ -52,6 +52,15 @@ write_marker() {   # $1 = newly created clone
     "${clone}.tartci-bench.json"
 }
 
+validate_ttl() {
+  local ttl="${TARTCI_BENCH_TTL_DAYS:-14}"
+  case "$ttl" in *[!0-9]*|"") echo "invalid TARTCI_BENCH_TTL_DAYS: $ttl" >&2; return 2;; esac
+  if [ -z "${ttl//0/}" ]; then
+    echo "invalid TARTCI_BENCH_TTL_DAYS: $ttl" >&2
+    return 2
+  fi
+}
+
 case "$OS" in
   windows)
     # Golden is already qcow2 — clone (CoW copy) into the bench, import to UTM.
@@ -59,9 +68,16 @@ case "$OS" in
     [ -n "$src" ] || { echo "no windows golden in $GOLDENS"; exit 1; }
     dst="$BENCH/${NAME}.qcow2"
     [ -e "$dst" ] && { echo "bench already exists: $dst — pick another name or remove it first (won't clobber your customized bench)"; exit 1; }
+    validate_ttl
     echo "cloning $src → $dst"
     cp -c "$src" "$dst" 2>/dev/null || cp "$src" "$dst"   # APFS CoW when possible
-    write_marker "$dst"
+    if write_marker "$dst"; then
+      :
+    else
+      rc=$?
+      rm -f "$dst"
+      exit "$rc"
+    fi
     open_in_utm "$dst"
     ;;
   linux)
