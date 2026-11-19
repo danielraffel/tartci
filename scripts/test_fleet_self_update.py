@@ -3388,15 +3388,32 @@ class StallSafeUpdateTests(Base):
         self.assertEqual(self.scheduled(), su.EXIT_FAILED)
         self.assertIn("pool on named no lane it enabled", self.last()["error"])
 
-    def test_outside_a_stall_the_update_kicks_nothing(self):
-        # Control: a healthy domain starts what pool on loads; the update
-        # neither kickstarts a lane nor waits for the guard.
+    def test_outside_a_stall_the_update_verifies_and_kicks_nothing(self):
+        # Control: a healthy domain starts what pool on loads; the update still
+        # verifies every lane (a stall can open while the pool is off) but
+        # kickstarts none, because each one is already running.
         self.guard(active=False)
         self.sys.stalled = False
         self.assertUpdated(self.scheduled())
         self.assertLanesRunning()
         self.assertEqual(self.sys.kickstarts, [])
-        self.assertEqual(self.steps("demand-spawn"), [])
+        details = " ".join(step["detail"] for step in self.steps("demand-spawn"))
+        self.assertIn(f"{len(LANES)} lanes running after pool on (0 kickstarts)", details)
+
+    def test_a_stall_that_opens_while_the_pool_is_off_still_brings_every_lane_back(self):
+        # Review (#996): the stall was latched only before pool off. A stall
+        # that opens during the off interval (Tart upgrade, install, relay)
+        # left pool on trusting launchd, and the lanes stayed pended.
+        self.guard(active=False)
+        self.sys.stalled = False
+
+        def hook(argv) -> None:
+            if argv[:3] == ["./tartci", "pool", "off"] and "--plan" not in argv:
+                self.sys.stalled = True
+        self.sys.hook = hook
+        self.assertUpdated(self.scheduled())
+        self.assertLanesRunning()
+        self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
 
     def test_no_pause_is_reported_during_a_stall(self):
         import fleet_doctor

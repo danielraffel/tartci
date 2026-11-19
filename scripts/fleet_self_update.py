@@ -5146,14 +5146,17 @@ class Run:
                 self.receipt.step("pool-on", "installed shim" +
                                   ("; restored prior receipted serving set without fresh relay proof"
                                    if restore_receipt else ""))
-                if self.stall:
-                    # stdout: Result.text is stderr whenever stderr is not
-                    # empty, and the lane lines are on stdout.
-                    failure = self._demand_spawn(on.out)
-                    if failure:
-                        self.spawn_failure, self.spawn_state = failure
-                        self.spawn_failures.append(self.spawn_failure)
-                        return False
+                # Every pool on demand-spawns and verifies its lanes, stall or
+                # not: a launchd timer stall can open while the pool is off
+                # (Tart upgrade, install, relay, rollback), after the last
+                # latch, and a kickstart of a lane that is already running is
+                # harmless. stdout: Result.text is stderr whenever stderr is
+                # not empty, and the lane lines are on stdout.
+                failure = self._demand_spawn(on.out)
+                if failure:
+                    self.spawn_failure, self.spawn_state = failure
+                    self.spawn_failures.append(self.spawn_failure)
+                    return False
                 return True
             self.receipt.step("pool-on", f"attempt {attempt} failed (exit {on.rc}): {on.text[:300]}",
                               ok=False)
@@ -5186,7 +5189,9 @@ class Run:
         if result.rc != 0:
             return False, None, None
         fields = guard.parse_print(result.out)  # top-level fields only
-        running = fields.get("pid", "").isdigit() or fields.get("state") == "running"
+        # Running means launchd reports a live pid; "state = running" alone
+        # is not proof the supervisor process exists.
+        running = fields.get("pid", "").isdigit()
         runs = fields.get("runs", "")
         pid = fields.get("pid", "")
         return running, int(runs) if runs.isdigit() else None, int(pid) if pid.isdigit() else None
@@ -5280,7 +5285,7 @@ class Run:
                 if running and pid is not None:
                     live_pids.add(pid)
             if (ts is not None and ts >= started and owner is not None
-                    and owner != self.guard_owner_before and owner in live_pids):
+                    and owner in live_pids):
                 self.receipt.step("demand-spawn", "interval guard running again "
                                   f"(pass at {_iso(ts)}, supervisor pid {owner})")
                 return None
