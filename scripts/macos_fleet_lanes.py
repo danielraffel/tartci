@@ -133,7 +133,8 @@ LANE_KEYS = {
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
     "admission_precheck_overlap", "admission_precheck_overlap_backoff_seconds",
-    "v2_gate_classes", "queue_merge_group_quota",
+    "v2_gate_classes", "queue_merge_group_quota", "refresh_after_every_serve",
+    "forced_discoveries_per_hour",
     # Slot priority's short-job-first rule (scripts/slot_priority.py).
     "short_jobs", "short_job_first",
 }
@@ -925,6 +926,22 @@ def load(path: Path) -> dict:
         quota = lane.get("queue_merge_group_quota")
         if quota is not None and (type(quota) is not int or quota < 0):
             fail(f"lane {lane_id}: queue_merge_group_quota must be a nonnegative integer")
+        refresh = lane.get("refresh_after_every_serve")
+        if refresh is not None and (type(refresh) is not bool or not lane.get("tier")
+                                    or lane.get("assignment_mode") == "event-class-v2"):
+            # The runner implements it in the tier loop's selection only.
+            fail(f"lane {lane_id}: refresh_after_every_serve must be a boolean on a "
+                 "[[lane.tier]] lane that is not event-class-v2")
+        forced = lane.get("forced_discoveries_per_hour")
+        if bool(refresh) != (forced is not None) or (
+                forced is not None and (type(forced) is not int or forced < 0)):
+            # Each refresh lane states its own budget share; queue_scan.py adds
+            # it to the fleet API budget check.
+            fail(f"lane {lane_id}: forced_discoveries_per_hour is a nonnegative integer, "
+                 "required with refresh_after_every_serve and only with it")
+        if refresh and lane.get("min_queued_age_seconds", 0):
+            # A just-queued job cannot count under a minimum age: pure cost.
+            fail(f"lane {lane_id}: refresh_after_every_serve needs min_queued_age_seconds = 0")
         validate_short_jobs(lane_id, lane, data)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
@@ -3257,6 +3274,13 @@ def lane_plist(
         # queue_scan.py reads the newest N merge_group runs' jobs on every
         # refresh; absent, the lane keeps the plain newest-then-rotation order.
         env["TARTCI_QUEUE_MERGE_GROUP_QUOTA"] = str(lane["queue_merge_group_quota"])
+    if lane.get("refresh_after_every_serve"):
+        # runner.sh refresh_after_serve: after any served job, not only a
+        # merge-group one, the next selection rescans uncached once.
+        env["TARTCI_REFRESH_AFTER_EVERY_SERVE"] = "1"
+        # The lane's repository's post-serve discoveries an hour, fleet-wide;
+        # queue_scan.py adds them to its fleet API budget check.
+        env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"] = str(lane["forced_discoveries_per_hour"])
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
     if "vm_cores_from" in lane:
@@ -3998,6 +4022,16 @@ def check_reserve(target: dict, installed_path: Path, host_json: Path | None,
         print(line)
     for line in gate_reserve_fit.finding_lines(rows):
         print(line)
+    unreachable = gate_reserve_fit.unreachable_lines(
+        gate_reserve_fit.unreachable_concurrency(target, host))
+    for line in unreachable:
+        print(line)
+        print(line, file=sys.stderr)
+    if unreachable:
+        print("refusing: a lane's slots can never run together inside the non-gate lease "
+              "budget; lower its vm_cores or supervisors (or enable vm_slot_lending)",
+              file=sys.stderr)
+        return 1
     for line in refusals:
         print(line, file=sys.stderr)
     if refusals:
@@ -4016,18 +4050,24 @@ def gate_reserve_summary(config: Path) -> dict:
             profile = tomllib.load(fh)
         host = live_host_profile(config)
         lines = gate_reserve_fit.finding_lines(gate_reserve_fit.fit(profile, host))
+        unreachable = gate_reserve_fit.unreachable_lines(
+            gate_reserve_fit.unreachable_concurrency(profile, host))
         not_applicable = gate_reserve_fit.not_applicable_lines(profile, host)
     except Exception as exc:  # noqa: BLE001 - a status line must not break status
         return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
                 "problem": None}
+    extra = [f"lane budget: UNREACHABLE {line.split(' ', 1)[1]}" for line in unreachable]
     if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
-        return {"lines": not_applicable, "problem": None}
+        if not unreachable:
+            return {"lines": not_applicable, "problem": None}
+        return {"lines": [*not_applicable, *extra],
+                "problem": "; ".join(line.split(" ", 1)[1] for line in unreachable)}
     if not lines:
-        return {"lines": ["gate reserve: every gate lane fits", *not_applicable],
-                "problem": None}
+        return {"lines": ["gate reserve: every gate lane fits", *extra, *not_applicable],
+                "problem": "; ".join(line.split(" ", 1)[1] for line in unreachable) or None}
     return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines]
-            + not_applicable,
-            "problem": "; ".join(line.split(" ", 1)[1] for line in lines)}
+            + extra + not_applicable,
+            "problem": "; ".join(line.split(" ", 1)[1] for line in lines + unreachable)}
 
 
 def self_update_summary() -> dict:

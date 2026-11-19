@@ -219,6 +219,29 @@ class NoReserveTests(unittest.TestCase):
         self.assertEqual(fd.check_gate_reserve(value, installed_present=True).code,
                          "gate_reserve_fits")
 
+    @requires_tomllib
+    def test_summary_keeps_unreachable_problem_when_gate_reserve_is_not_applicable(self) -> None:
+        host = {"reserved_gate_cores": 0, "vm_pool_cores": 4,
+                "reserved_gate_mem_mb": 0, "non_gate_capacity_cores": 6,
+                "non_gate_capacity_mem_mb": 100000}
+        profile_text = (
+            '[[lane]]\nid = "pulp-gate"\nsupervisors = 1\n'
+            '[[lane]]\nid = "vellum-gate"\npriority = "vm"\n'
+            'supervisors = 2\nvm_cores = 4\n')
+        import macos_fleet_lanes
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(macos_fleet_lanes, "live_host_profile", return_value=host):
+            config = Path(td) / "profile.toml"
+            config.write_text(profile_text)
+            value = macos_fleet_lanes.gate_reserve_summary(config)
+        self.assertEqual(value["problem"],
+                         "lane=vellum-gate axis=cores supervisors=2 vm_cores=4 demand=8 budget=6")
+        self.assertEqual(value["lines"], [
+            "gate reserve: n/a (this host reserves no gate cores)",
+            "lane budget: UNREACHABLE lane=vellum-gate axis=cores supervisors=2 "
+            "vm_cores=4 demand=8 budget=6"])
+        self.assertEqual(fd.check_gate_reserve(value, installed_present=True).state, fd.PROBLEM)
+
 
 class RatchetTests(unittest.TestCase):
     @requires_tomllib
@@ -327,6 +350,74 @@ class M5DoctorTests(unittest.TestCase):
         self.assertIn("lane=pulp-gate axis=cores demand=12 reserve=8", before.detail)
         after = self.finding((ROOT / "profiles" / "m5-macos-fleet.toml").read_text())
         self.assertEqual((after.state, after.code), (fd.OK, "gate_reserve_fits"))
+
+
+NON_GATE = {  # `tartci host-profile --json` on each host, 2026-11-18
+    "m3": {"lease_capacity_cores": 26, "non_gate_capacity_cores": 12,
+           "lease_capacity_mem_mb": 81920, "non_gate_capacity_mem_mb": 37810},
+    "m5studio": {"lease_capacity_cores": 26, "non_gate_capacity_cores": 6,
+                 "lease_capacity_mem_mb": 249856, "non_gate_capacity_mem_mb": 57660},
+    "m1": {"lease_capacity_cores": 6, "non_gate_capacity_cores": 3,
+           "lease_capacity_mem_mb": 55296, "non_gate_capacity_mem_mb": 27648},
+    "m5": {"lease_capacity_cores": 14, "non_gate_capacity_cores": 6,
+           "lease_capacity_mem_mb": 118784, "non_gate_capacity_mem_mb": 50908},
+}
+
+
+class UnreachableConcurrencyTests(unittest.TestCase):
+    """A lane whose slots can never run together is refused, not ratcheted."""
+
+    def host(self, name: str) -> dict:
+        return {**HOSTS[name], **NON_GATE[name]}
+
+    @requires_tomllib
+    def test_every_shipped_profile_is_reachable(self) -> None:
+        for name in HOSTS:
+            with self.subTest(host=name):
+                self.assertEqual(
+                    grf.unreachable_concurrency(profile(name), self.host(name)), [])
+
+    @requires_tomllib
+    def test_the_previous_m3_vellum_sizing_is_refused(self) -> None:
+        data = profile("m3")
+        vellum = next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")
+        vellum["vm_cores"] = 8  # 2 slots x 8 = 16 against the 12-core non-gate budget
+        self.assertEqual(
+            grf.unreachable_lines(grf.unreachable_concurrency(data, self.host("m3"))),
+            ["lane_concurrency_unreachable lane=vellum-gate axis=cores supervisors=2 "
+             "vm_cores=8 demand=16 budget=12"])
+
+    @requires_tomllib
+    def test_slot_lending_raises_the_budget_to_the_lease_capacity(self) -> None:
+        data = profile("m5")
+        self.assertTrue(data["leases"]["vm_slot_lending"])
+        vellum = next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")
+        self.assertEqual(vellum["supervisors"], 2)
+        del data["leases"]["vm_slot_lending"]
+        # Without lending, the same two 6-core slots exceed m5's 6-core budget.
+        self.assertEqual(len(grf.unreachable_concurrency(data, self.host("m5"))), 1)
+
+    @requires_tomllib
+    def test_live_slot_lending_override_can_disable_profile_lending(self) -> None:
+        data = profile("m5")
+        host = {**self.host("m5"), "vm_slot_lending": True}
+        with mock.patch.dict("os.environ", {"TARTCI_VM_SLOT_LENDING": "0"}):
+            rows = grf.unreachable_concurrency(data, host)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["budget"], 6)
+
+    @requires_tomllib
+    def test_validate_check_reserve_exits_nonzero(self) -> None:
+        import macos_fleet_lanes
+        data = profile("m3")
+        next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")["vm_cores"] = 8
+        with tempfile.TemporaryDirectory() as tmp:
+            host_json = Path(tmp) / "host.json"
+            host_json.write_text(json.dumps(self.host("m3")))
+            with mock.patch("sys.stderr"), mock.patch("builtins.print"):
+                code = macos_fleet_lanes.check_reserve(
+                    data, Path(tmp) / "none.toml", host_json, ROOT / "profiles" / "m3-macos-fleet.toml")
+        self.assertEqual(code, 1)
 
 
 class DoctorTests(unittest.TestCase):

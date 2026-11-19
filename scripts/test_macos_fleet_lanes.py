@@ -1242,7 +1242,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "7"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
-                            else "8"
+                            else "4"
                             if host_id == "studio"
                             and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/vellum"
                             else (
