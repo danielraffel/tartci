@@ -2599,10 +2599,9 @@ def close_launcher_probe_alert(cfg: Config) -> None:
 
 
 def lane_spawn_alert(cfg: Config, me: str, target: str, failures: list[str], *,
-                     rolled_back: bool, pool_state: str, now: float) -> None:
-    """One issue when an update during a launchd timer stall could not bring
-    its lanes (or the interval guard) back with demand spawns, or left the
-    host off, where nothing retries. Best effort: never raises."""
+                     rolled_back: bool, pool_state: str, now: float,
+                     during_stall: bool = True) -> None:
+    """One issue when an update cannot restore its lanes or interval guard."""
     if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
         return
     try:
@@ -2610,32 +2609,37 @@ def lane_spawn_alert(cfg: Config, me: str, target: str, failures: list[str], *,
         path = cfg.state_dir / "lane-spawn-alert.json"
         prior = (_read_json(path) or {}).get("since")
         since = prior if isinstance(prior, str) and prior else _iso(now)
+        stall_suffix = " during a launchd stall" if during_stall else ""
         if pool_state == LANES_DOWN:
-            title = f"[tartci] {me}: lanes NOT RUNNING after a self-update during a launchd stall"
+            title = f"[tartci] {me}: lanes NOT RUNNING after a self-update{stall_suffix}"
             outcome = ("The pool is on but at least one lane is not running, and the rollback "
                        "could not start it either.")
         elif pool_state == GUARD_DOWN:
-            title = (f"[tartci] {me}: interval guard NOT RUNNING after a self-update during a "
-                     "launchd stall")
+            title = (f"[tartci] {me}: interval guard NOT RUNNING after a self-update"
+                     f"{stall_suffix}")
             outcome = ("The lanes run, but no supervisor is running the interval guard, so "
                        "nothing will restart a lane or timer that stops.")
         elif pool_state not in ("on", "undrained"):
-            title = f"[tartci] {me} left {pool_state.upper()} by a self-update during a launchd stall"
+            title = f"[tartci] {me} left {pool_state.upper()} by a self-update{stall_suffix}"
             outcome = ("Nothing retries `pool on` by itself: with the pool off no supervisor "
                        "runs the guard, and launchd starts neither the watchdog nor self-update. "
                        "Run `tartci pool on` on the host.")
         elif rolled_back:
-            title = f"[tartci] {me}: self-update rolled back, lanes did not start during a launchd stall"
+            title = f"[tartci] {me}: self-update rolled back, lanes did not start{stall_suffix}"
             outcome = (f"Self-update rolled back from {target[:12]}; the previous generation's "
                        "lanes started and verified.")
         else:
-            title = f"[tartci] {me}: self-update failed, lanes did not start during a launchd stall"
+            title = f"[tartci] {me}: self-update failed, lanes did not start{stall_suffix}"
             outcome = "Self-update failed; read the receipt for the host's state."
+        if during_stall:
+            opening = (f"`{me}`'s launchd is in a timer stall: it starts no job on its own, only "
+                       "`launchctl kickstart`. Self-update did not get the host back to serving "
+                       f"with its lanes and guard running. {outcome}")
+        else:
+            opening = f"`{me}`'s self-update did not get the host back to serving. {outcome}"
         body = "\n".join([
             "## What happened",
-            f"`{me}`'s launchd is in a timer stall: it starts no job on its own, only "
-            "`launchctl kickstart`. Self-update did not get the host back to serving with "
-            f"its lanes and guard running. {outcome}", "",
+            opening, "",
             "## Evidence",
             *[f"- {failure[:400]}" for failure in failures[-3:]],
             "- the self-update receipt's `demand-spawn` steps under "
@@ -5870,12 +5874,13 @@ class Run:
         # update failure, not evidence for the stall-specific incident. The
         # host-off alert below still records that failure for intervention.
         confirmed_stall = self.stall and self.stall != "unknown"
-        if confirmed_stall and (self.spawn_failures or self.receipt.value["host_off"]):
+        if self.spawn_failures or self.receipt.value["host_off"] \
+                or pool_state in (LANES_DOWN, GUARD_DOWN):
             if self.spawn_failures:
                 self.receipt.value["lanes_not_started"] = self.spawn_failures[-1]
             lane_spawn_alert(self.cfg, self.me, self.target, self.spawn_failures or [message],
                              rolled_back=status == "rolled_back", pool_state=pool_state,
-                             now=self.sys.now())
+                             now=self.sys.now(), during_stall=bool(confirmed_stall))
         self.receipt.step(status, message, ok=False)
         self.receipt.finish(status, message)
         if self.receipt.value["host_off"]:

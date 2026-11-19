@@ -2571,8 +2571,9 @@ wrong one to rely on for its own alert, so its peers raise it.
   `Run: ssh <peer> 'tartci doctor fleet'` and the fix: nothing; the host heals
   itself, and the next planned reboot clears the stall. Only when the peer's
   guard still lists self-update as paused (a generation from before the
-  stall-safe update) does the body name the one `launchctl kickstart` of its
-  self-update that installs the fix. The watchdog log prints a
+  stall-safe update) does the body instruct an operator to run the installed
+  shim unscheduled: `~/.local/bin/tartci fleet-macos self-update --apply`.
+  The watchdog log prints a
   `WARN peer-stall` line each read while it holds.
 - **One reader acts.** Every watchdog runs on the same cadence, so reads of a
   peer line up. The peer's primary reader, the lowest published host id other
