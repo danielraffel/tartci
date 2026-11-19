@@ -41,7 +41,11 @@ open_in_utm() {   # $1 = qcow2 path
 write_marker() {   # $1 = newly created clone
   local clone="$1" owner="${TARTCI_BENCH_OWNER:-${USER:-unknown}}"
   local ttl="${TARTCI_BENCH_TTL_DAYS:-14}" created
-  case "$ttl" in *[!0-9]*|0|"") echo "invalid TARTCI_BENCH_TTL_DAYS: $ttl" >&2; return 2;; esac
+  case "$ttl" in *[!0-9]*|"") echo "invalid TARTCI_BENCH_TTL_DAYS: $ttl" >&2; return 2;; esac
+  if [ -z "${ttl//0/}" ]; then
+    echo "invalid TARTCI_BENCH_TTL_DAYS: $ttl" >&2
+    return 2
+  fi
   created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   TARTCI_MARKER_OWNER="$owner" TARTCI_MARKER_CREATED="$created" TARTCI_MARKER_TTL="$ttl" \
     /usr/bin/python3 -c 'import json, os, sys; json.dump({"owner": os.environ["TARTCI_MARKER_OWNER"], "created": os.environ["TARTCI_MARKER_CREATED"], "ttl_days": int(os.environ["TARTCI_MARKER_TTL"])}, open(sys.argv[1], "x"))' \

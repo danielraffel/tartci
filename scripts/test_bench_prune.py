@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Bench expiry is opt-in per clone and never removes unmarked owner data."""
 
+import contextlib
 import json
+import io
 import os
 import pathlib
 import subprocess
@@ -80,6 +82,27 @@ class BenchPruneTests(unittest.TestCase):
         report = bench_prune.plan(self.store, runner=failed, now=NOW)
         self.assertEqual(report["entries"][0]["verdict"], "keep")
 
+    def test_non_string_created_is_kept_as_unreadable(self):
+        clone = self.clone("bad-created")
+        pathlib.Path(str(clone) + ".tartci-bench.json").write_text(json.dumps({
+            "owner": "test", "created": None, "ttl_days": 14,
+        }))
+        report = bench_prune.plan(self.store, runner=self.lsof, now=NOW)
+        row = next(entry for entry in report["entries"] if entry["name"] == "bad-created")
+        self.assertEqual(row["verdict"], "keep")
+        self.assertIn("invalid created", row["reason"])
+
+    def test_empty_bench_env_uses_home_default(self):
+        home = pathlib.Path(self.temp.name) / "home"
+        default_store = home / "bench"
+        default_store.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"TARTCI_HOME": str(home), "TARTCI_BENCH": ""}):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(bench_prune.main(["--json"], runner=self.lsof, now=NOW), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["store"], str(default_store))
+
     def test_new_windows_clone_gets_marker(self):
         golden = pathlib.Path(self.temp.name) / "goldens"
         golden.mkdir()
@@ -97,6 +120,17 @@ class BenchPruneTests(unittest.TestCase):
         self.assertEqual(marker["owner"], "bench-test")
         self.assertEqual(marker["ttl_days"], 3)
         self.assertIsNotNone(datetime.fromisoformat(marker["created"].replace("Z", "+00:00")).tzinfo)
+
+    def test_zero_ttl_is_rejected(self):
+        golden = pathlib.Path(self.temp.name) / "goldens"
+        golden.mkdir()
+        (golden / "base-windows.qcow2").write_bytes(b"golden")
+        env = dict(os.environ, TARTCI_GOLDENS=str(golden), TARTCI_BENCH=str(self.store),
+                   TARTCI_BENCH_TTL_DAYS="00")
+        proc = subprocess.run(["bash", str(ROOT / "bench/bench.sh"), "windows", "clone"],
+                              env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("invalid TARTCI_BENCH_TTL_DAYS: 00", proc.stderr)
 
 
 if __name__ == "__main__":

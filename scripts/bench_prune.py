@@ -46,7 +46,10 @@ def marker_created(path: pathlib.Path) -> tuple[datetime, float]:
     if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) \
             or not math.isfinite(ttl) or ttl <= 0:
         raise ValueError("invalid ttl_days")
-    created = datetime.fromisoformat(value["created"].replace("Z", "+00:00"))
+    created_value = value.get("created")
+    if not isinstance(created_value, str) or not created_value:
+        raise ValueError("invalid created")
+    created = datetime.fromisoformat(created_value.replace("Z", "+00:00"))
     if created.tzinfo is None or created.utcoffset() != timedelta(0):
         raise ValueError("created must be UTC")
     return created, ttl
@@ -132,7 +135,8 @@ def main(argv: list[str] | None = None, runner: Runner = subprocess.run,
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     home = pathlib.Path(os.environ.get("TARTCI_HOME", pathlib.Path.home() / ".tartci"))
-    store = pathlib.Path(os.environ.get("TARTCI_BENCH", home / "bench"))
+    bench_value = os.environ.get("TARTCI_BENCH")
+    store = pathlib.Path(bench_value) if bench_value else home / "bench"
     report = plan(store, runner, now)
     report["mode"] = "apply" if args.apply else "plan"
     if args.apply and not report.get("error"):
