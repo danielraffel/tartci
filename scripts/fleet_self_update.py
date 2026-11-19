@@ -3555,7 +3555,7 @@ def _recovery_lane_spawn_alert(cfg: Config, sys_: System, value: dict,
                                result: Result, *, target: str | None) -> None:
     """Open the lane incident when early recovery cannot restore service."""
     stall = value.get("launchd_stall") or stall_since(cfg.state_dir, sys_.now())
-    if not stall or stall == "unknown" or result.rc == 0:
+    if result.rc == 0:
         return
     try:
         me = self_host_id(cfg)
@@ -3564,8 +3564,9 @@ def _recovery_lane_spawn_alert(cfg: Config, sys_: System, value: dict,
     detail = result.text or "recovery pool on failed"
     lane_spawn_alert(cfg, me, target or value.get("target") or "unknown", [detail],
                      rolled_back=False,
-                     pool_state=GUARD_DOWN if "interval guard" in detail else LANES_DOWN,
-                     now=sys_.now())
+                     pool_state=(result.state if result.state in (LANES_DOWN, GUARD_DOWN)
+                                 else LANES_DOWN),
+                     now=sys_.now(), during_stall=bool(stall and stall != "unknown"))
 
 
 def _ts(text: str | None) -> float:
