@@ -43,8 +43,13 @@ def marker_created(path: pathlib.Path) -> tuple[datetime, float]:
             or not value["owner"]:
         raise ValueError("invalid owner")
     ttl = value.get("ttl_days")
-    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) \
-            or not math.isfinite(ttl) or ttl <= 0:
+    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+        raise ValueError("invalid ttl_days")
+    try:
+        finite = math.isfinite(ttl)
+    except OverflowError as exc:
+        raise ValueError("invalid ttl_days") from exc
+    if not finite or ttl <= 0:
         raise ValueError("invalid ttl_days")
     created_value = value.get("created")
     if not isinstance(created_value, str) or not created_value:
@@ -127,7 +132,7 @@ def apply(report: dict[str, Any], runner: Runner = subprocess.run) -> list[str]:
                 path.unlink()
             marker.unlink()
             row["deleted"] = True
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
             errors.append(f"{path}: {exc}")
     return errors
 

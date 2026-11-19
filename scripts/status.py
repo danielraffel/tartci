@@ -79,7 +79,8 @@ def pool_disk_attribution(disk: dict[str, Any], home: Path,
     now = time.time() if now is None else now
     try:
         cached = json.loads(cache.read_text(encoding="utf-8"))
-        if cached.get("home") == str(home) and now - float(cached["at"]) < ATTRIBUTION_CACHE_SECONDS:
+        age = now - float(cached["at"])
+        if cached.get("home") == str(home) and 0 <= age < ATTRIBUTION_CACHE_SECONDS:
             return str(cached["line"])
     except (OSError, ValueError, KeyError, TypeError):
         pass

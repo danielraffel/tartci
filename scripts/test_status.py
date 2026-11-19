@@ -226,6 +226,22 @@ class StatusOutputTests(unittest.TestCase):
                 {"role": "vm_store", "state": "problem", "used_percent": 92},
                 root, runner=timed_out, cache=root / "c3.json"), "disk: vm_store attribution: unavailable")
 
+    def test_pool_vm_store_attribution_does_not_reuse_future_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            calls = []
+
+            def fake_du(argv, timeout=10):
+                calls.append(argv)
+                return {"ok": True, "stdout": "", "stderr": "", "returncode": 0}
+
+            cache = root / "cache.json"
+            disk = {"role": "vm_store", "state": "problem", "used_percent": 92}
+            status.pool_disk_attribution(disk, root, runner=fake_du, cache=cache, now=1000.0)
+            self.assertEqual(len(calls), 1)
+            status.pool_disk_attribution(disk, root, runner=fake_du, cache=cache, now=900.0)
+            self.assertEqual(len(calls), 2)
+
     def _quiet_main(self, argv):
         buffer = io.StringIO()
         with mock.patch.object(status, "tart_vms", return_value={}), \

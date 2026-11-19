@@ -101,6 +101,19 @@ class BenchPruneTests(unittest.TestCase):
         self.assertEqual(row["verdict"], "keep")
         self.assertIn("invalid created", row["reason"])
 
+    def test_apply_keeps_clone_when_marker_changes_to_oversized_ttl(self):
+        clone = self.clone("changed")
+        report = bench_prune.plan(self.store, runner=self.lsof, now=NOW)
+        pathlib.Path(str(clone) + ".tartci-bench.json").write_text(json.dumps({
+            "owner": "test", "created": (NOW - timedelta(days=20)).isoformat(),
+            "ttl_days": 10 ** 1000,
+        }))
+        errors = bench_prune.apply(report, runner=self.lsof)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("invalid ttl_days", errors[0])
+        self.assertTrue(clone.exists())
+        self.assertTrue(pathlib.Path(str(clone) + ".tartci-bench.json").exists())
+
     def test_empty_bench_env_uses_home_default(self):
         home = pathlib.Path(self.temp.name) / "home"
         default_store = home / "bench"
