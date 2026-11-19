@@ -3469,6 +3469,39 @@ def _attempts(state_dir: Path) -> list[tuple[Path, dict]]:
     return rows
 
 
+def _recovery_receipt(cfg: Config, sys_: System, path: Path | None = None,
+                      value: dict | None = None) -> Receipt:
+    """Build the receipt adapter used by early recovery's shared pool-on path."""
+    if path is not None and value is not None:
+        receipt = Receipt.__new__(Receipt)
+        receipt.cfg, receipt.sys, receipt.path, receipt.value = cfg, sys_, path, value
+        return receipt
+    return Receipt(cfg, sys_, None, "plan")
+
+
+def _verified_recovery_pool_on(cfg: Config, sys_: System, receipt: Receipt, *,
+                               stopped_lanes: list[str],
+                               guard_owner_before: int | None) -> Result:
+    """Use Run's demand-spawn and guard verification for an early recovery.
+
+    Recovery has no update target or install arguments, but the safety proof for
+    ``pool on`` is identical: every lane it names must have a live pid, and a
+    configured interval guard must write a pass owned by one of those pids.
+    """
+    run = Run.__new__(Run)
+    run.cfg, run.sys, run.receipt = cfg, sys_, receipt
+    run.stopped_lanes = list(stopped_lanes)
+    run.guard_owner_before = guard_owner_before
+    run.spawn_failure = run.spawn_state = None
+    run.spawn_failures = []
+    run.terminating = False
+    run.pool_on_text = ""
+    if run._pool_on():
+        return Result(0, run.pool_on_text)
+    detail = run.spawn_failure or run.pool_on_text or "pool on failed"
+    return Result(1, run.pool_on_text, detail)
+
+
 def _ts(text: str | None) -> float:
     try:
         return dt.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -3674,13 +3707,27 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
                 os.replace(tmp, pin)
                 notes.append(f"pin re-matched to the live launcher ({str(running)[:12]})")
         pending = _read_json(cfg.state_dir / tart_pin.PENDING)
+        on = None
         if pending is not None:
             # Killed mid Tart upgrade: which Tart is linked is unknown. Hold
             # the host OFF rather than serve on it.
             notes.append(f"HOST HELD OFF: killed mid Tart upgrade ({pending.get('installed')} -> "
                          f"{pending.get('pin')}); {TART_RECOVERY}")
         else:
-            on = installed_tartci(cfg, sys_, "pool", "on")
+            stopped_lanes = value.get("stopped_lanes")
+            if not isinstance(stopped_lanes, list) or not all(isinstance(label, str)
+                                                               for label in stopped_lanes):
+                # Receipts written before stopped_lanes was persisted are
+                # treated conservatively: an unnamed pool-on cannot claim the
+                # lanes this interrupted run may have stopped are healthy.
+                stopped_lanes = ["<unknown interrupted lane>"]
+            owner = value.get("guard_owner_before")
+            guard_owner = (owner if isinstance(owner, int) and owner > 0
+                           else guard_receipt(cfg.state_dir)[1])
+            receipt = _recovery_receipt(cfg, sys_, path, value)
+            on = _verified_recovery_pool_on(cfg, sys_, receipt,
+                                            stopped_lanes=stopped_lanes,
+                                            guard_owner_before=guard_owner)
             notes.append("host is on" if on.rc == 0
                          else f"HOST LEFT OFF: pool on failed: {on.text[:200]}")
         message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
@@ -3694,8 +3741,10 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
         _write_json(cfg.state_dir / "last.json", {"status": "failed", "target": target,
                                                   "error": message, "at": value["finished_at"],
                                                   "receipt": str(path),
-                                                  **({"host_off": True, "pool_state": "off"}
-                                                     if pending is not None else {})})
+                                                  "host_off": pending is not None or on is None
+                                                  or on.rc != 0,
+                                                  "pool_state": "off" if pending is not None
+                                                  or on is None or on.rc != 0 else "on"})
         if pending is not None:
             tart_pin.hold(cfg.state_dir, sys_.now(), message)
         print(f"self-update: FAILED (recovered interrupted run): {message}", file=sys.stderr)
@@ -3714,7 +3763,21 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
     import host_off  # noqa: PLC0415 - sibling module
 
     def pool_on() -> tuple[int, str]:
-        result = installed_tartci(cfg, sys_, "pool", "on")
+        last = _read_json(cfg.state_dir / "last.json") or {}
+        prior_path = Path(last["receipt"]) if isinstance(last.get("receipt"), str) else None
+        prior = _read_json(prior_path) if prior_path is not None else None
+        receipt = _recovery_receipt(cfg, sys_)
+        # A host_off record means a prior update stopped service. New receipts
+        # persist the exact set; old records are conservative when pool on
+        # names nothing. The current guard owner activates the same post-on
+        # guard proof used by Run._pool_on.
+        stopped = prior.get("stopped_lanes") if isinstance(prior, dict) else None
+        if not isinstance(stopped, list) or not all(isinstance(label, str) for label in stopped):
+            stopped = ["<unknown left-off lane>"]
+        _, owner = guard_receipt(cfg.state_dir)
+        result = _verified_recovery_pool_on(cfg, sys_, receipt,
+                                            stopped_lanes=stopped,
+                                            guard_owner_before=owner)
         return result.rc, result.text
 
     if not (_read_json(cfg.state_dir / "last.json") or {}).get("host_off"):
@@ -5168,6 +5231,7 @@ class Run:
     def _latch_stall(self) -> None:
         """Read the stall again right before a pool off, while the guard runs."""
         self.guard_owner_before = guard_receipt(self.cfg.state_dir)[1]
+        self.receipt.value["guard_owner_before"] = self.guard_owner_before
         if not self.stall:
             self.stall = stall_since(self.cfg.state_dir, self.sys.now())
         if self.stall and not self.receipt.value.get("launchd_stall"):
@@ -5181,6 +5245,7 @@ class Run:
         for label in _BOOTED_OUT.findall(text or ""):
             if label not in self.stopped_lanes:
                 self.stopped_lanes.append(label)
+        self.receipt.value["stopped_lanes"] = list(self.stopped_lanes)
 
     def _lane_state(self, label: str) -> tuple[bool, int | None, int | None]:
         """(running, runs, pid) for one lane from `launchctl print`."""
