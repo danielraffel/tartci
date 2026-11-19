@@ -36,7 +36,7 @@ when that supervisor exits. Each pass reads the fleet's LaunchAgents
   * kicks an overdue self-update like any other timer agent, stall or not.
     An update stops every supervisor, so no guard runs while it does; during
     a stall episode self-update therefore starts every lane it stopped with
-    `launchctl kickstart` itself and verifies them and this guard back
+    launchctl kickstart itself and verifies them and this guard back
     (fleet_self_update.py, Run._demand_spawn) instead of leaving any start to
     launchd;
   * opens a domain-wide episode when two or more interval agents have gone
