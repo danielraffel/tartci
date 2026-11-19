@@ -145,6 +145,7 @@ class FakeSystem(su.System):
                                 "fleet": {"managed": True, "fleet_ready": True,
                                           "serving": {"blocked": False}}}
         self.guard_rcs = (2, 0)
+        self.guard_diff_rc = 0
         self.settling_reads = 0        # status reads that still miss a first heartbeat
         self.settling_code = "heartbeat_missing"
         self.bundle_commit = None      # what the built bundle claims (default: target)
@@ -354,6 +355,8 @@ class FakeSystem(su.System):
                 if a[-1] == "origin/main":
                     return su.Result(1 if a[-2] in self.off_main else 0)
                 return su.Result(0 if self.ancestor else 1)
+            if "diff" in a:
+                return su.Result(self.guard_diff_rc, "", "diff failed" if self.guard_diff_rc != 0 else "")
             if "log" in a:
                 # Honour `base..main` the way git does: commits newer than base.
                 base = next((x.split("..")[0] for x in a if ".." in x), None)
@@ -3163,6 +3166,10 @@ class PausedByStallTests(Base):
             "target": T_OLD, "oldest_undeployed": "2026-10-05T05:21:21Z",
             "measured_at": su._iso(time.time())})
 
+    def behind_main_for(self, seconds):
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
     def test_a_paused_self_update_says_why_everywhere(self):
         # m3 from 2026-10-05: behind and stale, no attempt since, the guard
         # holding it. Its status and doctor read like a failed update.
@@ -3190,6 +3197,44 @@ class PausedByStallTests(Base):
         receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
         self.assertIn("PAUSED by the launchd timer stall",
                       json.loads(receipts[-1].read_text())["error"])
+
+    def test_a_starved_run_overrides_stall_when_target_changes_guard(self):
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.guard()
+        self.sys.guard_diff_rc = 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                                  scheduled=True)
+        self.assertEqual(rc, su.EXIT_OK)
+        self.assertEqual(out.getvalue().count("self-update: stall pause overridden:"), 1)
+        self.assertIn(
+            "self-update: stall pause overridden: STARVED 4.2 h and the target changes the "
+            "launchd stall guard (111111111111..aaaaaaaaaaaa); the apply verifies pool-on and "
+            "rolls back on failure\n", out.getvalue())
+
+    def test_a_starved_run_keeps_stall_refusal_when_guard_is_unchanged(self):
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.guard()
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+
+    def test_a_non_starved_run_keeps_stall_refusal_when_guard_changes(self):
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS - 600)
+        self.guard()
+        self.sys.guard_diff_rc = 1
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+
+    def test_a_git_diff_failure_keeps_stall_refusal(self):
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.guard()
+        self.sys.guard_diff_rc = 2
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
 
     def test_a_kicked_run_refuses_even_when_the_guard_lists_it_running(self):
         # The guard omits a running self-update from `paused`; the open

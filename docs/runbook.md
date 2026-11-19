@@ -3012,6 +3012,8 @@ fleet`), and check GitHub's job history against it with
   stall, so a scheduled self-update now refuses by itself while the interval
   guard holds it for a stall (`self-update PAUSED by the launchd timer
   stall`). A run started by hand without `--scheduled` is not held.
+  When the host is past the STARVED bound and the target changes the stall guard,
+  the scheduled apply overrides this pause and verifies pool-on with rollback.
 - **A host the capacity floor refuses steps aside.** The floor is read
   before a host defers. When it refuses (the host is the last server of a
   required label and no peer can mint it on demand), the host cannot take a

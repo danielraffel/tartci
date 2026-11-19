@@ -647,6 +647,30 @@ def stall_refusal(state_dir: Path) -> str | None:
             "run (a tick or a kick) waits until the stall ends")
 
 
+def scheduled_stall_refusal(cfg: Config, sys_: System, installed: str, target: str,
+                            skew: dict, now: float, *, reported: bool = False
+                            ) -> tuple[str | None, bool]:
+    """Apply the narrow deadlock escape for a scheduled run, if proven safe."""
+    refusal = stall_refusal(cfg.state_dir)
+    if refusal is None:
+        return None, reported
+    behind = behind_main_seconds(skew, cfg.soak_seconds, now)
+    if behind is None or behind <= BEHIND_STARVED_SECONDS:
+        return refusal, reported
+    try:
+        diff = sys_.run(["git", "-C", str(cfg.checkout), "diff", "--quiet",
+                         installed, target, "--", "scripts/launchd_interval_guard.py"])
+    except Exception:  # noqa: BLE001 - an unreadable checkout fails closed
+        return refusal, reported
+    if diff.rc != 1:
+        return refusal, reported
+    if not reported:
+        print(f"self-update: stall pause overridden: STARVED {behind / 3600:.1f} h and the "
+              f"target changes the launchd stall guard ({installed[:12]}..{target[:12]}); "
+              "the apply verifies pool-on and rolls back on failure", flush=True)
+    return None, True
+
+
 def summary(home: Path | None = None) -> dict:
     """Cached skew + last attempt for status surfaces. Never fetches or raises."""
     state = state_dir_for(home or Path.home())
@@ -3907,6 +3931,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # peer never accumulated its unreadable-read streak and every host
         # could wait forever for a fresh report.  Plans remain read-only.
         survey = survey_peers(cfg, sys_, me, record=apply)
+        stall_override_reported = False
         if apply:
             paused = scheduled_pause(cfg.state_dir)
             if paused:
@@ -3916,7 +3941,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             # supervisor, and lane restarts left to launchd would pend. A
             # demand start (a peer's handoff kick, a hand kickstart) still
             # spawns it, so a scheduled run refuses here itself.
-            stalled = stall_refusal(cfg.state_dir) if scheduled else None
+            stalled, stall_override_reported = (
+                scheduled_stall_refusal(cfg, sys_, installed, target, skew, now,
+                                        reported=stall_override_reported)
+                if scheduled else (None, stall_override_reported))
             if stalled:
                 raise Refused(stalled)
             halted = halt_reason(cfg.state_dir)
@@ -4196,7 +4224,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_OK
         # A stall can open during the stagger, checkout, preflight or build:
         # check again at the last step before the drain.
-        stalled = stall_refusal(cfg.state_dir) if scheduled else None
+        stalled, stall_override_reported = (
+            scheduled_stall_refusal(cfg, sys_, installed, target, skew, now,
+                                    reported=stall_override_reported)
+            if scheduled else (None, stall_override_reported))
         if stalled:
             raise Refused(stalled)
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
