@@ -3,10 +3,11 @@
 
 A stalled macOS automatic install can leave launchd refusing every
 non-demand spawn (launchd_interval_guard.py). The guard keeps the timers
-running from inside a lane supervisor, but it pauses self-update for the whole
-episode, and nothing on the stalled host opened an issue: m3 sat stalled from
-2026-10-05T05:41Z for 97 h, 44 commits behind, while every view said it was
-serving. A host in that state is the wrong one to rely on for its own alert.
+running from inside a lane supervisor, self-update included, and nothing on
+the stalled host opens an issue: m3 sat stalled from 2026-10-05T05:41Z for
+97 h while every view said it was serving (self-update was then paused for the
+episode; it no longer is). A host in that state is the wrong one to rely on
+for its own alert.
 
 So every fleet host reads its peers. The launchd watchdog runs `alert_pass`
 every 300 s; at most once per READ_SECS it reads each published peer's guard
@@ -15,6 +16,10 @@ guard's own `classify` on that clock. A stall episode open for STALL_ALERT_SECS
 opens one GitHub issue per peer and episode, titled
 
     [tartci] <peer> launchd stalled / self-update paused since <episode start>
+
+The title still says "self-update paused" because readers on every generation
+adopt the open issue by its exact title; a new title would open a duplicate
+while hosts on older generations still read. The body says what is true now.
 
 Every watchdog runs on the same cadence, so the reads of one peer align by
 construction. One host acts for each stalled peer: its primary reader, the
@@ -220,11 +225,16 @@ def alert_text(peer: str, target: str, me: str, info: Dict[str, Any],
     body = "\n".join([
         f"{peer}'s launchd has not started its timer jobs on its own since {verdict['since']} "
         f"({verdict['hours']} h). "
-        + ("The guard lists self-update as paused, so its tartci is not updating."
-           if held else "The guard is starting the timers; self-update is not listed as paused."),
+        + (f"The guard lists self-update as paused: {peer} runs a tartci from before "
+           "self-update was made stall-safe, so it is not updating. On a sealed-launcher host "
+           "the old scheduled launcher still refuses before it can hand off. Run the "
+           "installed shim unscheduled, by hand: `ssh " + target + " '$HOME/.local/bin/tartci "
+           "fleet-macos self-update --apply'`."
+           if held else "The guard is starting the timers, self-update included."),
         f"Run: ssh {target} 'tartci doctor fleet'",
-        f"Fix: reboot {peer} when its lanes are idle; a reboot clears the stall. "
-        "Do not kickstart self-update while the stall lasts.",
+        "Fix: nothing; it heals itself. The guard keeps every timer running for as long as "
+        "the stall lasts, and an update during it starts and verifies its own lanes. The next "
+        "reboot (planned, with the lanes drained) clears the stall; do not reboot only for it.",
         "",
         f"Stalled agents ({len(stalled)}): {', '.join(stalled[:8])}"
         + (" ..." if len(stalled) > 8 else ""),

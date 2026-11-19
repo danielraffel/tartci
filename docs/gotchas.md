@@ -79,20 +79,41 @@ for this stall could not install itself.
 
 **Fix:** `scripts/launchd_interval_guard.py` runs inside the lane supervisors
 and kicks any timer agent whose run count has not moved for twice its interval.
-A host on a generation from before that guard needs one manual
-`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`; after that
-it heals on its own. To spot it, compare the age of the newest entry in
+A host on a generation from before that guard needs the installed shim run
+once by hand, without `--scheduled`, because the old scheduled launcher refuses
+before it can hand off: `~/.local/bin/tartci fleet-macos self-update --apply`.
+After that it heals on its own. To spot it, compare the age of the newest entry in
 `~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
 not the exit code.
 
-The one agent the guard does not kick is self-update, for as long as the stall
-lasts (`PAUSE_DURING_STALL`): an update stops every supervisor, so no guard
-would run and any lane restart left to launchd would pend. Self-update then
-writes no log line and no attempt for days (m3 from 2026-10-05, 44 commits
-behind). `tartci fleet-macos self-update --status` and `tartci doctor fleet`
-say so (`self_update_paused`, with the stall's start) rather than reading like
-a failed update. The remedy is the stall's: reboot when the lanes are idle.
-Do not kickstart self-update during the stall.
+Self-update is kicked like any other timer, stall or not. Until 2026-11-18 it
+was the one exception (`PAUSE_DURING_STALL`): an update stops every
+supervisor, so no guard runs while it does, and a lane restart left to
+launchd would pend. That left m3 not updating for days (from 2026-10-05, 44
+commits behind; again from 2026-11-18T07:11Z), with a reboot as the only
+remedy. Now an update reads the stall before its `pool off` and keeps that
+answer for the whole run: after every `pool on` (forward, rollback, recovery)
+it kickstarts each lane `pool on` enabled, waits up to 120 s for each to be
+running (a pid; a supervisor that started and exited 75 pends again and is
+re-kicked), and then waits up to 180 s for the interval guard to write a pass
+again. A lane or guard that does not come back fails the update and rolls back
+through the same path; if the rollback's do not come back either, the host is
+left with its pool on, reported as `on-lanes-not-running` or
+`on-guard-not-running` (never reinstalled for it), and an issue opens
+(event `self_update_lanes_not_started`). A run that leaves the pool OFF during
+a stall says that nothing will retry `pool on` (no supervisor, so no guard, and
+launchd starts neither the watchdog nor self-update) and opens the same issue.
+A terminated run kicks each lane once and does not wait. The receipt's
+`launchd-stall` and `demand-spawn` steps show each step.
+
+**Remedy: run the installed shim unscheduled on pre-change generations.** The
+guard keeps every timer running for as long as the stall lasts, self-update
+included. A sealed host still running the old scheduled launcher can refuse
+before handoff, so it does not pick up this fix automatically. Run
+`~/.local/bin/tartci fleet-macos self-update --apply` by hand as shown above.
+After that migration, the host heals itself. Do not reboot or log out only to
+clear the stall: the next planned reboot (the next macOS install, with the
+lanes drained) clears it.
 
 The entries are grouped by the kind of failure they describe. If a fresh host
 does not behave as expected, start with the matching symptom and run the

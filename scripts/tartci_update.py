@@ -66,7 +66,7 @@ def snapshot(state_dir: Path, now: float | None = None) -> dict:
                   "at": last.get("finished_at") or last.get("started_at"),
                   "error": str(last.get("error") or "")[:300]} if last else None),
         "waiting": engine.waiting_line(state_dir, now),
-        "paused": engine.scheduled_pause(state_dir) or engine.paused_line(state_dir, now),
+        "paused": engine.scheduled_pause(state_dir),
         "halted": engine.halt_reason(state_dir),
     }
 
