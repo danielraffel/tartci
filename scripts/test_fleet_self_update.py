@@ -3670,6 +3670,14 @@ class StallSafeUpdateTests(Base):
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertTrue(any("interval guard NOT RUNNING" in t for t in opened), self.issues)
 
+    def test_a_failed_recovery_pool_on_is_reported_as_left_off(self):
+        su._recovery_lane_spawn_alert(self.cfg, self.sys, {"target": T_OLD},
+                                      su.Result(1, "pool on refused", "pool on refused", "off"),
+                                      target=T_OLD)
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertTrue(any("left OFF" in title for title in opened), self.issues)
+        self.assertFalse(any("NOT RUNNING" in title for title in opened), self.issues)
+
     def test_repeated_lane_failures_keep_one_alert_episode(self):
         failures = ["lane did not start"]
         su.lane_spawn_alert(self.cfg, "m1", T_OLD, failures, rolled_back=False,

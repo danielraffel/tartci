@@ -3563,8 +3563,10 @@ def _recovery_lane_spawn_alert(cfg: Config, sys_: System, value: dict,
     detail = result.text or "recovery pool on failed"
     lane_spawn_alert(cfg, me, target or value.get("target") or "unknown", [detail],
                      rolled_back=False,
-                     pool_state=(result.state if result.state in (LANES_DOWN, GUARD_DOWN)
-                                 else LANES_DOWN),
+                     # The real state: a recovery `pool on` that failed leaves the pool
+                     # off, which is reported as left OFF, never as lanes down after a
+                     # rollback that this path did not perform.
+                     pool_state=result.state or LANES_DOWN,
                      now=sys_.now(), during_stall=bool(stall and stall != "unknown"))
 
 

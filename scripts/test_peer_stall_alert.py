@@ -144,7 +144,7 @@ class PeerStall(unittest.TestCase):
         # the stale --scheduled argument and reaches the old refusal instead.
         self.assertIn("The guard lists self-update as paused", body[0])
         self.assertIn("old scheduled launcher still refuses", body[0])
-        self.assertIn("ssh studio '$HOME/.local/bin/tartci fleet-macos self-update --apply'",
+        self.assertIn("ssh m3 '$HOME/.local/bin/tartci fleet-macos self-update --apply'",
                       body[0])
         self.assertNotIn("launchctl kickstart", body[0])
         self.assertEqual(body[1], "Run: ssh m3 'tartci doctor fleet'")
