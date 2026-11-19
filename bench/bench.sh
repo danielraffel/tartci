@@ -17,6 +17,8 @@
 # Env:
 #   TARTCI_GOLDENS  dir holding goldens   (default: $HOME/.tartci/goldens)
 #   TARTCI_BENCH    dir holding benches   (default: $HOME/.tartci/bench)
+#   TARTCI_BENCH_OWNER owner in each new clone marker (default: $USER)
+#   TARTCI_BENCH_TTL_DAYS expiry in each new clone marker (default: 14)
 set -euo pipefail
 
 OS="${1:?usage: bench.sh <windows|linux|macos> [bench-name]}"
@@ -36,6 +38,16 @@ open_in_utm() {   # $1 = qcow2 path
   fi
 }
 
+write_marker() {   # $1 = newly created clone
+  local clone="$1" owner="${TARTCI_BENCH_OWNER:-${USER:-unknown}}"
+  local ttl="${TARTCI_BENCH_TTL_DAYS:-14}" created
+  case "$ttl" in *[!0-9]*|0|"") echo "invalid TARTCI_BENCH_TTL_DAYS: $ttl" >&2; return 2;; esac
+  created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  TARTCI_MARKER_OWNER="$owner" TARTCI_MARKER_CREATED="$created" TARTCI_MARKER_TTL="$ttl" \
+    /usr/bin/python3 -c 'import json, os, sys; json.dump({"owner": os.environ["TARTCI_MARKER_OWNER"], "created": os.environ["TARTCI_MARKER_CREATED"], "ttl_days": int(os.environ["TARTCI_MARKER_TTL"])}, open(sys.argv[1], "x"))' \
+    "${clone}.tartci-bench.json"
+}
+
 case "$OS" in
   windows)
     # Golden is already qcow2 — clone (CoW copy) into the bench, import to UTM.
@@ -45,6 +57,7 @@ case "$OS" in
     [ -e "$dst" ] && { echo "bench already exists: $dst — pick another name or remove it first (won't clobber your customized bench)"; exit 1; }
     echo "cloning $src → $dst"
     cp -c "$src" "$dst" 2>/dev/null || cp "$src" "$dst"   # APFS CoW when possible
+    write_marker "$dst"
     open_in_utm "$dst"
     ;;
   linux)
