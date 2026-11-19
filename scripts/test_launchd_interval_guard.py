@@ -484,7 +484,26 @@ class DomainStallTests(GuardCase):
         self.assertEqual(receipt["episode"]["labels"], sorted(labels))
         persisted = json.loads((self.state / "state.json").read_text())
         for label in labels:
-            self.assertEqual(persisted["agents"][label]["run_owner"], "unknown")
+            self.assertEqual(persisted["agents"][label]["run_owner"], "guard-started")
+            self.assertEqual(persisted["agents"][label]["natural_ts"], self.clock.now - 900)
+
+    def test_running_kicked_job_reclassifies_prior_launchd_run(self) -> None:
+        labels = ("com.danielraffel.tartci.reap",
+                  "com.danielraffel.tartci.launchd-watchdog")
+        for label in labels:
+            self.interval_agent(label, 300, running=True)
+        self.state.mkdir()
+        (self.state / "state.json").write_text(json.dumps({"agents": {
+            label: {"runs": 10, "progress_ts": self.clock.now - 900,
+                    "natural_ts": self.clock.now - 900, "pending_kicks": 1,
+                    "kicked_runs": 10, "run_owner": "launchd-started"}
+            for label in labels},
+            "episode": None}))
+        receipt = self.guard().pass_once()
+        self.assertTrue(receipt["episode"]["active"], receipt)
+        persisted = json.loads((self.state / "state.json").read_text())
+        for label in labels:
+            self.assertEqual(persisted["agents"][label]["run_owner"], "guard-started")
             self.assertEqual(persisted["agents"][label]["natural_ts"], self.clock.now - 900)
 
     def test_observed_launchd_started_long_runs_open_no_episode(self) -> None:

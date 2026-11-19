@@ -325,6 +325,10 @@ class Guard:
             # Did the last kick take? It ran (or is running) by now, or it did not.
             if obs["runs"] > int(mem.pop("kicked_runs")) or obs["running"]:
                 mem["unconfirmed"] = 0
+                if obs["running"]:
+                    # A still-running job after a kick belongs to the guard,
+                    # even if its previous run was launchd-started.
+                    mem["run_owner"] = "guard-started"
             else:
                 mem["unconfirmed"] = int(mem.get("unconfirmed", 0)) + 1
                 # A kick that started nothing caused no run, so it must not
@@ -376,6 +380,7 @@ class Guard:
         if ok:
             mem["pending_kicks"] = int(mem.get("pending_kicks", 0)) + 1
             mem["kicked_runs"] = obs["runs"]
+            mem["run_owner"] = "guard-started"
             mem["progress_ts"] = now
             kicked.append({"label": label, "interval": interval,
                            "seconds_since_progress": int(since)})
