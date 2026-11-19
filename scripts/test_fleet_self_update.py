@@ -3651,8 +3651,8 @@ class StallSafeUpdateTests(Base):
         self.assertTrue(outcome["attempted"])
         self.assertFalse(outcome["ok"])
         self.assertIn("not running", outcome["reason"])
-        self.assertTrue(self.last()["host_off"])
-        self.assertEqual("off", self.last()["pool_state"])
+        self.assertFalse(self.last()["host_off"])
+        self.assertEqual(su.LANES_DOWN, self.last()["pool_state"])
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertTrue(any("during a launchd stall" in title for title in opened), self.issues)
 

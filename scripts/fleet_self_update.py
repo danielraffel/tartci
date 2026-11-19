@@ -3839,6 +3839,10 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
         _recovery_lane_spawn_alert(cfg, sys_, prior or {}, result,
                                    target=(prior or {}).get("target") if isinstance(prior, dict)
                                    else None)
+        state = result.state or ("on" if result.rc == 0 else "off")
+        last.update(host_off=result.rc != 0 and state not in (LANES_DOWN, GUARD_DOWN),
+                    pool_state=state)
+        _write_json(cfg.state_dir / "last.json", last)
         return result.rc, result.text
 
     last_value = _read_json(cfg.state_dir / "last.json") or {}
@@ -5785,6 +5789,9 @@ class Run:
             if off.rc != 0:
                 raise Failed(f"pool off for rollback failed: {off.text}")
             self._reinstall_previous()
+            # The pool-off output names the target generation. Validate the
+            # restored generation against its own serving set instead.
+            self.stopped_lanes = sorted(installed_lane_labels(cfg))
             rollback_install_ok = True
             rollback_pin_ok = True
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
