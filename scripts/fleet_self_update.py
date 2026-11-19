@@ -656,10 +656,9 @@ def installed_lane_labels(cfg: Config) -> set[str]:
     if not isinstance(value, dict):
         return set()
     labels: set[str] = set()
-    for key in ("plists", "persistent_plists"):
-        rows = value.get(key)
-        if isinstance(rows, dict):
-            labels.update(name.removesuffix(".plist") for name in rows if isinstance(name, str))
+    rows = value.get("plists")
+    if isinstance(rows, dict):
+        labels.update(name.removesuffix(".plist") for name in rows if isinstance(name, str))
     return labels
 
 
