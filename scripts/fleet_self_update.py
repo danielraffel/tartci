@@ -641,6 +641,27 @@ def fresh_guard_owner(state_dir: Path, now: float) -> int | None:
     return owner if isinstance(owner, int) and owner > 0 else None
 
 
+def installed_lane_labels(cfg: Config) -> set[str]:
+    """Labels the installed fleet receipt says this generation serves."""
+    value = _read_json(cfg.install_receipt)
+    if not isinstance(value, dict):
+        return set()
+    labels: set[str] = set()
+    for key in ("plists", "persistent_plists"):
+        rows = value.get(key)
+        if isinstance(rows, dict):
+            labels.update(name.removesuffix(".plist") for name in rows if isinstance(name, str))
+    return labels
+
+
+def recovery_guard_owner(cfg: Config, sys_: System, value: dict) -> int | None:
+    """Preserve an explicit absent guard; infer only for old receipts."""
+    if "guard_owner_before" in value:
+        owner = value.get("guard_owner_before")
+        return owner if isinstance(owner, int) and owner > 0 else None
+    return fresh_guard_owner(cfg.state_dir, sys_.now())
+
+
 def stall_since(state_dir: Path, now: float | None = None) -> str | None:
     """The start of the launchd timer-stall episode the interval guard has
     open, None when a fresh receipt says there is none, or "unknown" when the
@@ -3749,9 +3770,7 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
                 # treated conservatively: an unnamed pool-on cannot claim the
                 # lanes this interrupted run may have stopped are healthy.
                 stopped_lanes = ["<unknown interrupted lane>"]
-            owner = value.get("guard_owner_before")
-            guard_owner = (owner if isinstance(owner, int) and owner > 0
-                           else guard_receipt(cfg.state_dir)[1])
+            guard_owner = recovery_guard_owner(cfg, sys_, value)
             receipt = _recovery_receipt(cfg, sys_, path, value)
             on = _verified_recovery_pool_on(cfg, sys_, receipt,
                                             stopped_lanes=stopped_lanes,
@@ -3803,7 +3822,7 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
         stopped = prior.get("stopped_lanes") if isinstance(prior, dict) else None
         if not isinstance(stopped, list) or not all(isinstance(label, str) for label in stopped):
             stopped = ["<unknown left-off lane>"]
-        owner = fresh_guard_owner(cfg.state_dir, sys_.now())
+        owner = recovery_guard_owner(cfg, sys_, prior if isinstance(prior, dict) else {})
         result = _verified_recovery_pool_on(cfg, sys_, receipt,
                                             stopped_lanes=stopped,
                                             guard_owner_before=owner)
@@ -5315,7 +5334,13 @@ class Run:
                 return failure, LANES_DOWN
             self.receipt.step("demand-spawn", "pool on enabled no lane and none was stopped")
             return None
-        skipped = [label for label in self.stopped_lanes if label not in enabled]
+        unknown_stopped = any(label.startswith("<unknown ") for label in self.stopped_lanes)
+        expected = installed_lane_labels(self.cfg) if unknown_stopped else set(self.stopped_lanes)
+        if unknown_stopped and not expected:
+            failure = "pool on could not verify lanes from a legacy receipt without stopped_lanes"
+            self.receipt.step("demand-spawn", failure, ok=False)
+            return failure, LANES_DOWN
+        skipped = [label for label in expected if label not in enabled]
         if skipped:
             retired = set()
             installed = _read_json(self.cfg.install_receipt)
@@ -5359,7 +5384,7 @@ class Run:
         deadline = started + LANE_SPAWN_TIMEOUT_SECONDS
         while True:
             still = []
-            for label in pending:
+            for label in enabled:
                 running, runs, _ = self._lane_state(label)
                 if running:
                     continue
@@ -5394,16 +5419,26 @@ class Run:
         while True:
             ts, owner = guard_receipt(self.cfg.state_dir)
             live_pids = set()
+            down = []
             for label in enabled:
                 running, _, pid = self._lane_state(label)
                 if running and pid is not None:
                     live_pids.add(pid)
-            if (ts is not None and ts >= started and owner is not None
+                else:
+                    down.append(label)
+            for label in down:
+                kick(label)
+            if (not down and ts is not None and ts >= started and owner is not None
                     and owner in live_pids):
                 self.receipt.step("demand-spawn", "interval guard running again "
                                   f"(pass at {_iso(ts)}, supervisor pid {owner})")
                 return None
             if self.sys.now() >= deadline:
+                if down:
+                    failure = (f"{len(down)} of {len(enabled)} lanes stopped while waiting for "
+                               f"the interval guard: {', '.join(down)}")
+                    self.receipt.step("demand-spawn", failure, ok=False)
+                    return failure, LANES_DOWN
                 failure = (f"no interval guard pass from a new live lane supervisor within "
                            f"{GUARD_BACK_TIMEOUT_SECONDS} s of the lanes starting (last pass "
                            f"{_iso(ts) if ts else 'never'}, owner pid "

@@ -3430,6 +3430,26 @@ class StallSafeUpdateTests(Base):
         self.assertLanesRunning()
         self.assertEqual(sorted(set(self.sys.kickstarts)), sorted(LANES))
 
+    def test_a_lane_that_exits_after_start_is_restarted_before_guard_success(self):
+        self.guard()
+        original = self.sys.run
+        dropped = {LANES[0]: False}
+
+        def run(argv, **kw):
+            result = original(argv, **kw)
+            if (argv[:2] == ["launchctl", "print"]
+                    and argv[-1].endswith(LANES[0])
+                    and not dropped[LANES[0]]
+                    and "pid =" in result.out):
+                dropped[LANES[0]] = True
+                self.sys.lanes[LANES[0]].update(running=False, pid=None)
+            return result
+
+        self.sys.run = run
+        self.assertUpdated(self.scheduled())
+        self.assertLanesRunning()
+        self.assertGreaterEqual(self.sys.kickstarts.count(LANES[0]), 2)
+
     def test_no_pause_is_reported_during_a_stall(self):
         import fleet_doctor
         su._write_json(self.cfg.state_dir / "skew.json", {
@@ -3550,6 +3570,39 @@ class StallSafeUpdateTests(Base):
         self.assertFalse(self.last()["host_off"])
         self.assertEqual("on", self.last()["pool_state"])
         self.assertIn("interval guard running again", path.read_text())
+
+    def test_interrupted_recovery_preserves_explicitly_absent_guard(self):
+        self.guard(age=10 * 3600)
+        self.sys.pool_state = "off"
+        for lane in self.sys.lanes.values():
+            lane.update(loaded=False, running=False, pid=None)
+        path = self.cfg.state_dir / "attempts" / "interrupted-no-guard.json"
+        value = {"mode": "apply", "status": "running", "pid": 999999,
+                 "target": T_NEW, "previous": INSTALLED,
+                 "steps": [{"step": "announce"}], "stopped_lanes": list(LANES),
+                 "guard_owner_before": None}
+        su._write_json(path, value)
+        su.recover_interrupted(self.cfg, self.sys, [path])
+        self.assertFalse(self.last()["host_off"])
+        self.assertEqual("on", self.last()["pool_state"])
+
+    def test_legacy_interrupted_receipt_uses_installed_serving_set(self):
+        self.guard()
+        su._write_json(self.cfg.install_receipt, {
+            "support": {"source_commit": INSTALLED},
+            "plists": {f"{label}.plist": {} for label in LANES},
+        })
+        self.sys.pool_state = "off"
+        for lane in self.sys.lanes.values():
+            lane.update(loaded=False, running=False, pid=None)
+        path = self.cfg.state_dir / "attempts" / "interrupted-legacy.json"
+        value = {"mode": "apply", "status": "running", "pid": 999999,
+                 "target": T_NEW, "previous": INSTALLED,
+                 "steps": [{"step": "announce"}]}
+        su._write_json(path, value)
+        su.recover_interrupted(self.cfg, self.sys, [path])
+        self.assertFalse(self.last()["host_off"])
+        self.assertEqual("on", self.last()["pool_state"])
 
     def test_interrupted_recovery_failure_opens_the_lane_incident(self):
         self.guard()
