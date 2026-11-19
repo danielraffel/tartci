@@ -433,6 +433,14 @@ class System:
         result = self.run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
         return result.out.strip() or None if result.rc == 0 else None
 
+    def process_parent(self, pid: int) -> int | None:
+        """The live process parent, or None when it cannot be read."""
+        result = self.run(["ps", "-o", "ppid=", "-p", str(pid)], timeout=10)
+        try:
+            return int(result.out.strip()) if result.rc == 0 else None
+        except ValueError:
+            return None
+
     def group_alive(self, pgid: int) -> bool:
         try:
             os.killpg(pgid, 0)
@@ -3704,6 +3712,22 @@ def _alive(sys_: System, pid: Any, start: Any) -> bool:
     return isinstance(pid, int) and start is not None and sys_.process_start(pid) == start
 
 
+def owner_belongs_to_lane(sys_: System, owner: int, lane_pid: int) -> bool:
+    """Accept a guard supervisor that is the launcher or its child process."""
+    current = owner
+    for _ in range(8):
+        if current == lane_pid:
+            return True
+        try:
+            parent = sys_.process_parent(current)
+        except Exception:  # noqa: BLE001 - an unreadable ancestry is not proof
+            return False
+        if parent is None or parent == current:
+            return False
+        current = parent
+    return False
+
+
 def previous_run_state(cfg: Config, sys_: System) -> tuple[str | None, list[Path]]:
     """(refusal, interrupted receipts).
 
@@ -5451,7 +5475,8 @@ class Run:
             for label in down:
                 kick(label)
             if (not down and ts is not None and ts >= started and owner is not None
-                    and owner in live_pids):
+                    and any(owner_belongs_to_lane(self.sys, owner, pid)
+                            for pid in live_pids)):
                 self.receipt.step("demand-spawn", "interval guard running again "
                                   f"(pass at {_iso(ts)}, supervisor pid {owner})")
                 return None
@@ -5792,6 +5817,7 @@ class Run:
             # The pool-off output names the target generation. Validate the
             # restored generation against its own serving set instead.
             self.stopped_lanes = sorted(installed_lane_labels(cfg))
+            self.receipt.value["stopped_lanes"] = list(self.stopped_lanes)
             rollback_install_ok = True
             rollback_pin_ok = True
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
