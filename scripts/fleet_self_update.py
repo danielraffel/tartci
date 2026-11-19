@@ -659,7 +659,11 @@ def recovery_guard_owner(cfg: Config, sys_: System, value: dict) -> int | None:
     """Preserve an explicit absent guard; infer only for old receipts."""
     if "guard_owner_before" in value:
         owner = value.get("guard_owner_before")
-        return owner if isinstance(owner, int) and owner > 0 else None
+        if not isinstance(owner, int) or owner <= 0:
+            return None
+        # A persisted owner is only meaningful while the current receipt is
+        # fresh. A stale receipt may mean the guard is disabled or absent.
+        return owner if fresh_guard_owner(cfg.state_dir, sys_.now()) is not None else None
     return fresh_guard_owner(cfg.state_dir, sys_.now())
 
 

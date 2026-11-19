@@ -3586,6 +3586,21 @@ class StallSafeUpdateTests(Base):
         self.assertFalse(self.last()["host_off"])
         self.assertEqual("on", self.last()["pool_state"])
 
+    def test_interrupted_recovery_ignores_stale_persisted_guard_owner(self):
+        self.guard(age=10 * 3600)
+        self.sys.pool_state = "off"
+        for lane in self.sys.lanes.values():
+            lane.update(loaded=False, running=False, pid=None)
+        path = self.cfg.state_dir / "attempts" / "interrupted-stale-guard.json"
+        value = {"mode": "apply", "status": "running", "pid": 999999,
+                 "target": T_NEW, "previous": INSTALLED,
+                 "steps": [{"step": "announce"}], "stopped_lanes": list(LANES),
+                 "guard_owner_before": 100}
+        su._write_json(path, value)
+        su.recover_interrupted(self.cfg, self.sys, [path])
+        self.assertFalse(self.last()["host_off"])
+        self.assertEqual("on", self.last()["pool_state"])
+
     def test_legacy_interrupted_receipt_uses_installed_serving_set(self):
         self.guard()
         su._write_json(self.cfg.install_receipt, {
