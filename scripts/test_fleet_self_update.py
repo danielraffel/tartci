@@ -3620,6 +3620,8 @@ class StallSafeUpdateTests(Base):
         su.recover_interrupted(self.cfg, self.sys, [path])
         opened = [title for kind, title in self.issues if kind == "open"]
         self.assertTrue(any("lanes NOT RUNNING" in title for title in opened), self.issues)
+        retry = su.recover_left_off(self.cfg, self.sys)
+        self.assertTrue(retry["attempted"])
 
     def test_left_off_recovery_retains_the_off_episode_when_lanes_do_not_start(self):
         self.guard()

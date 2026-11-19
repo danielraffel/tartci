@@ -323,6 +323,7 @@ class Result:
     rc: int
     out: str = ""
     err: str = ""
+    state: str | None = None
 
     @property
     def text(self) -> str:
@@ -3529,9 +3530,9 @@ def _verified_recovery_pool_on(cfg: Config, sys_: System, receipt: Receipt, *,
     run.terminating = False
     run.pool_on_text = ""
     if run._pool_on():
-        return Result(0, run.pool_on_text)
+        return Result(0, run.pool_on_text, state="on")
     detail = run.spawn_failure or run.pool_on_text or "pool on failed"
-    return Result(1, run.pool_on_text, detail)
+    return Result(1, run.pool_on_text, detail, run.spawn_state or "off")
 
 
 def _recovery_lane_spawn_alert(cfg: Config, sys_: System, value: dict,
@@ -3777,7 +3778,9 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
                                             guard_owner_before=guard_owner)
             _recovery_lane_spawn_alert(cfg, sys_, value, on, target=target)
             notes.append("host is on" if on.rc == 0
-                         else f"HOST LEFT OFF: pool on failed: {on.text[:200]}")
+                         else (f"host is on but recovery verification failed: {on.text[:200]}"
+                               if on.state in (LANES_DOWN, GUARD_DOWN)
+                               else f"HOST LEFT OFF: pool on failed: {on.text[:200]}"))
         message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
                    f"during {value['steps'][-1]['step'] if value.get('steps') else 'start'}; "
                    f"host runs {str(running)[:12]}; " + "; ".join(notes)
@@ -3790,9 +3793,12 @@ def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
                                                   "error": message, "at": value["finished_at"],
                                                   "receipt": str(path),
                                                   "host_off": pending is not None or on is None
-                                                  or on.rc != 0,
+                                                  or (on.rc != 0 and on.state not in
+                                                      (LANES_DOWN, GUARD_DOWN)),
                                                   "pool_state": "off" if pending is not None
-                                                  or on is None or on.rc != 0 else "on"})
+                                                  or on is None or (on.rc != 0 and on.state not in
+                                                                    (LANES_DOWN, GUARD_DOWN))
+                                                  else (on.state or "on")})
         if pending is not None:
             tart_pin.hold(cfg.state_dir, sys_.now(), message)
         print(f"self-update: FAILED (recovered interrupted run): {message}", file=sys.stderr)
@@ -3831,15 +3837,23 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
                                    else None)
         return result.rc, result.text
 
-    if not (_read_json(cfg.state_dir / "last.json") or {}).get("host_off"):
+    last_value = _read_json(cfg.state_dir / "last.json") or {}
+    needs_recovery = bool(last_value.get("host_off")) or \
+        last_value.get("pool_state") in (LANES_DOWN, GUARD_DOWN)
+    if not needs_recovery:
         return {"attempted": False, "ok": None, "reason": "not left off"}
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         pool_state = str(json.loads(status.out).get("state") or "unknown")
     except (json.JSONDecodeError, AttributeError):
         pool_state = "unknown"
-    outcome = host_off.recover(cfg.state_dir, host_off.pool_state_file(cfg.home), pool_on,
-                               now=sys_.now(), who="self-update", pool_state=pool_state)
+    if pool_state == "on" and last_value.get("pool_state") in (LANES_DOWN, GUARD_DOWN):
+        rc, text = pool_on()
+        outcome = {"attempted": True, "ok": rc == 0,
+                   "reason": "pool on verified" if rc == 0 else text}
+    else:
+        outcome = host_off.recover(cfg.state_dir, host_off.pool_state_file(cfg.home), pool_on,
+                                   now=sys_.now(), who="self-update", pool_state=pool_state)
     if outcome["attempted"]:
         word = "ON again" if outcome["ok"] else "STILL OFF"
         print(f"self-update: host was left OFF by a failed update; pool on: {word} "
@@ -5753,6 +5767,9 @@ class Run:
     def _rollback(self, reason: str) -> int:
         cfg, sys_ = self.cfg, self.sys
         self.receipt.step("rollback", f"reinstalling {self.previous[:12]} from {self.snapshot}")
+        # Validate the restored generation against only the lanes it serves;
+        # target-only labels must not leak into rollback demand-spawn checks.
+        self.stopped_lanes = []
         rollback_install_ok = False
         rollback_pin_ok = self.helper is None
         rollback_pool_on_ok = False
