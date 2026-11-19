@@ -37,6 +37,22 @@ def entry(kind: int, payload: bytes = b"payload") -> bytes:
     return b"\xcc\xac\x01" + bytes([kind]) + b"\x00" * 16 + payload
 
 
+def bsd_tar_path() -> str | None:
+    """A BSD tar binary: bsdtar itself, or a tar that reports bsdtar."""
+    found = shutil.which("bsdtar")
+    if found:
+        return found
+    tar = shutil.which("tar")
+    if tar is None:
+        return None
+    try:
+        version = subprocess.run([tar, "--version"], capture_output=True, text=True,
+                                 timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return tar if "bsdtar" in version else None
+
+
 def write_entry(remote: Path, key: str, data: bytes, mtime: float | None = None) -> Path:
     path = remote / key[:2] / key[2:]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -772,6 +788,258 @@ class BootTests(Base):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("done", result.stdout)
         self.assertEqual(self.events(), "")
+
+
+class SeedTests(Base):
+    """Warming an empty host store from the keys a trusted peer promoted."""
+
+    IDENTITY = {"schema": 1, "golden": "pulp-build-runner:latest",
+                "golden_config_sha256": "a" * 64, "compiler": "Apple clang version 17.0.0"}
+
+    def setUp(self) -> None:
+        # Before any fixture: a skip from setUp never reaches tearDown.
+        bsd_tar = bsd_tar_path()
+        if bsd_tar is None:
+            self.skipTest("the peer pull script needs BSD tar; no bsdtar here")
+        super().setUp()
+        # Outside Base's "ccache-layer-*" temp dir: the guard refuses any root
+        # with a component starting "ccache".
+        peer_tmp = Path(tempfile.mkdtemp(prefix="seed-peer-"))
+        self.addCleanup(shutil.rmtree, peer_tmp, True)
+        self.peer_root = peer_tmp / "peer-root"
+        self.peer_shared = self.peer_root / "ccache-layers-v1" / "shared"
+        self.peer_promotions = self.peer_root / "ccache-layer-state" / "promotions"
+        self.peer_shared.mkdir(parents=True)
+        self.peer_promotions.mkdir(parents=True)
+        # Runs the remote script locally, as ssh would on the peer. Peers are
+        # macOS hosts, so the script uses BSD tar flags (--no-mac-metadata,
+        # -s); where the local tar is GNU tar (the Linux CI runner), put
+        # bsdtar first on the script's PATH as "tar", or skip without one.
+        shim = self.tmp / "peer-bin"
+        shim.mkdir()
+        (shim / "tar").symlink_to(bsd_tar)
+        self.ssh = self.tmp / "fake-ssh"
+        self.ssh.write_text(f'#!/bin/sh\nfor a; do last=$a; done\nPATH={shim}:$PATH exec sh -c "$last"\n')
+        self.ssh.chmod(0o755)
+
+    def identity_file(self, name: str, **changes: object) -> Path:
+        path = self.tmp / f"{name}.identity.json"
+        path.write_text(json.dumps({**self.IDENTITY, **changes}))
+        return path
+
+    def peer_entry(self, key: str, data: bytes, promoted: bool = True) -> Path:
+        path = write_entry(self.peer_shared, key, data)
+        if promoted:
+            with (self.peer_promotions / "20261117T000000Z-vm.keys").open("a") as handle:
+                handle.write(key + "\n")
+        return path
+
+    def run_seed(self, **kwargs: object) -> dict:
+        options: dict = {"peer": "m5studio", "local_identity": self.identity_file("local"),
+                         "peer_identity": self.identity_file("peer"), "max_bytes": 1 << 20,
+                         "timeout": 30, "max_size": 1 << 30,
+                         "peer_cache_root": str(self.peer_root), "ssh": str(self.ssh)}
+        options.update(kwargs)
+        return cl.seed(self.layout, options.pop("peer"), options.pop("local_identity"),
+                       options.pop("peer_identity"), **options)
+
+    def seed_events(self) -> list[dict]:
+        return [e for e in self.audit_events() if e["event"] == "ccache_seed"]
+
+    def assert_refused(self, reason: str, **kwargs: object) -> None:
+        with self.assertRaises(cl.SeedError):
+            self.run_seed(**kwargs)
+        event = self.seed_events()[-1]
+        self.assertEqual(event["verdict"], "refused")
+        self.assertIn(reason, event["reason"])
+
+    def test_promoted_peer_keys_land_and_the_audit_names_source_and_bytes(self) -> None:
+        result_key, manifest_key = "ab" + "1" * 38, "cd" + "2" * 38
+        self.peer_entry(result_key, entry(0))
+        self.peer_entry(manifest_key, entry(1))
+        counts = self.run_seed()
+        self.assertEqual(counts["promoted"], 2)
+        self.assertEqual(self.shared_keys(), {result_key, manifest_key})
+        [event] = self.seed_events()
+        self.assertEqual(event["verdict"], "seeded")
+        self.assertEqual(event["peer"], "m5studio")
+        self.assertEqual(event["bytes_received"], 2 * len(entry(0)))
+        self.assertIsNotNone(event["trimmed"], "the store is trimmed after seeding")
+        self.assertEqual(list(self.layout.jobs.iterdir()), [], "the seed layer is removed")
+        keys = list(self.layout.promotions.glob("seed-m5studio-*.keys"))
+        self.assertEqual(len(keys), 1, "the rollback list is written")
+
+    def test_only_keys_the_peer_promoted_are_exported(self) -> None:
+        promoted, stray = "ab" + "1" * 38, "ab" + "9" * 38
+        self.peer_entry(promoted, entry(0))
+        self.peer_entry(stray, entry(0), promoted=False)
+        self.run_seed()
+        self.assertEqual(self.shared_keys(), {promoted})
+
+    def test_a_source_under_a_ccache_mount_is_refused(self) -> None:
+        # The September opt-in's store: $CACHE_ROOT/ccache/tartci-layers-v1/shared,
+        # inside the guest-writable legacy mount.
+        legacy = self.tmp / "legacy-root" / "ccache" / "tartci-layers-v1"
+        write_entry(legacy / "shared", "ab" + "1" * 38, entry(0))
+        marker = self.tmp / "pulled"
+        self.ssh.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        for root in (str(self.tmp / "legacy-root" / "ccache"), str(legacy),
+                     "~/.cache/pulp-ci/ccache", "~/x/ccache-layers-v1", "~/a/../b", "rel/path",
+                     # The Linux guests' read-write mount, and the legacy mount
+                     # spelled in another case (APFS is case-insensitive).
+                     "~/.cache/pulp-ci/ccache-linux", "~/.cache/pulp-ci/CCache",
+                     "~/x/TARTCI-LAYERS-V1"):
+            with self.subTest(root=root):
+                self.assert_refused("peer cache root", peer_cache_root=root)
+                self.assertFalse(marker.exists(), "a refused source is never pulled")
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_a_mismatched_image_or_compiler_is_refused_before_any_pull(self) -> None:
+        marker = self.tmp / "pulled"
+        self.ssh.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        for field, value in (("golden_config_sha256", "b" * 64),
+                             ("compiler", "Apple clang version 16.0.0"),
+                             ("golden", "pulp-build-runner:old")):
+            with self.subTest(field):
+                self.assert_refused(f"'{field}'",
+                                    peer_identity=self.identity_file("peer-bad", **{field: value}))
+                self.assertFalse(marker.exists(), "a refused seed must not run the pull")
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_a_malformed_identity_is_refused_even_when_both_sides_agree(self) -> None:
+        # The same bad file on both sides, so equality cannot be what refuses it.
+        for name, text in (("json", "{not json"),
+                           ("extra", json.dumps({**self.IDENTITY, "extra": 1})),
+                           ("hex64", json.dumps({**self.IDENTITY, "golden_config_sha256": "XYZ"})),
+                           ("blank", json.dumps({**self.IDENTITY, "compiler": " "}))):
+            with self.subTest(name):
+                bad = self.tmp / f"bad-{name}.json"
+                bad.write_text(text)
+                self.assert_refused("identity", local_identity=bad, peer_identity=bad)
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_links_and_bad_headers_are_rejected_as_in_receive(self) -> None:
+        good = "ab" + "1" * 38
+        self.peer_entry(good, entry(0))
+        self.peer_entry("ab" + "2" * 38, b"not a ccache entry at all")
+        self.peer_entry("ab" + "3" * 38, b"\xcc\xac\x01\x07" + b"\x00" * 16)
+        secret = self.tmp / "host-secret"
+        secret.write_bytes(entry(0, b"secret"))
+        link = self.peer_shared / "ab" / ("4" * 38)
+        link.symlink_to(secret)
+        with (self.peer_promotions / "x.keys").open("a") as handle:
+            handle.write("ab" + "4" * 38 + "\n../../etc\n")
+        self.run_seed()
+        self.assertEqual(self.shared_keys(), {good})
+        [event] = self.seed_events()
+        self.assertEqual(event["received_rejected"], 2)
+        self.assertEqual(secret.read_bytes(), entry(0, b"secret"))
+
+    def test_max_bytes_is_honoured(self) -> None:
+        for i in range(4):
+            self.peer_entry(f"ab{i:038d}", entry(0, b"x" * 4096))
+        self.assert_refused("exceeds", max_bytes=8192)
+        self.assertEqual(self.shared_keys(), set())
+        self.assertEqual(list(self.layout.jobs.iterdir()), [])
+
+    def test_a_seed_never_replaces_a_local_manifest_or_result(self) -> None:
+        manifest, result = "cd" + "2" * 38, "ab" + "1" * 38
+        self.layout.ensure()
+        local_manifest = write_entry(self.layout.shared, manifest, entry(1, b"local"), mtime=1.0)
+        local_result = write_entry(self.layout.shared, result, entry(0, b"local"), mtime=1.0)
+        self.peer_entry(manifest, entry(1, b"peer"))
+        self.peer_entry(result, entry(0, b"peer"))
+        counts = self.run_seed(force_warm=True)
+        self.assertEqual(counts["existing"], 2)
+        self.assertEqual(counts["replaced"], 0)
+        self.assertEqual(local_manifest.read_bytes(), entry(1, b"local"))
+        self.assertEqual(local_result.read_bytes(), entry(0, b"local"))
+
+    def test_a_warm_store_is_refused_without_force_warm(self) -> None:
+        self.layout.ensure()
+        write_entry(self.layout.shared, "ef" + "3" * 38, entry(0))
+        self.peer_entry("ab" + "1" * 38, entry(0))
+        self.assert_refused("store_not_empty")
+        self.assertEqual(self.shared_keys(), {"ef" + "3" * 38})
+        self.run_seed(force_warm=True)
+        self.assertEqual(self.shared_keys(), {"ef" + "3" * 38, "ab" + "1" * 38})
+
+    def test_a_pending_green_layer_refuses_the_seed(self) -> None:
+        self.layout.ensure()
+        (self.layout.green / "vm-pending").mkdir()
+        self.peer_entry("ab" + "1" * 38, entry(0))
+        self.assert_refused("green_pending")
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_every_refusal_is_audited(self) -> None:
+        self.layout.ensure()
+        with self.subTest("busy"):
+            with cl.flock(self.layout.locks / "seed.lock"):
+                self.assert_refused("busy")
+        with self.subTest("invalid peer"):
+            self.assert_refused("invalid peer name", peer="m5studio;rm")
+        with self.subTest("ssh missing"):
+            self.assert_refused("FileNotFoundError", ssh=str(self.tmp / "no-such-ssh"))
+        with self.subTest("promote ENOSPC"):
+            import errno as errno_mod  # noqa: PLC0415
+            from unittest import mock  # noqa: PLC0415
+            self.peer_entry("ab" + "1" * 38, entry(0))
+            with mock.patch.object(cl, "promote_layer",
+                                   side_effect=OSError(errno_mod.ENOSPC, "No space left")):
+                self.assert_refused("No space left")
+            self.assertEqual(list(self.layout.jobs.iterdir()), [])
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_a_partial_promotion_still_records_every_linked_key(self) -> None:
+        import errno as errno_mod  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+        first, second = "ab" + "1" * 38, "ab" + "2" * 38
+        self.peer_entry(first, entry(0))
+        self.peer_entry(second, entry(0))
+        real = cl.publish_result
+        calls = {"n": 0}
+
+        def publish_then_fill_disk(src: Path, dest: Path) -> str:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError(errno_mod.ENOSPC, "No space left on device")
+            return real(src, dest)
+
+        with mock.patch.object(cl, "publish_result", side_effect=publish_then_fill_disk):
+            self.assert_refused("No space left")
+        self.assertEqual(self.shared_keys(), {first})
+        [keys_file] = self.layout.promotions.glob("seed-m5studio-*.keys")
+        self.assertEqual(keys_file.read_text().split(), [first])
+
+    def test_the_remote_key_filter_drops_anything_but_a_lowercase_key(self) -> None:
+        import tarfile  # noqa: PLC0415
+        good = "ab" + "1" * 38
+        self.peer_entry(good, entry(0))
+        for key in ("AB" + "1" * 38, "ab" + "1" * 37 + "Z"):
+            write_entry(self.peer_shared, key, entry(0))
+        (self.peer_shared / "x").mkdir()
+        (self.peer_shared / "x" / "y").write_bytes(entry(0))
+        (self.peer_promotions / "odd.keys").write_text("\n".join([
+            "AB" + "1" * 38, "ab" + "1" * 37 + "Z", "../../etc/passwd", "ab/" + "1" * 37,
+            "a", "", "xy", "ab*", "ab " + "1" * 36, "$(touch pwned)"]) + "\n")
+        out = subprocess.run(cl.seed_pull_command("m5studio", str(self.peer_root), str(self.ssh)),
+                             capture_output=True, check=True, cwd=self.tmp)
+        with tarfile.open(fileobj=io.BytesIO(out.stdout)) as archive:
+            names = [member.name for member in archive]
+        self.assertEqual(names, [f"remote/ab/{'1' * 38}"])
+        self.assertFalse((self.tmp / "pwned").exists())
+
+    def test_identity_hashes_the_golden_configuration(self) -> None:
+        fake = self.tmp / "tart"
+        fake.write_text('#!/bin/sh\nprintf \'{"cpuCount":8,"os":"darwin"}\'\n')
+        fake.chmod(0o755)
+        value = cl.identity("pulp-build-runner:latest", "Apple clang version 17.0.0\n", str(fake))
+        path = self.tmp / "id.json"
+        path.write_text(json.dumps(value))
+        self.assertEqual(cl.load_identity(path)["compiler"], "Apple clang version 17.0.0")
+        import hashlib  # noqa: PLC0415
+        self.assertEqual(value["golden_config_sha256"],
+                         hashlib.sha256(b'{"cpuCount":8,"os":"darwin"}').hexdigest())
 
 
 class ProfileTests(unittest.TestCase):

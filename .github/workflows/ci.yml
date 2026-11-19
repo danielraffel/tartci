@@ -41,9 +41,15 @@ jobs:
       - name: Ensure shellcheck
         run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
 
+      # The ccache seed's peer pull uses BSD tar flags (peers are macOS), and
+      # test_ccache_layer.SeedTests skips without a bsdtar to run it under.
+      - name: Ensure bsdtar
+        run: command -v bsdtar >/dev/null || { sudo apt-get update && sudo apt-get install -y libarchive-tools; }
+
       - name: Show tool versions
         run: |
           bash --version | head -1
+          bsdtar --version
           shellcheck --version | sed -n '1,2p'
           python3 --version
 

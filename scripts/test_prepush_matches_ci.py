@@ -21,6 +21,8 @@ MIRRORED_JOBS = ("lint", "python-39-tests")
 # Step names that prepare the hosted runner and have nothing to run locally.
 SETUP_STEPS = {
     "Ensure shellcheck",
+    # macOS ships bsdtar as tar; only the ubuntu lint runner needs it.
+    "Ensure bsdtar",
     "Show tool versions",
     "Match the macOS launch-interpreter contract",
     # Mirrored by require_py39 in prepush.sh (test_python39_stage_checks_...).
