@@ -2731,7 +2731,7 @@ def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: fl
 # soak) is STARVED whatever held it: a step-aside, a host fault, the rate
 # limit, a pause or no turn. Those paths never reach defer(), so on
 # 2026-11-17 m3 sat ten hours behind with no STARVED line anywhere.
-BEHIND_STARVED_SECONDS = 4 * 3600
+BEHIND_STARVED_SECONDS = int(2.5 * 3600)
 # At most one behind-main issue per host in this long, across episodes.
 BEHIND_ALERT_REPEAT_SECONDS = 6 * 3600
 BEHIND_ALERT_NAME = "behind-alert.json"
@@ -2775,7 +2775,7 @@ def behind_alert(cfg: Config, skew: dict, now: float) -> None:
         if active:
             print(f"self-update: STARVED: {behind / 3600:.1f} h behind main (oldest undeployed "
                   f"{skew.get('oldest_undeployed')}, {skew.get('behind')} commits), past the "
-                  f"{BEHIND_STARVED_SECONDS // 3600} h bound", flush=True)
+                  f"{BEHIND_STARVED_SECONDS / 3600:g} h bound", flush=True)
 
         def render() -> tuple[str, str]:
             body = "\n".join([
@@ -2797,7 +2797,7 @@ def behind_alert(cfg: Config, skew: dict, now: float) -> None:
                 "fix the named gate.", "",
                 "## How to verify",
                 f"`tartci fleet-macos self-update --plan` reports the host current or under "
-                f"{BEHIND_STARVED_SECONDS // 3600} h behind; this issue then closes itself.",
+                f"{BEHIND_STARVED_SECONDS / 3600:g} h behind; this issue then closes itself.",
             ])
             title = (f"[tartci] {me} self-update STARVED: {behind / 3600:.1f} h behind main")
             marker = tartci_incident.marker(me, "self_update_behind", since, since)
