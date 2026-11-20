@@ -226,6 +226,29 @@ class StatusOutputTests(unittest.TestCase):
                 {"role": "vm_store", "state": "problem", "used_percent": 92},
                 root, runner=timed_out, cache=root / "c3.json"), "disk: vm_store attribution: unavailable")
 
+    def test_pool_vm_store_attribution_survives_an_unreadable_entry(self):
+        # m5s at 93.9%: du printed every row but exited 1 on a Permission denied under
+        # bench, and the line read "unavailable" exactly when it was needed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for name in ("vms", "utm"):
+                (root / name).mkdir()
+
+            def du_denied(argv, timeout=10):
+                rows = "".join(f"{size * 1024 * 1024}\t{root / name}\n" for size, name in ((248, "vms"), (525, "utm")))
+                return {"ok": False, "stdout": rows, "stderr": "du: ./bench/x: Permission denied", "returncode": 1}
+
+            problem = {"role": "vm_store", "state": "problem", "used_percent": 93.9}
+            self.assertEqual(
+                status.pool_disk_attribution(problem, root, runner=du_denied, cache=root / "c1.json"),
+                "disk: vm_store attribution: CI vms 248G | other utm 525G (partial: du could not read some entries)")
+
+            def failed(argv, timeout=10):
+                return {"ok": False, "stdout": "", "stderr": "boom", "returncode": 1}
+            self.assertEqual(
+                status.pool_disk_attribution(problem, root, runner=failed, cache=root / "c2.json"),
+                "disk: vm_store attribution: unavailable")
+
     def test_pool_vm_store_attribution_does_not_reuse_future_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
