@@ -3156,7 +3156,7 @@ fleet`), and check GitHub's job history against it with
   the 3 h exclusion, so one dark peer cannot raise issues on every other host
   before the queue heals), and after 6 h otherwise or when the demand read
   fails. Those bounds only cover a host deferred to a peer. Separately, every
-  scheduled apply that finds the host more than 4 h behind main (its oldest
+  scheduled apply that finds the host more than 2.5 h behind main (its oldest
   undeployed commit's age past the soak) logs `self-update: STARVED: ... behind
   main` whatever held it (a step-aside, a host fault, the rate limit, a pause),
   writes `self_update_behind` once per episode and opens one issue, at most
