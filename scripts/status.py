@@ -98,7 +98,11 @@ def pool_disk_attribution(disk: dict[str, Any], home: Path,
 def _measure_attribution(home: Path, runner) -> str:
     # macOS du rejects -s with -d; -k -d 1 produces the requested KiB rows.
     result = runner(["du", "-k", "-d", "1", str(home)], timeout=30)
-    if not result["ok"]:
+    # du exits 1 after printing every row it could read when one entry is unreadable
+    # (a Permission denied under bench on m5s); the top-level sizes are still the answer.
+    partial = (not result["ok"] and result.get("returncode") == 1
+               and bool((result.get("stdout") or "").strip()))
+    if not result["ok"] and not partial:
         return "disk: vm_store attribution: unavailable"
     groups: dict[str, list[tuple[str, int]]] = {"CI": [], "other": []}
     try:
@@ -118,7 +122,8 @@ def _measure_attribution(home: Path, runner) -> str:
         rows.sort(key=lambda row: (-row[1], row[0]))
     def describe(rows: list[tuple[str, int]]) -> str:
         return " ".join(f"{name} {size / (1024 * 1024):.0f}G" for name, size in rows) or "-"
-    return f"disk: vm_store attribution: CI {describe(groups['CI'])} | other {describe(groups['other'])}"
+    line = f"disk: vm_store attribution: CI {describe(groups['CI'])} | other {describe(groups['other'])}"
+    return line + " (partial: du could not read some entries)" if partial else line
 
 
 def command_presence(names: list[str]) -> dict[str, str | None]:
