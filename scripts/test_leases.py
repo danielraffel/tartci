@@ -148,6 +148,29 @@ class LeaseAcquireReleaseTests(LeaseCliTestCase):
         records = json.loads((self.store / "leases.json").read_text(encoding="utf-8"))
         self.assertEqual([row["id"] for row in records], ["lease-owned"])
 
+    def test_corrupt_tombstones_never_block_a_reaping_acquire(self) -> None:
+        # reclaim() writes tombstones while it reaps, inside every acquire and status. A corrupt
+        # tombstone file must not turn a quiet-release fix into a host-wide lease outage.
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        identity = leases.process_identity(self.pid)
+        self.store.mkdir(parents=True, exist_ok=True)
+        now = leases.iso(leases.utcnow())
+        (self.store / "leases.json").write_text(json.dumps([{
+            "id": "reaped-with-corrupt-tombstones", "lease_size_cores": 1, "priority": 60,
+            "priority_class": "vm", "command_kind": "tart-macos-vm", "owner": "unittest",
+            "pid": self.pid, "process_start_time": identity["process_start_time"],
+            "host_boot_time": identity["host_boot_time"], "created_at": now, "heartbeat_at": now,
+            "guardian_pid": exited.pid, "guardian_mode": "exec",
+            "guardian_process_start_time": "Mon Jan  1 00:00:00 2001",
+            "guardian_host_boot_time": identity["host_boot_time"]
+        }]))
+        (self.store / "released.json").write_text("{broken", encoding="utf-8")
+        self.acquire("lease-after-corruption", 1)
+        records = json.loads((self.store / "leases.json").read_text(encoding="utf-8"))
+        self.assertEqual([row["id"] for row in records], ["lease-after-corruption"])
+        self.assertTrue((self.store / "released.json.corrupt").exists())
+
     def test_corrupt_release_tombstones_fail_closed(self) -> None:
         self.store.mkdir(parents=True, exist_ok=True)
         (self.store / "released.json").write_text("{broken", encoding="utf-8")

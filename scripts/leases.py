@@ -681,7 +681,17 @@ def reclaim(
         active.append(record)
     if store_dir is not None:
         if reaped:
-            released_rows = load_released(store_dir)
+            # Tombstones only make a later release quiet. An unreadable tombstone file must never
+            # block reclaim, which every acquire and status runs: set it aside and start fresh.
+            try:
+                released_rows = load_released(store_dir)
+            except (OSError, ValueError):
+                problems.append("released_tombstones_unreadable")
+                try:
+                    released_file(store_dir).replace(released_file(store_dir).with_suffix(".json.corrupt"))
+                except OSError:
+                    pass
+                released_rows = []
             for record in reaped:
                 lease_id = str(record.get("id") or "")
                 if not lease_id:
