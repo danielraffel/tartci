@@ -473,6 +473,50 @@ def store_file(store_dir: pathlib.Path) -> pathlib.Path:
     return store_dir / "leases.json"
 
 
+def released_file(store_dir: pathlib.Path) -> pathlib.Path:
+    return store_dir / "released.json"
+
+
+def load_released(store_dir: pathlib.Path) -> list[dict[str, Any]]:
+    path = released_file(store_dir)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "[]")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid released lease tombstones JSON in {path}") from exc
+    if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+        raise ValueError(f"invalid released lease tombstones in {path}: expected objects")
+    return data
+
+
+def write_released(store_dir: pathlib.Path, rows: list[dict[str, Any]]) -> None:
+    path = released_file(store_dir)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rows[-1024:], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def add_released(
+    store_dir: pathlib.Path,
+    rows: list[dict[str, Any]],
+    record: dict[str, Any],
+    *,
+    reason: str = "released",
+) -> None:
+    lease_id = str(record.get("id") or "")
+    if not lease_id:
+        return
+    rows = [row for row in rows if str(row.get("id") or "") != lease_id]
+    rows.append({
+        "id": lease_id,
+        "owner": str(record.get("owner") or ""),
+        "reason": reason,
+        "released_at": iso(utcnow()),
+    })
+    write_released(store_dir, rows)
+
+
 def parse_priority(value: str | int | None) -> tuple[int, str]:
     if value is None:
         return PRIORITY_CLASSES["build"], "build"
@@ -636,6 +680,22 @@ def reclaim(
             problems.append(f"stale_heartbeat_live_owner:{lease_id}")
         active.append(record)
     if store_dir is not None:
+        if reaped:
+            released_rows = load_released(store_dir)
+            for record in reaped:
+                lease_id = str(record.get("id") or "")
+                if not lease_id:
+                    continue
+                released_rows = [
+                    row for row in released_rows if str(row.get("id") or "") != lease_id
+                ]
+                released_rows.append({
+                    "id": lease_id,
+                    "owner": str(record.get("owner") or ""),
+                    "reason": str(record.get("_reap_reason") or "reaped"),
+                    "released_at": iso(utcnow()),
+                })
+            write_released(store_dir, released_rows)
         journal_lease_events(store_dir, journal)
     return active, reaped, problems
 
@@ -2533,6 +2593,13 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         active, reaped, problems = reclaim(
             records, int(args.stale_secs), store_dir=store_dir, releasing_id=str(args.id)
         )
+        released_rows = load_released(store_dir)
+        target = next((record for record in active if record.get("id") == args.id), None)
+        requested_owner = str(getattr(args, "owner", "") or "")
+        if target is not None and requested_owner and str(target.get("owner") or "") != requested_owner:
+            return {"ok": False, "error": "lease_owned_by_different_holder", "lease_id": args.id,
+                    "capacity": usage(active, cfg), "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems)}, 1
         kept = [record for record in active if record.get("id") != args.id]
         removed = len(kept) != len(active)
         # A VM lease is owned by its guardian (the `tart run` it exec'd into).
@@ -2543,6 +2610,14 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         # as failures and hid any real one.
         already = next((row.get("_reap_reason") for row in reaped
                         if row.get("id") == args.id), None)
+        tombstone = next((row for row in released_rows if row.get("id") == args.id), None)
+        tombstone_reason = str(tombstone.get("reason") or "") if tombstone else ""
+        if already is None and tombstone_reason and tombstone_reason != "released":
+            already = tombstone_reason
+        if tombstone is not None and requested_owner and str(tombstone.get("owner") or "") != requested_owner:
+            return {"ok": False, "error": "lease_owned_by_different_holder", "lease_id": args.id,
+                    "capacity": usage(active, cfg), "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems)}, 1
         qos_actions = reconcile_borrowers(kept, cfg)
         # A borrower released while preempted keeps running (a `pulp dev` loop
         # outlives each build's lease), so its tree must leave background QoS
@@ -2554,16 +2629,21 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     {"pid": pid, "qos": "normal",
                      "summary": {"id": str(args.id), "qos": "normal", "pid": pid}}
                 )
+        if removed:
+            add_released(store_dir, released_rows, target or {"id": args.id})
         write_records(store_dir, kept)
         apply_qos_actions(qos_actions)
         return {
-            "ok": removed or already is not None,
+            "ok": removed or already is not None or tombstone is not None,
             "released": args.id if removed else None,
             "already_reclaimed": already,
+            "already_released": bool(tombstone is not None and not removed and tombstone_reason == "released"),
             "capacity": usage(kept, cfg),
             "reaped": reaped_summary(reaped),
             "problems": problem_summary(problems),
-        }, 0 if removed or already is not None else 1
+            "error": None if removed or already is not None or tombstone is not None
+            else "lease_not_found",
+        }, 0 if removed or already is not None or tombstone is not None else 1
 
 
 def heartbeat(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -2845,6 +2925,8 @@ def main(argv: list[str] | None = None) -> int:
     if result.get("reason") in (external_only_policy.REASON,
                                  external_only_policy.REASON_UNREADABLE):
         print(result["message"], file=sys.stderr)
+    if args.command == "release" and rc != 0:
+        print(f"lease release failed: {result.get('error', 'lease release error')}", file=sys.stderr)
     emit(result, bool(getattr(args, "json", False)))
     return rc
 
