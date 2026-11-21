@@ -171,6 +171,21 @@ class LeaseAcquireReleaseTests(LeaseCliTestCase):
         self.assertEqual([row["id"] for row in records], ["lease-after-corruption"])
         self.assertTrue((self.store / "released.json.corrupt").exists())
 
+    def test_reacquired_id_releases_for_its_new_owner(self) -> None:
+        # 1021-r1-f1: acquire X as A, release, acquire X as B; B's owner-qualified release must
+        # succeed, and A's old tombstone must not leave B's lease held.
+        self.acquire("lease-reused", 1, extra_args=("--owner", "holder-a"))
+        self.run_cli("release", "--id", "lease-reused", "--owner", "holder-a")
+        self.acquire("lease-reused", 1, extra_args=("--owner", "holder-b"))
+        released = self.run_cli("release", "--id", "lease-reused", "--owner", "holder-b", check=False)
+        self.assertEqual(released.returncode, 0, released.stdout)
+        self.assertEqual(json.loads(released.stdout)["released"], "lease-reused")
+        records = json.loads((self.store / "leases.json").read_text(encoding="utf-8"))
+        self.assertEqual(records, [])
+        # A's stale release of the reused id is then quiet (it is gone), never a release of B's.
+        again = self.run_cli("release", "--id", "lease-reused", check=False)
+        self.assertEqual(again.returncode, 0)
+
     def test_corrupt_release_tombstones_fail_closed(self) -> None:
         self.store.mkdir(parents=True, exist_ok=True)
         (self.store / "released.json").write_text("{broken", encoding="utf-8")

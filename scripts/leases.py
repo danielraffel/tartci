@@ -2620,7 +2620,10 @@ def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         # as failures and hid any real one.
         already = next((row.get("_reap_reason") for row in reaped
                         if row.get("id") == args.id), None)
-        tombstone = next((row for row in released_rows if row.get("id") == args.id), None)
+        # A tombstone only speaks for a lease that is gone. A live record (the id re-acquired, possibly
+        # by another owner) is authoritative, so an old tombstone never overrides current ownership.
+        tombstone = (next((row for row in released_rows if row.get("id") == args.id), None)
+                     if target is None else None)
         tombstone_reason = str(tombstone.get("reason") or "") if tombstone else ""
         if already is None and tombstone_reason and tombstone_reason != "released":
             already = tombstone_reason
