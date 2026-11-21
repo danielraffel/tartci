@@ -134,6 +134,65 @@ class LeaseAcquireReleaseTests(LeaseCliTestCase):
         self.assertTrue(released["ok"])
         self.assertEqual(released["capacity"]["used_cores"], 0)
 
+        again = self.run_cli("release", "--id", "lease-a", "--capacity", "8")
+        again_body = json.loads(again.stdout)
+        self.assertEqual(again.returncode, 0)
+        self.assertEqual(again.stderr, "")
+        self.assertTrue(again_body["already_released"])
+
+    def test_release_rejects_a_different_holder(self) -> None:
+        self.acquire("lease-owned", 1, extra_args=("--owner", "holder-a"))
+        refused = self.run_cli("release", "--id", "lease-owned", "--owner", "holder-b", check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(json.loads(refused.stdout)["error"], "lease_owned_by_different_holder")
+        records = json.loads((self.store / "leases.json").read_text(encoding="utf-8"))
+        self.assertEqual([row["id"] for row in records], ["lease-owned"])
+
+    def test_corrupt_tombstones_never_block_a_reaping_acquire(self) -> None:
+        # reclaim() writes tombstones while it reaps, inside every acquire and status. A corrupt
+        # tombstone file must not turn a quiet-release fix into a host-wide lease outage.
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        identity = leases.process_identity(self.pid)
+        self.store.mkdir(parents=True, exist_ok=True)
+        now = leases.iso(leases.utcnow())
+        (self.store / "leases.json").write_text(json.dumps([{
+            "id": "reaped-with-corrupt-tombstones", "lease_size_cores": 1, "priority": 60,
+            "priority_class": "vm", "command_kind": "tart-macos-vm", "owner": "unittest",
+            "pid": self.pid, "process_start_time": identity["process_start_time"],
+            "host_boot_time": identity["host_boot_time"], "created_at": now, "heartbeat_at": now,
+            "guardian_pid": exited.pid, "guardian_mode": "exec",
+            "guardian_process_start_time": "Mon Jan  1 00:00:00 2001",
+            "guardian_host_boot_time": identity["host_boot_time"]
+        }]))
+        (self.store / "released.json").write_text("{broken", encoding="utf-8")
+        self.acquire("lease-after-corruption", 1)
+        records = json.loads((self.store / "leases.json").read_text(encoding="utf-8"))
+        self.assertEqual([row["id"] for row in records], ["lease-after-corruption"])
+        self.assertTrue((self.store / "released.json.corrupt").exists())
+
+    def test_reacquired_id_releases_for_its_new_owner(self) -> None:
+        # 1021-r1-f1: acquire X as A, release, acquire X as B; B's owner-qualified release must
+        # succeed, and A's old tombstone must not leave B's lease held.
+        self.acquire("lease-reused", 1, extra_args=("--owner", "holder-a"))
+        self.run_cli("release", "--id", "lease-reused", "--owner", "holder-a")
+        self.acquire("lease-reused", 1, extra_args=("--owner", "holder-b"))
+        released = self.run_cli("release", "--id", "lease-reused", "--owner", "holder-b", check=False)
+        self.assertEqual(released.returncode, 0, released.stdout)
+        self.assertEqual(json.loads(released.stdout)["released"], "lease-reused")
+        records = json.loads((self.store / "leases.json").read_text(encoding="utf-8"))
+        self.assertEqual(records, [])
+        # A's stale release of the reused id is then quiet (it is gone), never a release of B's.
+        again = self.run_cli("release", "--id", "lease-reused", check=False)
+        self.assertEqual(again.returncode, 0)
+
+    def test_corrupt_release_tombstones_fail_closed(self) -> None:
+        self.store.mkdir(parents=True, exist_ok=True)
+        (self.store / "released.json").write_text("{broken", encoding="utf-8")
+        failed = self.run_cli("release", "--id", "never-acquired", check=False)
+        self.assertEqual(failed.returncode, 2)
+        self.assertFalse(json.loads(failed.stdout)["ok"])
+
     def test_releasing_a_lease_whose_vm_guardian_exited_is_not_an_error(self) -> None:
         # Teardown stops the VM, its guardian (the exec'd `tart run`) exits,
         # and the next store operation reclaims the record before the
@@ -158,7 +217,30 @@ class LeaseAcquireReleaseTests(LeaseCliTestCase):
         # The control: an id the store never held is still an error.
         unknown = self.run_cli("release", "--id", "never-acquired", "--capacity", "8", check=False)
         self.assertEqual(unknown.returncode, 1)
+        self.assertIn("lease release failed", unknown.stderr)
         self.assertFalse(json.loads(unknown.stdout)["ok"])
+
+    def test_release_after_another_command_reaped_the_lease(self) -> None:
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        identity = leases.process_identity(self.pid)
+        self.store.mkdir(parents=True, exist_ok=True)
+        now = leases.iso(leases.utcnow())
+        (self.store / "leases.json").write_text(json.dumps([{
+            "id": "reaped-before-release", "lease_size_cores": 1, "priority": 60,
+            "priority_class": "vm", "command_kind": "tart-macos-vm", "owner": "unittest",
+            "pid": self.pid, "process_start_time": identity["process_start_time"],
+            "host_boot_time": identity["host_boot_time"], "created_at": now, "heartbeat_at": now,
+            "guardian_pid": exited.pid, "guardian_mode": "exec",
+            "guardian_process_start_time": "Mon Jan  1 00:00:00 2001",
+            "guardian_host_boot_time": identity["host_boot_time"]
+        }]))
+        status = self.run_cli("status", "--capacity", "8")
+        self.assertEqual(json.loads(status.stdout)["reaped"][0]["id"], "reaped-before-release")
+        released = self.run_cli("release", "--id", "reaped-before-release", "--capacity", "8")
+        body = json.loads(released.stdout)
+        self.assertEqual(released.stderr, "")
+        self.assertEqual((body["ok"], body["already_reclaimed"]), (True, "identity_mismatch"))
 
     def test_contention_fails_closed_when_capacity_is_exhausted(self) -> None:
         self.acquire("lease-a", 3, capacity=4)

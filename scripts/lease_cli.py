@@ -256,6 +256,7 @@ def parse_args(
     release_parser = sub.add_parser("release", help="release a lease by id")
     add_common(release_parser)
     release_parser.add_argument("--id", required=True)
+    release_parser.add_argument("--owner", help="holder expected to own the lease")
 
     resize_parser = sub.add_parser(
         "resize",
