@@ -122,7 +122,18 @@ print("all test modules import under Python %d.%d" % sys.version_info[:2])
 # that need tomllib are not skipped everywhere. With no 3.11+ installed, that
 # second run is reported as a SKIP, never passed silently.
 fast_unit_tests() {
-  local selected m
+  local selected m ps_probe_err process_inspection_restricted=0
+  ps_probe_err="$logdir/ps-probe.err"
+  if ! /bin/ps -p $$ -o pid= >/dev/null 2>"$ps_probe_err"; then
+    if grep -Eiq 'Operation not permitted|Permission denied|EPERM|EACCES' "$ps_probe_err"; then
+      process_inspection_restricted=1
+      echo "process inspection restricted: ps tests may be reported as NOT CHECKED"
+    else
+      cat "$ps_probe_err" >&2
+      echo "process inspection probe failed for an unrecognized reason" >&2
+      return 1
+    fi
+  fi
   selected="$(python3 scripts/prepush_select.py "$BASE")" || {
     echo "test selection failed (see above); refusing to pass on the fixed modules alone" >&2
     return 1
@@ -146,14 +157,22 @@ SELECTED_END
   # that skips itself without tomllib reports a skip instead of crashing the run.
   # `stage` calls this inside `if`, where set -e is off: every failure must
   # return explicitly, or a red 3.9 run is masked by a green run after it.
-  PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts "$PY39" scripts/prepush_unittest.py run "${uniq[@]}" || return 1  # bash32-lint: nonempty one per fixed module
+  if [ "$process_inspection_restricted" = 1 ]; then
+    PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts PREPUSH_PROCESS_INSPECTION_RESTRICTED=1 "$PY39" scripts/prepush_unittest.py run "${uniq[@]}" || return 1  # bash32-lint: nonempty one per fixed module
+  else
+    PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts "$PY39" scripts/prepush_unittest.py run "${uniq[@]}" || return 1  # bash32-lint: nonempty one per fixed module
+  fi
   [ "${#chosen[@]}" -gt 0 ] || return 0
   # The tomllib-gated tests skipped above run again under a Python 3.11+, found
   # even when the default python3 is the hosts' 3.9.
   local tomllib_py
   if tomllib_py="$(python3 scripts/prepush_unittest.py pick-tomllib-python)"; then
     echo "changed modules again under $tomllib_py (tomllib-gated tests run here)"
-    PYTHONPATH=scripts "$tomllib_py" scripts/prepush_unittest.py run "${chosen[@]}" || return 1  # bash32-lint: nonempty guarded by the -gt 0 test
+    if [ "$process_inspection_restricted" = 1 ]; then
+      PYTHONPATH=scripts PREPUSH_PROCESS_INSPECTION_RESTRICTED=1 "$tomllib_py" scripts/prepush_unittest.py run "${chosen[@]}" || return 1  # bash32-lint: nonempty guarded by the -gt 0 test
+    else
+      PYTHONPATH=scripts "$tomllib_py" scripts/prepush_unittest.py run "${chosen[@]}" || return 1  # bash32-lint: nonempty guarded by the -gt 0 test
+    fi
   else
     printf '\033[33mSKIP: no Python 3.11+ with tomllib found (set TARTCI_PREPUSH_TOMLLIB_PY); the tomllib-gated tests in %s did not run locally. CI runs them.\033[0m\n' "${chosen[*]}" >&2  # bash32-lint: nonempty guarded by the -gt 0 test
   fi

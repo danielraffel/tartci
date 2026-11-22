@@ -21,6 +21,7 @@ Runs under Python 3.9; no third-party imports.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,37 @@ SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 TOMLLIB_CANDIDATES = ("python3", "python3.15", "python3.14", "python3.13",
                       "python3.12", "python3.11", "/opt/homebrew/bin/python3",
                       "/usr/local/bin/python3")
+
+NOT_CHECKED_REASON = "process inspection restricted in this sandbox; CI's python-39-tests runs it"
+
+
+def _process_inspection_start_failure(traceback):
+    """Return whether a traceback proves that starting ps was denied by the OS."""
+    if not re.search(r"(?:PermissionError|OSError).*?(?:EPERM|EACCES|Errno (?:1|13)\b)",
+                     traceback, re.IGNORECASE | re.DOTALL):
+        return False
+    return bool(re.search(
+        r"(?:\[\s*['\"](?:/bin/)?ps['\"](?:\s*,|\s*\])|"
+        r"argv\s*=\s*\[\s*['\"](?:/bin/)?ps['\"]|"
+        r"(?:PermissionError|OSError).*?['\"](?:/bin/)?ps['\"])",
+        traceback, re.IGNORECASE | re.DOTALL))
+
+
+def classify_failures(result, process_inspection_restricted=False):
+    """Split unittest failures into real failures and restricted-ps checks.
+
+    The result is read-only, so this remains a pure function over unittest's
+    recorded ``failures`` and ``errors`` lists. It returns two lists of
+    ``(test, traceback)`` pairs in their original order.
+    """
+    not_checked, failures = [], []
+    for test, traceback in list(result.failures) + list(result.errors):
+        if (process_inspection_restricted and
+                _process_inspection_start_failure(traceback)):
+            not_checked.append((test, traceback))
+        else:
+            failures.append((test, traceback))
+    return not_checked, failures
 
 
 def has_tomllib(python):
@@ -77,8 +109,11 @@ def load(modules, start=SCRIPTS):
     return suite, missing
 
 
-def run(modules, start=SCRIPTS, stream=None):
+def run(modules, start=SCRIPTS, stream=None, process_inspection_restricted=None):
     stream = sys.stderr if stream is None else stream
+    if process_inspection_restricted is None:
+        process_inspection_restricted = os.environ.get(
+            "PREPUSH_PROCESS_INSPECTION_RESTRICTED") == "1"
     suite, missing = load(modules, start)
     if missing:
         stream.write("no such test module: %s\n" % ", ".join(missing))
@@ -87,7 +122,15 @@ def run(modules, start=SCRIPTS, stream=None):
         # Name each whole-module skip, so it is visible in the log, not buried in a count.
         stream.write("module skipped: %s\n" % test.id().rsplit(".", 1)[-1])
     result = unittest.TextTestRunner(stream=stream, verbosity=1).run(suite)
-    return 0 if result.wasSuccessful() else 1
+    not_checked, failures = classify_failures(result, process_inspection_restricted)
+    if process_inspection_restricted and not_checked:
+        stream.write("NOT CHECKED (process inspection restricted):\n")
+        for test, _ in not_checked:
+            stream.write("  %s: %s\n" % (test.id(), NOT_CHECKED_REASON))
+    if process_inspection_restricted:
+        stream.write("Summary: %d NOT CHECKED, %d real failure(s)\n" %
+                     (len(not_checked), len(failures)))
+    return 0 if not failures else 1
 
 
 def main(argv):
