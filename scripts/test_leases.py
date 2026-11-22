@@ -2125,6 +2125,13 @@ class AcquireOutcomeJournalTests(LeaseCliTestCase):
             self.assertTrue(rows[0]["floor"])
 
     def test_results_identical_with_and_without_journaling(self) -> None:
+        # An external-only host profile journals an external_only_policy event on every acquire,
+        # into the same events.jsonl. Judge acquires with that policy out of the picture, so the
+        # test measures only outcome journaling, on any host (tartci#1022).
+        no_host_policy = mock.patch.object(leases.external_only_policy, "check_acquire_safe", return_value=None)
+        no_host_policy.start()
+        self.addCleanup(no_host_policy.stop)
+
         def run(journal: bool) -> list[tuple[dict, int]]:
             store = Path(self.tmp.name) / ("with" if journal else "without")
             out = []
