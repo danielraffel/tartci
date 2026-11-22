@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -95,6 +96,54 @@ class RunTest(unittest.TestCase):
             self.assertIn("module skipped: test_advertised_labels", proc.stderr)
         else:
             self.assertNotIn("module skipped", proc.stderr)
+
+    def test_restricted_ps_permission_error_is_not_checked(self):
+        result = SimpleNamespace(
+            failures=[],
+            errors=[("test_ps", "Traceback\nPermissionError: [Errno 1] Operation not permitted: ['/bin/ps', '-p']")],
+        )
+        not_checked, failures = pu.classify_failures(result, True)
+        self.assertEqual([item[0] for item in not_checked], ["test_ps"])
+        self.assertEqual(failures, [])
+
+    def test_ps_assertion_failure_remains_a_failure(self):
+        result = SimpleNamespace(
+            failures=[("test_ps", "Traceback\nAssertionError: expected ps output")],
+            errors=[],
+        )
+        not_checked, failures = pu.classify_failures(result, True)
+        self.assertEqual(not_checked, [])
+        self.assertEqual([item[0] for item in failures], ["test_ps"])
+
+    def test_permission_error_starting_non_ps_remains_a_failure(self):
+        result = SimpleNamespace(
+            failures=[],
+            errors=[("test_other", "Traceback\nPermissionError: [Errno 13] Permission denied: ['/bin/kill', '-0']")],
+        )
+        not_checked, failures = pu.classify_failures(result, True)
+        self.assertEqual(not_checked, [])
+        self.assertEqual([item[0] for item in failures], ["test_other"])
+
+    def test_working_ps_probe_never_classifies_a_ps_error(self):
+        result = SimpleNamespace(
+            failures=[],
+            errors=[("test_ps", "Traceback\nPermissionError: [Errno 1] Operation not permitted: ['/bin/ps']")],
+        )
+        not_checked, failures = pu.classify_failures(result, False)
+        self.assertEqual(not_checked, [])
+        self.assertEqual([item[0] for item in failures], ["test_ps"])
+
+    def test_classification_summary_counts_each_result_once(self):
+        result = SimpleNamespace(
+            failures=[("bad", "AssertionError: boom")],
+            errors=[
+                ("ps_one", "PermissionError: [Errno 1] Operation not permitted: ['/bin/ps']"),
+                ("ps_two", "OSError: [Errno 13] Permission denied: ['ps', '-p']"),
+            ],
+        )
+        not_checked, failures = pu.classify_failures(result, True)
+        self.assertEqual(len(not_checked), 2)
+        self.assertEqual(len(failures), 1)
 
 
 def _fake_python(directory, name, has_tomllib):
