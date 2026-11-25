@@ -8,7 +8,9 @@ name: Tart pin update
 # installation token (secret SHIPYARD_APP_PRIVATE_KEY),
 # never the default workflow token: pushes and PRs made with that token start
 # no workflows, so the PR's required checks would never run. The default token
-# stays read-only and is not persisted for git.
+# stays read-only and is not persisted for git. The key is a secret of the
+# `app-key` environment, which admits only runs on refs/heads/main: the
+# schedule, or a dispatch from main (a dispatch from another branch is refused).
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -25,6 +27,7 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: app-key
     steps:
       - name: Check out main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
