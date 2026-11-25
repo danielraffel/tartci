@@ -64,6 +64,30 @@ class TartPinUpdateWorkflow(unittest.TestCase):
         self.assertEqual(permissions, [("contents", "write"), ("pull-requests", "write"),
                                        ("workflows", "write")])
 
+    def test_app_key_is_read_only_through_the_main_only_environment(self):
+        # SHIPYARD_APP_PRIVATE_KEY is a secret of the `app-key` environment,
+        # which admits only refs/heads/main. Every job that names the key must
+        # declare it, and the workflow may start only from events whose ref is
+        # main (schedule, dispatch from main), never a tag push or a PR.
+        workflows = os.path.dirname(WORKFLOW)
+        readers = 0
+        for name in sorted(os.listdir(workflows)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            with open(os.path.join(workflows, name), encoding="utf-8") as fh:
+                text = fh.read()
+            jobs = re.split(r"(?m)^  (?=[A-Za-z0-9_-]+:\n)", text.split("\njobs:\n", 1)[-1])
+            for job in jobs:
+                if "secrets.SHIPYARD_APP_PRIVATE_KEY" not in job:
+                    continue
+                readers += 1
+                with self.subTest(workflow=name, job=job.split(":", 1)[0]):
+                    self.assertRegex(job, r"(?m)^    environment: app-key$")
+        self.assertEqual(readers, 1)
+        on = re.search(r"(?m)^on:\n((?:  .*\n|    .*\n)+)", self.text).group(1)
+        self.assertEqual(sorted(re.findall(r"(?m)^  ([a-z_]+):", on)),
+                         ["schedule", "workflow_dispatch"])
+
     def test_missing_app_credentials_fail_before_minting(self):
         names = list(self.steps)
         require = names.index("Require the pin-update App credentials")
