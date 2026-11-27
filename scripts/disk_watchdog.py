@@ -53,6 +53,20 @@ killed: on m5studio a SIGKILL to the helper's pid freed a 19 h rg with no
 reboot. Any still stuck after that need a reboot; the issue says how many.
 TARTCI_DEVICEFS_REMEDIATE=0 reports without acting.
 
+The pass also checks FREE SPACE on each volume the fleet manifest declares a
+floor for (`kind = "disk_floor_gb"` keys under `[hosts.<host.id>]`, read from
+the file named by TARTCI_FLEET_MANIFEST or the profile's
+`[disk_watch] fleet_manifest`; the floors are never hardcoded here). On
+2026-11-25 a work volume fell to 96 GiB free against a 200 GiB floor while the
+latency alarm fired only for slow writes, so nothing named the floor. Below a
+floor the pass opens ONE `disk_free_low` episode per volume (an event and one
+GitHub issue) naming the free space, the floor and the top MAX_TOP directories
+by size under the work roots on that volume (depth 1, bounded `du` per root,
+never a volume scan). The episode ends, and the issue closes, after
+RECOVER_PASSES passes at or above floor plus FREE_MARGIN. With no manifest, no
+host entry or no floors the check is off and says why, once per change. The
+pass never deletes anything.
+
 Python 3.9-safe: the launchd python on fleet hosts is /usr/bin/python3.
 """
 from __future__ import annotations
@@ -88,6 +102,12 @@ EVIDENCE_TIMEOUT_S = 60.0
 SAMPLE_SECONDS = 3
 MAX_SAMPLES = 5
 RECOVER_PASSES = 3
+FREE_MARGIN = 0.10
+DU_TIMEOUT_S = 20.0
+MAX_TOP = 5
+MAX_ROOTS = 6
+FREE_TIMEOUT_S = 10.0
+GIB = 1024 ** 3
 PROBE_MARKER = "--tartci-disk-probe"
 LOG_PREDICATE = ('sender == "apfs" OR subsystem BEGINSWITH "com.apple.apfs" '
                  'OR process == "kernel"')
@@ -718,6 +738,252 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
             "evidence": state.get("evidence"), **out}
 
 
+# ── free space against the fleet manifest's floors ─────────────────────────
+
+# statvfs in a child, like the probe: a wedged volume can block the call in the
+# kernel, and this pass must never be the thing that hangs. f_bavail is what
+# the manifest's floors are evaluated against (it excludes root-reserved blocks).
+FREE_SCRIPT = """
+import os, sys
+st = os.statvfs(sys.argv[-1])
+print(st.f_frsize * st.f_bavail)
+"""
+
+
+def _expand(path: str) -> str:
+    return os.path.normpath(os.path.expanduser(path))
+
+
+def load_floors(profile: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """(floors, None), or ([], why the check is off).
+
+    A floor is `{name, path, floor_gb}` from the manifest's
+    `[[hosts.<host id>.keys]]` entries of kind `disk_floor_gb`.
+    """
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    watch = profile.get("disk_watch") if isinstance(profile.get("disk_watch"), dict) else {}
+    manifest = os.environ.get("TARTCI_FLEET_MANIFEST") or watch.get("fleet_manifest")
+    if not manifest or not isinstance(manifest, str):
+        return [], ("no fleet manifest configured (TARTCI_FLEET_MANIFEST or "
+                    "[disk_watch] fleet_manifest in the profile)")
+    if tomllib is None:
+        return [], "no tomllib (needs Python 3.11+)"
+    try:
+        data = tomllib.loads(pathlib.Path(os.path.expanduser(manifest)).read_text())
+    except Exception as exc:  # noqa: BLE001 - an unreadable manifest turns the check off
+        return [], f"fleet manifest {manifest} unreadable: {exc}"
+    host_id = str(host.get("id") or os.uname().nodename.split(".")[0])
+    hosts = data.get("hosts") if isinstance(data.get("hosts"), dict) else {}
+    entry = hosts.get(host_id)
+    if not isinstance(entry, dict):
+        return [], f"fleet manifest has no host {host_id}"
+    floors = []
+    for key in entry.get("keys") or []:
+        if (isinstance(key, dict) and key.get("kind") == "disk_floor_gb"
+                and isinstance(key.get("path"), str)
+                and isinstance(key.get("value"), (int, float))
+                and not isinstance(key.get("value"), bool) and key["value"] > 0):
+            floors.append({"name": str(key.get("name") or key["path"]),
+                           "path": _expand(key["path"]), "floor_gb": float(key["value"])})
+    if not floors:
+        return [], f"fleet manifest declares no disk_floor_gb for host {host_id}"
+    return floors, None
+
+
+def work_roots(profile: Dict[str, Any]) -> List[str]:
+    """Directories whose children are worth naming when a volume is low:
+    TARTCI_DISK_WORK_ROOTS, else `[disk_watch] work_roots`, else the profile's
+    VM store, cache root and reclaim worktree roots."""
+    raw = os.environ.get("TARTCI_DISK_WORK_ROOTS")
+    if raw is not None:
+        found = [p for p in raw.split(os.pathsep) if p]
+    else:
+        watch = profile.get("disk_watch") if isinstance(profile.get("disk_watch"), dict) else {}
+        found = [p for p in watch.get("work_roots") or [] if isinstance(p, str)]
+        if not found:
+            reclaim = profile.get("reclaim") if isinstance(profile.get("reclaim"), dict) else {}
+            found = profile_paths(profile)
+            found += [reclaim.get("repo"), reclaim.get("worktrees_root")]
+            found += list(reclaim.get("extra_worktree_roots") or [])
+    return list(dict.fromkeys(_expand(p) for p in found if isinstance(p, str) and p))
+
+
+def roots_on(path: str, floors: Sequence[Dict[str, Any]], roots: Sequence[str]) -> List[str]:
+    """The roots that belong to the volume at `path`: under it, and not under a
+    longer floor path (so a `/` floor does not claim a data volume's roots)."""
+    def under(child: str, parent: str) -> bool:
+        return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
+
+    longer = [f["path"] for f in floors if len(f["path"]) > len(path) and under(f["path"], path)]
+    return [r for r in roots if under(r, path) and not any(under(r, o) for o in longer)]
+
+
+def parse_du(text: str, root: str) -> List[Tuple[int, str]]:
+    """(bytes, path) for each child in `du -k -d 1` output, the root's own total dropped."""
+    rows = []
+    for line in text.splitlines():
+        size, _, name = line.partition("\t")
+        if size.isdigit() and name and os.path.normpath(name) != os.path.normpath(root):
+            rows.append((int(size) * 1024, name))
+    return rows
+
+
+def top_dirs(roots: Sequence[str], directory: pathlib.Path, run: Optional[Runner] = None,
+             ) -> Dict[str, Any]:
+    """The MAX_TOP largest children of `roots`, from one bounded depth-1 `du`
+    per root. A du that does not finish contributes what it printed and is
+    named in `notes`; nothing here scans the volume."""
+    run = run or bounded
+    timeout = _env_float("TARTCI_DISK_DU_TIMEOUT_S", DU_TIMEOUT_S)
+    directory.mkdir(parents=True, exist_ok=True)
+    rows: List[Tuple[int, str]] = []
+    notes: List[str] = []
+    for root in list(roots)[:MAX_ROOTS]:
+        outcome, text = run(["/usr/bin/du", "-k", "-d", "1", root], timeout,
+                            directory / "du.txt")
+        rows += parse_du(text, root)
+        if outcome != "ok":
+            notes.append(f"{root}: du {outcome}")
+    (directory / "du.txt").unlink(missing_ok=True)
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return {"top": [{"path": name, "gib": round(size / GIB, 1)} for size, name in rows[:MAX_TOP]],
+            "notes": notes, "roots": list(roots)[:MAX_ROOTS]}
+
+
+def read_free_gib(path: str) -> Optional[float]:
+    """Free GiB on the volume at `path`, read in a child bounded by FREE_TIMEOUT_S;
+    None when it did not answer."""
+    override = os.environ.get("TARTCI_DISK_FREE_COMMAND")
+    command = json.loads(override) if override else [child_python(), "-c", FREE_SCRIPT]
+    try:
+        proc = subprocess.Popen([*command, path], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, start_new_session=True)
+    except (OSError, ValueError):
+        return None
+    try:
+        stdout, _ = proc.communicate(timeout=_env_float("TARTCI_DISK_FREE_TIMEOUT_S",
+                                                        FREE_TIMEOUT_S))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass  # in the kernel: abandoned, never waited on
+        if proc.stdout is not None:
+            proc.stdout.close()
+        return None
+    value = _float(stdout) if proc.returncode == 0 else None
+    return None if value is None else value / GIB
+
+
+def free_alert_text(host: str, target: str, floor: Dict[str, Any], free_gib: float,
+                    since: str, top: Dict[str, Any]) -> Tuple[str, str]:
+    lines = [f"{host}: {floor['path']} has {free_gib:.1f} GiB free; the fleet manifest's "
+             f"floor ({floor['name']}) is {floor['floor_gb']:g} GiB.",
+             f"Run: ssh {target} 'tartci disk status'", ""]
+    if top["top"]:
+        lines.append(f"Largest directories under the work roots on this volume "
+                     f"({', '.join(top['roots'])}):")
+        lines += [f"- {row['gib']} GiB  {row['path']}" for row in top["top"]]
+    else:
+        lines.append("No work root on this volume reported a size.")
+    lines += [f"({note})" for note in top["notes"]]
+    lines += ["", "Nothing is deleted by this alarm. Free space by removing finished work "
+              "(build trees of merged lanes first).",
+              f"This issue closes itself after {RECOVER_PASSES} passes at or above "
+              f"{floor['floor_gb'] * (1 + FREE_MARGIN):g} GiB (the floor plus "
+              f"{FREE_MARGIN:.0%})."]
+    title = (f"[tartci] {host}: {floor['path']} {free_gib:.0f} GiB free, below the "
+             f"{floor['floor_gb']:g} GiB floor since {since}")
+    return title, "\n".join(lines)
+
+
+def watch_free(directory: pathlib.Path, now: float, *, issue: Any = None, close: Any = None,
+               run: Optional[Runner] = None, host: Optional[str] = None,
+               target: Optional[str] = None, free_of: Optional[Callable[[str], Optional[float]]] = None,
+               profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Compare each manifest-floored volume's free space with its floor and
+    drive one episode per volume below it."""
+    profile = _profile() if profile is None else profile
+    floors, why = load_floors(profile)
+    marker = directory / "free-disabled.json"
+    if why is not None:
+        if (host_off._read_json(marker) or {}).get("reason") != why:
+            print(f"disk-watchdog: free-space check off: {why}", file=sys.stderr)
+            host_off._write_json(marker, {"reason": why})
+        return {"disabled": why, "volumes": []}
+    marker.unlink(missing_ok=True)
+    if host is None or target is None:
+        host, target = _alert_host()
+    free_of = free_of or read_free_gib
+    roots = work_roots(profile)
+    switched_on = os.environ.get("TARTCI_DISK_WATCH_ISSUE", "1") != "0"
+    volumes = []
+    for floor in floors:
+        path = floor["path"]
+        state_path = directory / f"free-{_key(path)}.json"
+        state = host_off._read_json(state_path) or {}
+        free = free_of(path)
+        need = floor["floor_gb"] * (1 + FREE_MARGIN)
+        if free is None:
+            status = "unknown"
+        elif free < floor["floor_gb"]:
+            status = "low"
+            state["ok_streak"] = 0
+            state.setdefault("since", _iso(now))
+            state["lowest_gib"] = min(free, float(state.get("lowest_gib") or free))
+        elif free >= need:
+            status = "ok"
+            state["ok_streak"] = int(state.get("ok_streak") or 0) + 1
+        else:
+            status = "recovering"  # above the floor but inside the margin
+            state["ok_streak"] = 0
+        since = state.get("since")
+        resolved = bool(since) and int(state.get("ok_streak") or 0) >= RECOVER_PASSES
+        cache: Dict[str, Any] = {}
+
+        def top() -> Dict[str, Any]:
+            if not cache:
+                cache.update(top_dirs(roots_on(path, floors, roots),
+                                      directory / "evidence", run=run))
+            return cache
+
+        def raise_event() -> None:
+            host_off.event(directory, "disk_free_low",
+                           f"{host}: {path} {free:.1f} GiB free, floor {floor['floor_gb']:g}",
+                           {"path": path, "free_gib": round(free, 1),
+                            "floor_gib": floor["floor_gb"], "since": since,
+                            "top": top()["top"], "notes": top()["notes"]}, now)
+
+        out = host_off.episode_alert(
+            directory / f"alert-free-{_key(path)}.json",
+            active=status == "low" or (bool(since) and not resolved),
+            resolved=resolved, since=since, raise_event=raise_event,
+            render=lambda: free_alert_text(host, target, floor, float(state.get("lowest_gib")),
+                                           str(since), top()),
+            issue=issue, close=close,
+            issues_enabled=switched_on and (issue is not None or not _scratch(directory)))
+        if out.get("closed"):
+            host_off.event(directory, "disk_free_recovered",
+                           f"{host}: {path} back above its floor",
+                           {"path": path, "since": since,
+                            "lowest_gib": state.get("lowest_gib")}, now)
+            for name in ("since", "lowest_gib"):
+                state.pop(name, None)
+        state["last"] = {"at": _iso(now), "path": path, "status": status,
+                         "free_gib": None if free is None else round(free, 1),
+                         "floor_gib": floor["floor_gb"]}
+        host_off._write_json(state_path, state)
+        volumes.append({"path": path, "status": status, "free_gib": state["last"]["free_gib"],
+                        "floor_gib": floor["floor_gb"], "episode_since": state.get("since"),
+                        **out})
+    return {"disabled": None, "volumes": volumes}
+
+
 def watch(now: Optional[float] = None, directory: Optional[pathlib.Path] = None,
           **kwargs: Any) -> Dict[str, Any]:
     """One pass over every watched path, under a lock so two never overlap."""
@@ -731,9 +997,13 @@ def watch(now: Optional[float] = None, directory: Optional[pathlib.Path] = None,
             if exc.errno in (errno.EAGAIN, errno.EACCES):
                 return {"skipped": "another pass holds the lock", "paths": []}
             raise
-        results = [watch_path(path, directory, now, **kwargs) for path in watch_paths()]
-        devicefs = watch_devicefs(directory, now, **kwargs)
-    return {"at": _iso(now), "paths": results, "devicefs": devicefs}
+        results = [watch_path(path, directory, now, **{k: v for k, v in kwargs.items()
+                                                       if k not in ("free_of", "profile")})
+                   for path in watch_paths()]
+        devicefs = watch_devicefs(directory, now, **{k: v for k, v in kwargs.items()
+                                                      if k not in ("free_of", "profile")})
+        free_space = watch_free(directory, now, **kwargs)
+    return {"at": _iso(now), "paths": results, "devicefs": devicefs, "free_space": free_space}
 
 
 def _age(last: Any, now: float) -> Optional[float]:
@@ -758,7 +1028,17 @@ def status(directory: Optional[pathlib.Path] = None, now: Optional[float] = None
                      "outstanding": state.get("outstanding"), "evidence": state.get("evidence"),
                      "age_s": age, "stale": age is None or age > stale_after})
     devicefs = host_off._read_json(directory / "devicefs.json") or {}
-    return {"paths": rows, "devicefs": {"last": devicefs.get("last"),
+    free_rows = []
+    for state_file in sorted(directory.glob("free-*.json")):
+        if state_file.name == "free-disabled.json":
+            continue
+        state = host_off._read_json(state_file) or {}
+        age = _age(state.get("last"), now)
+        free_rows.append({"last": state.get("last"), "since": state.get("since"),
+                          "age_s": age, "stale": age is None or age > stale_after})
+    disabled = (host_off._read_json(directory / "free-disabled.json") or {}).get("reason")
+    return {"paths": rows, "free_space": {"disabled": disabled, "volumes": free_rows},
+            "devicefs": {"last": devicefs.get("last"),
                                         "since": devicefs.get("since"),
                                         "stuck_probes": devicefs.get("stuck", []),
                                         "evidence": devicefs.get("evidence")}}
@@ -817,6 +1097,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # read days after the agent stopped must not look current.
             at = (row.get("last") or {}).get("at") if args.action == "status" else result["at"]
             print(f"{at or 'never'} disk-watchdog: {_line(row)}")
+        free = result.get("free_space") or {}
+        if free.get("disabled"):
+            print(f"disk-watchdog: free-space check off: {free['disabled']}")
+        for row in free.get("volumes") or []:
+            last = row.get("last") or row
+            print(f"disk-watchdog: free space {row.get('path') or last.get('path')}: {last.get('status')}, "
+                  f"{last.get('free_gib')} GiB free, floor {last.get('floor_gib')} GiB"
+                  + (f"; low since {row.get('episode_since') or row.get('since')}"
+                     if row.get("episode_since") or row.get("since") else "")
+                  + (f"; issue #{row['issue']}" if row.get("issue") else ""))
         if result.get("devicefs") is not None:
             at = (result.get("at") if args.action == "watch"
                   else (result["devicefs"].get("last") or {}).get("at"))
