@@ -850,13 +850,14 @@ def top_dirs(roots: Sequence[str], directory: pathlib.Path, run: Optional[Runner
             "notes": notes, "roots": list(roots)[:MAX_ROOTS]}
 
 
-def read_free_gib(path: str) -> Optional[float]:
+def read_free_gib(path: str, on_stuck: Optional[Callable[[int], None]] = None) -> Optional[float]:
     """Free GiB on the volume at `path`, read in a child bounded by FREE_TIMEOUT_S;
-    None when it did not answer."""
+    None when it did not answer. A child that outlives SIGKILL (in the kernel)
+    is reported through `on_stuck(pid)` so the pass can refuse to start another."""
     override = os.environ.get("TARTCI_DISK_FREE_COMMAND")
     command = json.loads(override) if override else [child_python(), "-c", FREE_SCRIPT]
     try:
-        proc = subprocess.Popen([*command, path], stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen([*command, PROBE_MARKER, path], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, start_new_session=True)
     except (OSError, ValueError):
@@ -872,7 +873,8 @@ def read_free_gib(path: str) -> Optional[float]:
         try:
             proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
-            pass  # in the kernel: abandoned, never waited on
+            if on_stuck is not None:
+                on_stuck(proc.pid)  # in the kernel: abandoned, never waited on
         if proc.stdout is not None:
             proc.stdout.close()
         return None
@@ -881,7 +883,7 @@ def read_free_gib(path: str) -> Optional[float]:
 
 
 def free_alert_text(host: str, target: str, floor: Dict[str, Any], free_gib: float,
-                    since: str, top: Dict[str, Any]) -> Tuple[str, str]:
+                    since: str, top: Dict[str, Any], stuck_since: Optional[str] = None) -> Tuple[str, str]:
     lines = [f"{host}: {floor['path']} has {free_gib:.1f} GiB free; the fleet manifest's "
              f"floor ({floor['name']}) is {floor['floor_gb']:g} GiB.",
              f"Run: ssh {target} 'tartci disk status'", ""]
@@ -892,6 +894,9 @@ def free_alert_text(host: str, target: str, floor: Dict[str, Any], free_gib: flo
     else:
         lines.append("No work root on this volume reported a size.")
     lines += [f"({note})" for note in top["notes"]]
+    if stuck_since:
+        lines.append(f"A free-space probe of this volume is stuck since {stuck_since}; "
+                     "no new probe starts while it lives.")
     lines += ["", "Nothing is deleted by this alarm. Free space by removing finished work "
               "(build trees of merged lanes first).",
               f"This issue closes itself after {RECOVER_PASSES} passes at or above "
@@ -919,7 +924,6 @@ def watch_free(directory: pathlib.Path, now: float, *, issue: Any = None, close:
     marker.unlink(missing_ok=True)
     if host is None or target is None:
         host, target = _alert_host()
-    free_of = free_of or read_free_gib
     roots = work_roots(profile)
     switched_on = os.environ.get("TARTCI_DISK_WATCH_ISSUE", "1") != "0"
     volumes = []
@@ -927,7 +931,16 @@ def watch_free(directory: pathlib.Path, now: float, *, issue: Any = None, close:
         path = floor["path"]
         state_path = directory / f"free-{_key(path)}.json"
         state = host_off._read_json(state_path) or {}
-        free = free_of(path)
+        outstanding = state.get("outstanding") if isinstance(state.get("outstanding"), dict) else None
+        if outstanding and _probe_alive(int(outstanding.get("pid", 0))):
+            free = None  # the previous probe is still stuck: start no second one
+        else:
+            state.pop("outstanding", None)
+            found: List[int] = []
+            free = (free_of(path) if free_of else read_free_gib(path, found.append))
+            if found:
+                state["outstanding"] = {"pid": found[0], "started": now,
+                                        "since": _iso(now)}
         need = floor["floor_gb"] * (1 + FREE_MARGIN)
         if free is None:
             status = "unknown"
@@ -965,7 +978,8 @@ def watch_free(directory: pathlib.Path, now: float, *, issue: Any = None, close:
             active=status == "low" or (bool(since) and not resolved),
             resolved=resolved, since=since, raise_event=raise_event,
             render=lambda: free_alert_text(host, target, floor, float(state.get("lowest_gib")),
-                                           str(since), top()),
+                                           str(since), top(),
+                                       (state.get("outstanding") or {}).get("since")),
             issue=issue, close=close,
             issues_enabled=switched_on and (issue is not None or not _scratch(directory)))
         if out.get("closed"):
@@ -977,10 +991,12 @@ def watch_free(directory: pathlib.Path, now: float, *, issue: Any = None, close:
                 state.pop(name, None)
         state["last"] = {"at": _iso(now), "path": path, "status": status,
                          "free_gib": None if free is None else round(free, 1),
-                         "floor_gib": floor["floor_gb"]}
+                         "floor_gib": floor["floor_gb"],
+                         "probe_stuck_since": (state.get("outstanding") or {}).get("since")}
         host_off._write_json(state_path, state)
         volumes.append({"path": path, "status": status, "free_gib": state["last"]["free_gib"],
                         "floor_gib": floor["floor_gb"], "episode_since": state.get("since"),
+                        "probe_stuck_since": state["last"]["probe_stuck_since"],
                         **out})
     return {"disabled": None, "volumes": volumes}
 

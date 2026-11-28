@@ -50,6 +50,7 @@ kind = "disk_floor_gb"
 path = "/"
 value = 999
 """
+PROFILE_FLOORS = ("/Volumes/Data", "/")  # one probe per floored volume
 PROFILE = {"host": {"id": "box", "tart_home": "/Volumes/Data/VMs", "cache_root": "/cache"},
            "reclaim": {"worktrees_root": "/Volumes/Data/trees"}}
 
@@ -195,6 +196,28 @@ class FreeFloorTests(unittest.TestCase):
         f.data(230)
         f.data(230)
         self.assertEqual(f.closed, ["101"])
+
+    def test_a_stuck_free_probe_is_the_only_one_across_many_passes(self) -> None:
+        f = Fakes(self)
+        log = f.dir / "starts.log"
+        script = ("import sys,time\nopen(sys.argv[1],'a').write('x')\ntime.sleep(300)\n")
+        env = {"TARTCI_DISK_FREE_COMMAND": json.dumps([sys.executable, "-c", script, str(log)]),
+               "TARTCI_DISK_FREE_TIMEOUT_S": "0.5"}
+        killed = []
+        self.addCleanup(lambda: [os.kill(p, 9) for p in killed if dw._alive(p)])
+        with mock.patch.dict(os.environ, env), mock.patch.object(dw.os, "killpg"):
+            outs = []
+            for _ in range(4):
+                f.now += 60
+                outs.append(dw.watch_free(f.state, f.now, profile=PROFILE, issue=f.issue,
+                                          close=f.close, run=f.run, host="box", target="t"))
+            for state in f.state.glob("free-*.json"):
+                pid = (json.loads(state.read_text()).get("outstanding") or {}).get("pid")
+                if pid:
+                    killed.append(pid)
+        self.assertEqual(len(log.read_text()), len(PROFILE_FLOORS))
+        self.assertTrue(all(v["status"] == "unknown" for v in outs[-1]["volumes"]))
+        self.assertTrue(all(v["probe_stuck_since"] for v in outs[-1]["volumes"]))
 
     def test_a_du_that_times_out_still_reports_what_it_read(self) -> None:
         f = Fakes(self)
