@@ -317,6 +317,35 @@ class PoolStatusTests(unittest.TestCase):
         self.assertEqual(vms[0].end - vms[0].start, 600)
         self.assertEqual(vms[0].assigned_at, NOW.timestamp() + 2)
 
+    @staticmethod
+    def _ev(t: float, name: str, vm: str = "", runner: str = "r", **fields: Any) -> dict:
+        return {"t": NOW.timestamp() + t, "i": int(t), "event": name, "vm": vm,
+                "runner": runner, "detail": "", "fields": fields}
+
+    def test_scan_diagnostics_do_not_truncate_a_demand_wait(self) -> None:
+        wait = lambda t: self._ev(t, "demand_waiting", running=1, cap=2, poll=30)
+        clean = [wait(0), wait(40)]
+        noisy = [wait(0), self._ev(10, "scan_demand_ids"),
+                 self._ev(11, "queue_head_inversion"), wait(40)]
+        want = pool_usage.demand_spans(clean, 30)
+        self.assertEqual(want[0]["b"] - want[0]["a"], 40)
+        self.assertEqual(pool_usage.demand_spans(noisy, 30), want)
+
+    def test_scan_diagnostics_do_not_change_lease_fit_holds(self) -> None:
+        base = [self._ev(0, "lease_unfit_now"), self._ev(100, "lease_fit_restored")]
+        noisy = [base[0], self._ev(50, "scan_demand_ids"), self._ev(51, "queue_head_inversion"),
+                 base[1]]
+        self.assertEqual(pool_usage.lease_fit_holds(noisy, NOW.timestamp() + 200),
+                         pool_usage.lease_fit_holds(base, NOW.timestamp() + 200))
+
+    def test_scan_diagnostics_do_not_rename_the_lane_runner(self) -> None:
+        events = [self._ev(0, "clone_start", runner="real-runner"),
+                  self._ev(5, "scan_demand_ids", runner="real-runner-1-tier")]
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = pool_usage.lane_report("lane", tmp, events, NOW.timestamp() - 10,
+                                         NOW.timestamp() + 100, NOW.timestamp() + 100, 30)
+        self.assertEqual(rep["runner"], "real-runner")
+
     def test_the_newest_observation_wins_across_lanes(self) -> None:
         d = detail([(1, queued_job(10, 69))],
                    [(2, started_job(20, created=60, started=50, runner="r"))])

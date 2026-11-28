@@ -176,6 +176,16 @@ def lane_log_lines(path: str, cutoff: str) -> List[bytes]:
     return lines
 
 
+# Written by the queue scan with no VM name and the scan's lane id as runner,
+# possibly mid-VM or mid-wait. They are not supervisor state transitions, so
+# every reader of the event stream below drops them first.
+SCAN_DIAGNOSTIC_EVENTS = frozenset({"scan_demand_ids", "queue_head_inversion"})
+
+
+def without_diagnostics(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [ev for ev in events if ev["event"] not in SCAN_DIAGNOSTIC_EVENTS]
+
+
 def load_events(path: str, cutoff: str) -> List[Dict[str, Any]]:
     out = []
     for i, line in enumerate(lane_log_lines(path, cutoff)):
@@ -223,9 +233,6 @@ class Vm:
         return "unrecorded" if self.minted else "unrecorded_pre_mint"
 
 
-SCAN_DIAGNOSTIC_EVENTS = frozenset({"scan_demand_ids", "queue_head_inversion"})
-
-
 def reconstruct_vms(events: List[Dict[str, Any]], now: float,
                     live_vm: Optional[str]) -> List[Vm]:
     """One interval per VM this lane cloned.
@@ -244,12 +251,8 @@ def reconstruct_vms(events: List[Dict[str, Any]], now: float,
             vms.append(cur)
             cur = None
 
-    for ev in events:
+    for ev in without_diagnostics(events):
         e, vm, t = ev["event"], ev["vm"], ev["t"]
-        if e in SCAN_DIAGNOSTIC_EVENTS:
-            # Written by the queue scan with no VM name, possibly mid-VM: not
-            # a sign that the supervisor's VM is gone.
-            continue
         if e == "clone_start":
             if cur is not None:
                 close(cur.last_t)
@@ -297,7 +300,7 @@ def demand_spans(events: List[Dict[str, Any]], default_poll: int) -> List[Dict[s
     """Each demand sample covers [t, end): up to the next sample when the lane
     kept waiting (next sample within two polls), else until the lane did
     something else, bounded by one poll (the sleep that followed the sample)."""
-    flow = [ev for ev in events if ev["event"] not in WAIT_NOISE]
+    flow = [ev for ev in without_diagnostics(events) if ev["event"] not in WAIT_NOISE]
     spans = []
     for k, ev in enumerate(flow):
         if ev["event"] not in DEMAND_EVENTS:
@@ -336,7 +339,7 @@ def lease_fit_holds(events: List[Dict[str, Any]], now: float) -> List[Tuple[floa
     """[lease_unfit_now, lane proceeds) intervals: the lane could not lease its
     VM and so did not scan for work."""
     spans, start = [], None
-    for ev in events:
+    for ev in without_diagnostics(events):
         e = ev["event"]
         if e in ("lease_unfit_now", "lease_never_fits"):
             if start is None:
@@ -354,7 +357,10 @@ def lease_fit_holds(events: List[Dict[str, Any]], now: float) -> List[Tuple[floa
 # ── report ───────────────────────────────────────────────────────────────────
 def lane_report(lane: str, lane_dir: str, events: List[Dict[str, Any]], since: float,
                 until: float, now: float, default_poll: int) -> Dict[str, Any]:
-    runner = next((ev["runner"] for ev in reversed(events) if ev["runner"]), lane)
+    # The runner name comes from a supervisor event: a scan diagnostic carries
+    # the scan's lane id, which can differ and would point read_state_vm astray.
+    runner = next((ev["runner"] for ev in reversed(without_diagnostics(events))
+                   if ev["runner"]), lane)
     live_vm = read_state_vm(lane_dir, runner)
     vms = reconstruct_vms(events, now, live_vm)
     window = until - since
