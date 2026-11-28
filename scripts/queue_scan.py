@@ -20,6 +20,7 @@ from typing import Any
 
 from bounded_subprocess import run_bounded
 from slot_demand import DemandDetail, parse_short_jobs
+import queue_head_inversion
 from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     NO_VALID_CREDENTIALS,
@@ -763,6 +764,8 @@ class QueueScanner:
                 raise ValueError(f"jobs is not a list for run {run_id}")
             run_matches = 0
             for job in jobs:
+                if isinstance(job, dict):
+                    self._note_started(detail, run, job)
                 if (
                     not isinstance(job, dict)
                     or str(job.get("status", "")).lower() not in self.job_statuses
@@ -819,7 +822,21 @@ class QueueScanner:
         # from the runs and jobs read above (no further call).
         if getattr(self.args, "detail_file", None):
             detail.write(self.args.detail_file)
+        # Diagnostics and the (default-off) inversion detector read the same
+        # detail; both only append to the lane's event log.
+        queue_head_inversion.record_from_args(detail.as_dict(), self.args)
         return matches
+
+    def _note_started(self, detail: DemandDetail, run: dict, job: dict) -> None:
+        """Jobs with this scan's labels that already hold a runner (inversion evidence)."""
+        if str(job.get("status", "")).lower() not in {"in_progress", "completed"}:
+            return
+        if not job.get("runner_name") or not job.get("started_at"):
+            return
+        job_labels = {str(label).lower() for label in job.get("labels", []) if str(label)}
+        if self.args.match_labels and (not job_labels or not job_labels.issubset(self.labels)):
+            return
+        detail.note_started(run, job)
 
     def scan(self) -> int:
         with self._state_lock():
@@ -926,6 +943,7 @@ def parse_args() -> argparse.Namespace:
         help="also write the matched jobs' event classes and oldest created_at here "
         "(scripts/slot_demand.py); makes no extra API call",
     )
+    queue_head_inversion.add_cli_args(parser)
     parser.add_argument(
         "--short-jobs",
         default=os.environ.get("TARTCI_SHORT_JOBS", ""),

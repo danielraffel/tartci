@@ -32,6 +32,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SCHEMA = 1
+# Diagnostics bounds: the detail file lists at most this many counted jobs per
+# class (oldest first) and this many jobs that already took a runner (newest
+# first), so a deep backlog cannot grow the file.
+MAX_LISTED_JOBS = 10
+MAX_STARTED_JOBS = 20
 MERGE_GROUP = "merge_group"
 PULL_REQUEST = "pull_request"
 OTHER = "other"
@@ -109,6 +114,32 @@ class DemandDetail:
         self.short_jobs = list(short_jobs or [])
         self._lock = threading.Lock()
         self._classes: Dict[str, Dict[str, Any]] = {}
+        self._listed: Dict[str, List[Dict[str, Any]]] = {}
+        self._started: List[Dict[str, Any]] = []
+
+    def note_started(self, run: Dict[str, Any], job: Dict[str, Any]) -> None:
+        """A job (matching this scan's labels) that already has a runner.
+
+        Evidence for scripts/queue_head_inversion.py: a runner that took a job
+        newer than a still-queued one. Bounded to the newest MAX_STARTED_JOBS.
+        """
+        started = parse_ts(job.get("started_at"))
+        runner = str(job.get("runner_name") or "")
+        if started is None or not runner:
+            return
+        created = parse_ts(job.get("created_at")) or parse_ts(run.get("created_at"))
+        row = {
+            "run_id": run.get("id"),
+            "job_id": job.get("id"),
+            "event_class": event_class(run.get("event")),
+            "created_at": iso(created) if created else None,
+            "started_at": iso(started),
+            "runner_name": runner,
+        }
+        with self._lock:
+            self._started.append(row)
+            self._started.sort(key=lambda r: r["started_at"], reverse=True)
+            del self._started[MAX_STARTED_JOBS:]
 
     def add(self, run: Dict[str, Any], job: Dict[str, Any]) -> None:
         cls = event_class(run.get("event"))
@@ -116,6 +147,11 @@ class DemandDetail:
         with self._lock:
             row = self._classes.setdefault(cls, {"count": 0, "oldest_created_at": None})
             row["count"] += 1
+            listed = self._listed.setdefault(cls, [])
+            listed.append({"run_id": run.get("id"), "job_id": job.get("id"),
+                           "created_at": iso(stamp) if stamp else None})
+            listed.sort(key=lambda r: (r["created_at"] is None, r["created_at"] or ""))
+            del listed[MAX_LISTED_JOBS:]
             if stamp is not None:
                 current = parse_ts(row["oldest_created_at"])
                 if current is None or stamp < current:
@@ -131,8 +167,10 @@ class DemandDetail:
     def as_dict(self) -> Dict[str, Any]:
         with self._lock:
             classes = {}
+            started = [dict(r) for r in self._started]
             for key, value in self._classes.items():
                 classes[key] = dict(value)
+                classes[key]["oldest_jobs"] = [dict(r) for r in self._listed.get(key, [])]
                 if isinstance(value.get("short"), dict):
                     classes[key]["short"] = dict(value["short"])
         return {
@@ -140,6 +178,7 @@ class DemandDetail:
             "written_at": iso(_utcnow()),
             "witness_only": self.witness_only,
             "classes": classes,
+            "started": started,
         }
 
     def write(self, path: str) -> None:

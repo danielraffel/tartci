@@ -173,6 +173,8 @@ tartci_assignment_v2_tier_demand(){
   # bash 3.2 (the macOS system shell) treats an empty "${a[@]}" as an unbound
   # variable under `set -u`, so the expansion must be guarded, not just quoted.
   [ "$exhaustive" = 1 ] && count_args=(--exhaustive-count)
+  # Per-tier counted run and job ids go to the lane event log (diagnostics).
+  [ -z "${EVENT_LOG:-}" ] || count_args+=(--event-log "$EVENT_LOG")
   # Slot priority reads the event class and age of what this scan counted.
   if [ "${ASSIGNMENT_MODE:-}" = event-class-v2 ] \
      && declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
