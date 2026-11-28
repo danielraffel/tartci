@@ -283,9 +283,26 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertEqual(
             [tier["label"] for tier in pr_first["tier"]],
             ["vellum-sterile-consumer", "vellum-build-macos", "vellum-build-macos-merge-group"])
-        # Apart from the id and the tier order the two lanes are identical.
-        strip = lambda lane: {k: v for k, v in lane.items() if k not in ("id", "tier")}
+        # Apart from the id, the tier order and the retired slot-2 agent the
+        # two lanes are identical.
+        skip = ("id", "tier", "replaces_launchd_labels")
+        strip = lambda lane: {k: v for k, v in lane.items() if k not in skip}
         self.assertEqual(strip(merge_first), strip(pr_first))
+
+    def test_m3_vellum_gate_pr_retires_the_old_slot2_agent(self) -> None:
+        # vellum-gate no longer renders .slot2. Self-update stops that agent and
+        # pool on never re-enables it, so _demand_spawn fails closed and rolls
+        # back unless the install receipt lists it in retired_launchd_labels,
+        # which comes only from replaces_launchd_labels.
+        old_slot2 = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate.slot2"
+        data = fleet.load(HOST_CONFIGS["studio"])
+        lanes = {lane["id"]: lane for lane in data["lane"]}
+        self.assertEqual(lanes["vellum-gate-pr"]["replaces_launchd_labels"], [old_slot2])
+        self.assertEqual(lanes["vellum-gate"]["replaces_launchd_labels"], [])
+        self.assertIn(old_slot2, fleet.replacements(data))
+        rendered = fleet.rendered_plists(data)
+        self.assertFalse(any(old_slot2 in name for name in rendered), sorted(rendered))
+        self.assertTrue(any("studio.vellum-gate-pr" in name for name in rendered))
 
     def test_vm_slot_lending_is_a_policed_boolean_on_the_m5_canary(self) -> None:
         self.assertIs(fleet.load(HOST_CONFIGS["m5"])["leases"]["vm_slot_lending"], True)

@@ -389,6 +389,37 @@ class UnreachableConcurrencyTests(unittest.TestCase):
              "vm_cores=8 demand=16 budget=12"])
 
     @requires_tomllib
+    def test_m3_vellum_lanes_fit_the_non_gate_budget_together(self) -> None:
+        # unreachable_concurrency checks each lane alone, so m3's two
+        # one-supervisor Vellum lanes must also fit when summed.
+        host = self.host("m3")
+
+        def summed(data: dict) -> dict:
+            total = {"cores": 0, "memory": 0}
+            for lane in grf.non_gate_lanes(data):
+                if lane.get("repo") != "Generous-Corp/vellum":
+                    continue
+                cores = grf.lane_vm_cores(lane, host)
+                total["cores"] += int(lane.get("supervisors", 1)) * cores
+                total["memory"] += int(lane.get("supervisors", 1)) * grf.vm_mem_mb(cores)
+            return total
+
+        data = profile("m3")
+        ids = sorted(lane["id"] for lane in grf.non_gate_lanes(data)
+                     if lane.get("repo") == "Generous-Corp/vellum")
+        self.assertEqual(ids, ["vellum-gate", "vellum-gate-pr"])
+        total = summed(data)
+        self.assertEqual(total["cores"], 8)
+        self.assertLessEqual(total["cores"], host["non_gate_capacity_cores"])
+        self.assertLessEqual(total["memory"], host["non_gate_capacity_mem_mb"])
+        # Control: 8-core guests on both lanes pass the per-lane check but not the sum.
+        for lane in data["lane"]:
+            if lane["id"] in ids:
+                lane["vm_cores"] = 8
+        self.assertEqual(grf.unreachable_concurrency(data, host), [])
+        self.assertGreater(summed(data)["cores"], host["non_gate_capacity_cores"])
+
+    @requires_tomllib
     def test_slot_lending_raises_the_budget_to_the_lease_capacity(self) -> None:
         data = profile("m5")
         self.assertTrue(data["leases"]["vm_slot_lending"])

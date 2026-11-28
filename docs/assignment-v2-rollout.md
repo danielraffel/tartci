@@ -427,7 +427,8 @@ the merge-capable m3, m5 and m5studio slots protect merge-group demand.
 
 m3 runs Vellum on two one-supervisor lanes instead of one two-supervisor lane:
 `vellum-gate` (sterile-consumer, merge-group, PR head) and `vellum-gate-pr`
-(sterile-consumer, PR head, merge-group). Every other key is identical, so the
+(sterile-consumer, PR head, merge-group). Every other key except the retired
+slot-2 agent (below) is identical, so the
 host still runs two 4-core Vellum VMs (8 of the 12 non-gate cores) and still
 serves merge groups on both slots whenever no PR proof waits. With both slots
 merge-group first, PR-head proofs (Vellum's required `gpu-macos-arm64` check)
@@ -441,10 +442,20 @@ event-class-v2: v2 requires a repository-scoped runner group 1 (Vellum
 registers in organization group 8), and `short_jobs` and
 `refresh_after_every_serve` are refused on a v2 lane.
 
-Rollback: delete the `vellum-gate-pr` lane, set `vellum-gate`'s `supervisors`
-back to 2, regenerate `fleet/advertised-labels.json`, and let self-update
-re-render and reload at an idle boundary (reverting the change does all of
-this). The m1 and m5studio Vellum lanes still serve merge groups first on
+`vellum-gate-pr` lists the old
+`com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate.slot2`
+agent in `replaces_launchd_labels`. Self-update stops every lane before it
+installs and fails closed (then rolls back) when `pool on` does not re-enable a
+stopped label, unless the install receipt's `retired_launchd_labels` lists it;
+that list comes only from `replaces_launchd_labels`.
+
+Rollback: a plain revert fails self-update the same way, because it stops
+`studio.vellum-gate-pr` and nothing retires it. Either revert and also add
+`replaces_launchd_labels =
+["com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate-pr"]` to
+`vellum-gate` (with `supervisors = 2` and a regenerated
+`fleet/advertised-labels.json`), or roll back by hand on m3 with `pool off`,
+`fleet-macos install`, `pool on`. The m1 and m5studio Vellum lanes still serve merge groups first on
 their one slot; giving them a PR-first lane is a separate change.
 
 ## Release event classes (declared on every host's pulp-gate lane)

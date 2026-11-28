@@ -323,7 +323,7 @@ vm_cores = 4
 # and a 4-core agent build; 6 merge-queue GPU proofs queued
 # 2-4h behind one slot on 2026-11-15. One of the two slots now lives in
 # lane vellum-gate-pr below, which serves the PR class before merge groups.
-# Rollback: delete lane vellum-gate-pr and set this back to 2.
+# Rollback: see lane vellum-gate-pr (a plain revert fails self-update).
 supervisors = 1
 min_queued_age_seconds = 0
 # Vellum's merge-group sterile job appears only when its GPU job ends, long
@@ -399,8 +399,14 @@ runner_group_id = 8
 # queued 1-4 h with no runner on 2026-11-28. This lane is identical to
 # vellum-gate except its tier order: sterile-consumer first (short journeys,
 # unchanged), then PR, then merge group, so it still serves merge groups
-# whenever no PR proof waits. Rollback: delete this lane and set vellum-gate's
-# supervisors back to 2, re-render, reload at an idle boundary.
+# whenever no PR proof waits.
+# It replaces vellum-gate's old slot-2 LaunchAgent, which this generation no
+# longer renders: self-update fails closed on a stopped label that pool on does
+# not enable unless the install receipt retires it.
+# Rollback: delete this lane, set vellum-gate's supervisors back to 2 AND add
+# replaces_launchd_labels = ["com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate-pr"]
+# on vellum-gate (a plain revert fails self-update the same way), or roll back
+# by hand with pool off, fleet-macos install, pool on.
 [[lane]]
 id = "vellum-gate-pr"
 repo = "Generous-Corp/vellum"
@@ -419,7 +425,7 @@ labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
 assignment_fleet_claim_peers = true
 job_claim_labels = ["self-hosted", "macOS", "ARM64"]
 runner_idle_timeout_seconds = 60
-replaces_launchd_labels = []
+replaces_launchd_labels = ["com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate.slot2"]
 guest_heartbeat_stale_seconds = 600
 
 [[lane.tier]]

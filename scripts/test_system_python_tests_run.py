@@ -197,6 +197,9 @@ ALLOWED = {
      "UnreachableConcurrencyTests.test_the_previous_m3_vellum_sizing_is_refused"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
+     "UnreachableConcurrencyTests.test_m3_vellum_lanes_fit_the_non_gate_budget_together"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
      "UnreachableConcurrencyTests.test_slot_lending_raises_the_budget_to_the_lease_capacity"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
