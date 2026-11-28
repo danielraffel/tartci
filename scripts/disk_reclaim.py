@@ -1069,7 +1069,8 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
         "pressure": report.get("pressure"),
         "free_bytes_before": report.get("free_bytes_before"),
         "free_bytes_after": report.get("free_bytes_after"),
-        "tartci_reclaimed_bytes": report.get("reclaimed_bytes", 0),
+        "tartci_reclaimed_bytes": report.get("candidate_reclaimed_bytes",
+                                             report.get("reclaimed_bytes", 0)),
         "fail_below_gb": report.get("fail_below_gb"),
         "tightest_root": report.get("tightest_root"),
         "pulp_reapers": {
@@ -1687,6 +1688,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         and volume["free_bytes"] is not None
         and volume["free_bytes"] < args.fail_below_gb * GIB
     ]
+    # Worktree-output removals (worktree_outputs.py) count toward what the
+    # pass reclaimed; `candidate_reclaimed_bytes` stays the build-dir share.
+    worktree_removed = int(worktree.get("removed") or 0)
+    worktree_bytes = int(worktree.get("removed_bytes") or 0)
     report = {
         "process_scan_ok": active is not None,
         "roots": [str(root) for root in roots],
@@ -1702,7 +1707,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         "checkout_build_outputs": receipt["checkout_build_outputs"],
         "deleted": deleted,
         "kept": kept,
-        "reclaimed_bytes": reclaimed,
+        "reclaimed_bytes": reclaimed + worktree_bytes,
+        "candidate_reclaimed_bytes": reclaimed,
+        "worktree_outputs_removed": worktree_removed,
+        "worktree_outputs_removed_bytes": worktree_bytes,
         "free_bytes_before": free_before,
         "free_bytes_after": free_after,
         "free_bytes_by_volume_before": volumes_before,
@@ -1746,7 +1754,8 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
                if tightest_root and (lease or len(floor_after) > 1) else ""))
         print(f"disk_reclaim: {len(candidates)} candidate(s) under "
               f"{', '.join(str(r) for r in roots)}; {verb} {len(deleted)}; "
-              f"{freed_verb} {reclaimed / GIB:.1f} GiB; "
+              + (f"worktree outputs {verb} {worktree_removed}; " if worktree_removed else "")
+              + f"{freed_verb} {(reclaimed + worktree_bytes) / GIB:.1f} GiB; "
               f"free {free_text} "
               f"(pressure={'yes' if pressure else 'no'}, age gate {min_age:g}d)")
         if active is None:

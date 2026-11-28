@@ -267,5 +267,46 @@ class PassSummary(unittest.TestCase):
         self.assertIn("97.0% -> 90.0%", text)
 
 
+class MainReport(unittest.TestCase):
+    """The report and human line of a whole pass count the worktree removals."""
+
+    def _run(self, *argv):
+        import contextlib
+        import json
+        import unittest.mock
+        worktree = {"enabled": True, "mode": "fix", "removed": 3,
+                    "removed_bytes": 5 * wo.GIB, "kept": {}}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td, \
+                unittest.mock.patch.dict(os.environ, {
+                    "TARTCI_HOME": td, "TARTCI_RECLAIM_STATE_DIR": td,
+                    "TARTCI_FLEET_PROFILE": td + "/none.toml",
+                    "TARTCI_RECLAIM_BOOT_FLOOR_GB": "0", "TARTCI_BOOT_USAGE": "0",
+                    "TARTCI_RECLAIM_RETENTION": "0"}), \
+                unittest.mock.patch.object(dr.worktree_outputs, "run", return_value=worktree), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            dr.main(["--roots", td, *argv])
+        return out.getvalue()
+
+    def test_json_report_counts_worktree_removals(self):
+        import json
+        report = json.loads(self._run("--json", "--fix"))
+        self.assertEqual(report["reclaimed_bytes"], 5 * wo.GIB)
+        self.assertEqual(report["worktree_outputs_removed"], 3)
+        self.assertEqual(report["worktree_outputs_removed_bytes"], 5 * wo.GIB)
+        self.assertEqual(report["candidate_reclaimed_bytes"], 0)
+
+    def test_human_summary_counts_worktree_removals(self):
+        text = self._run("--fix")
+        self.assertIn("worktree outputs removed 3", text)
+        self.assertIn("reclaimed 5.0 GiB", text)
+
+    def test_receipt_summary_does_not_double_count(self):
+        summary = dr.pass_summary({"mode": "fix", "worktree_outputs": {"removed_bytes": 5 * wo.GIB},
+                                   "report": {"reclaimed_bytes": 5 * wo.GIB,
+                                              "candidate_reclaimed_bytes": 0}}, 0)
+        self.assertEqual(summary["reclaimed_bytes"], 5 * wo.GIB)
+
+
 if __name__ == "__main__":
     unittest.main()
