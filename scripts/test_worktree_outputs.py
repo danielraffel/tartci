@@ -471,5 +471,18 @@ class MainReport(unittest.TestCase):
         self.assertEqual(summary["reclaimed_bytes"], 5 * wo.GIB)
 
 
+class ShippedProfilesTest(unittest.TestCase):
+    def test_no_shipped_profile_enables_it(self):
+        profiles = pathlib.Path(__file__).resolve().parent.parent / "profiles"
+        files = sorted(profiles.glob("*.toml"))
+        self.assertTrue(files)
+        for f in files:
+            for line in f.read_text().splitlines():
+                self.assertFalse(
+                    line.strip().startswith(wo.ROOTS_KEY),
+                    f"{f.name} enables the worktree-output reaper",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
