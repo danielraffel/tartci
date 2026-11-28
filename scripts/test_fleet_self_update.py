@@ -2598,6 +2598,91 @@ class OffPeerTests(Base):
         self.assertUpdated(self.apply())
 
 
+class PeerAwayTests(Base):
+    """A peer declared away on this host is excluded while it is unreachable.
+
+    On 2026-11-28 m5 was travelling (pool off) and its SSH timed out. m3 and
+    m5studio stepped aside at every attempt: the dark-peer exclusion needs
+    every readable peer's fresh read of m5, and m1, already current, had
+    stopped surveying. The declaration is explicit and per host; a peer that
+    is not declared, or that answers, is held to the normal reads.
+    """
+
+    def declare(self, value: object) -> None:
+        self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+        (self.cfg.state_dir / "peers-away.json").write_text(
+            value if isinstance(value, str) else json.dumps(value))
+
+    def peers_step(self) -> str:
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        return next(step for step in receipt["steps"] if step["step"] == "peers")["detail"]
+
+    def test_an_unreachable_peer_declared_away_no_longer_blocks_the_turn(self) -> None:
+        del self.sys.peers["m5"]
+        # Written by hand, as on a host whose installed CLI predates --peer-away.
+        self.declare({"m5": {"reason": "travelling", "since": "2026-11-28T10:00:00Z"}})
+        rc = self.apply()
+        self.assertIsNone(su.waiting_ticket(self.cfg), "stepped aside on a declared-away peer")
+        self.assertUpdated(rc)
+        self.assertIn("declared away and unreachable", self.peers_step())
+        self.assertIn("travelling", self.peers_step())
+        # Its streak is still recorded: other hosts corroborate from it.
+        self.assertIn("m5", su.peer_streaks(self.cfg))
+
+    def test_an_unreachable_peer_not_declared_still_steps_aside(self) -> None:
+        # Control, same instrument: only the declaration differs.
+        del self.sys.peers["m5"]
+        self.declare({"studio": {"reason": "a different host"}})
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertIn("SSH transport failed", su.waiting_ticket(self.cfg)["reason"])
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_declared_peer_that_answers_and_is_updating_still_blocks(self) -> None:
+        su.declare_away(self.cfg, "m5", "travelling", NOW)
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 60}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_declared_peer_that_answers_is_surveyed_and_named_stale(self) -> None:
+        su.declare_away(self.cfg, "m5", "travelling", NOW)
+        survey = su.survey_peers(self.cfg, self.sys, "m1")
+        self.assertEqual(survey.away, [])
+        self.assertEqual(survey.stale_away, ["m5"])
+        self.assertUpdated(self.apply())
+        self.assertNotIn("declared away", self.peers_step())
+
+    def test_a_malformed_or_reasonless_declaration_declares_nothing(self) -> None:
+        del self.sys.peers["m5"]
+        for value in ("{not json", ["m5"], {"m5": True}, {"m5": {"reason": " "}}):
+            with self.subTest(value=value):
+                self.declare(value)
+                self.assertEqual(su.peers_away(self.cfg), {})
+                self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+                self.assertEqual(self.sys.mutations(), [])
+
+    def test_declare_and_clear_round_trip(self) -> None:
+        su.declare_away(self.cfg, "m5", "travelling", NOW)
+        self.assertEqual(su.peers_away(self.cfg),
+                         {"m5": {"reason": "travelling", "since": su._iso(NOW)}})
+        su.declare_away(self.cfg, "m5", None, NOW)
+        self.assertEqual(su.peers_away(self.cfg), {})
+        self.assertFalse((self.cfg.state_dir / su.PEER_AWAY_NAME).exists())
+
+    def test_the_cli_declares_and_clears(self) -> None:
+        settings = self.home / "settings.toml"
+        settings.write_text("")
+        base = ["--home", str(self.home), "--settings", str(settings)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(su.main(["--peer-away", "m5", "--reason", "travelling", *base]), 0)
+        self.assertEqual(su.peers_away(su.load_config(self.home, settings))["m5"]["reason"],
+                         "travelling")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(su.main(["--peer-back", "m5", *base]), 0)
+        self.assertEqual(su.peers_away(su.load_config(self.home, settings)), {})
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            su.main(["--peer-away", "m5", *base])
+
+
 class MidJobWaitTests(Base):
     def test_waits_while_mid_job_then_proceeds(self) -> None:
         self.sys.offplan = [12, 12, 0]
