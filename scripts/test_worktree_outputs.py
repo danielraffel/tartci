@@ -12,6 +12,7 @@ import io
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -203,9 +204,47 @@ class Bounds(Fixture):
         wo.scratch_dirs.size_bytes = lambda *a, **k: 60 * wo.GIB
         self.addCleanup(setattr, wo.scratch_dirs, "size_bytes", orig)
         report = self.scan(max_gib=100, pressure_used_pct=99)
-        self.assertEqual(report["removed"], 2)
+        self.assertEqual(report["removed"], 1)
+        self.assertEqual(report["removed_bytes"], 60 * wo.GIB)
         self.assertEqual(report["capped"], "max_gib")
-        self.assertEqual(sum(o.exists() for o in outs), 2)
+        self.assertEqual(sum(o.exists() for o in outs), 3)
+
+    def test_candidate_larger_than_cap_is_skipped_and_smaller_still_fits(self):
+        big = self.output("lane-a", age=30)
+        small = self.output("lane-b", age=10)
+        sizes = {str(big): 500 * wo.GIB, str(small): 1 * wo.GIB}
+        orig = wo.scratch_dirs.size_bytes
+        wo.scratch_dirs.size_bytes = lambda p, *a, **k: sizes[str(p)]
+        self.addCleanup(setattr, wo.scratch_dirs, "size_bytes", orig)
+        report = self.scan(max_gib=100, pressure_used_pct=99)
+        self.assertTrue(big.exists())
+        self.assertFalse(small.exists())
+        self.assertEqual(report["capped"], "max_gib")
+
+    def test_unknown_size_is_kept(self):
+        out = self.output("lane-a")
+        orig = wo.scratch_dirs.size_bytes
+        wo.scratch_dirs.size_bytes = lambda *a, **k: None
+        self.addCleanup(setattr, wo.scratch_dirs, "size_bytes", orig)
+        report = self.scan()
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("size_unknown"), 1)
+
+    def test_build_started_after_scan_is_kept(self):
+        out = self.output("lane-a")
+        calls = []
+
+        def runner(cmd, *a, **k):
+            if cmd[0] == "ps":
+                calls.append(1)
+                text = "" if len(calls) == 1 else f"cc -o {out}/obj/b.o\n"
+                return type("P", (), {"returncode": 0, "stdout": text})()
+            return subprocess.run(cmd, *a, **k)
+        report = wo.scan(self.settings(), fix=True, runner=runner,
+                         log=lambda _l: None, measure=lambda _r: 97.0)
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("in_use"), 1)
+        self.assertEqual(len(calls), 2)
 
     def test_time_budget(self):
         self.output("lane-a")

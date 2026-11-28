@@ -268,6 +268,7 @@ def scan(settings: dict[str, Any], *, fix: bool, runner: Runner = subprocess.run
 
     commands = command_lines(runner)
     gib_cap = settings["max_gib"] * GIB
+    over_cap = False
     for root in settings["roots"]:
         entry: dict[str, Any] = {"root": str(root), "used_pct_before": None,
                                  "used_pct_after": None, "state": None}
@@ -334,10 +335,24 @@ def scan(settings: dict[str, Any], *, fix: bool, runner: Runner = subprocess.run
                 keep("protected_lane_recent" if days > settings["idle_days"] else "recent")
                 continue
             size = scratch_dirs.size_bytes(path, runner)
+            if size is None:
+                keep("size_unknown")
+                continue
+            if report["removed_bytes"] + size > gib_cap:
+                keep("over_gib_cap")
+                over_cap = True
+                continue
             if fix:
                 # Re-read just before the delete: a build may have started.
                 if idle_for(path, days, runner) is not True or has_live_marker(path):
                     keep("recent")
+                    continue
+                fresh = command_lines(runner)
+                if fresh is None:
+                    keep("process_scan_failed")
+                    continue
+                if str(path) in fresh or str(path.parent) in fresh:
+                    keep("in_use")
                     continue
                 error = scratch_dirs.remove_tree(path, os.geteuid())
                 if error:
@@ -364,6 +379,8 @@ def scan(settings: dict[str, Any], *, fix: bool, runner: Runner = subprocess.run
                 except OSError:
                     pass
         entry["used_pct_after"] = round(current, 1)
+    if over_cap and not report["capped"]:
+        report["capped"] = "max_gib"
     report["elapsed_s"] = round(clock() - started, 1)
     return report
 
