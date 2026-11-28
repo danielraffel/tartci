@@ -74,7 +74,7 @@
 #                              # reload refuses a mid-job lane (exit 3) unless --force;
 #                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
 #   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
-#   tartci disk <watch|status> [--json]  # write-latency watchdog for the cache/VM volumes
+#   tartci disk <watch|status> [--json]  # write-latency and free-space watchdog for the cache/VM volumes
 #                              # (one pass; the disk-watchdog LaunchAgent runs it every 60 s)
 #   tartci pool log [--status] [--json]  # bounded history of this host's pool status
 #                              # (one pass; the pool-log LaunchAgent runs it every 300 s)

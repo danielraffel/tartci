@@ -92,6 +92,9 @@ ALLOWED = {
         ("3.11-only: host_hygiene judges VM ownership with tart_image_prune.plan(), which "
          "reads the fleet profile with tomllib; without it nothing is judged foreign "
          "(NoTomllib.test_without_tomllib_nothing_is_judged_foreign)"),
+    ("test_disk_watchdog_free_space.py", "FreeFloorTests"):
+        ("3.11-only: the floors are read from the fleet manifest with tomllib; without it the "
+         "free-space check is off (FloorConfigTests.test_without_tomllib_the_check_is_off)"),
     ("test_vm_boot_alert.py",
      "Alert.test_the_host_and_ssh_target_come_from_the_profile"):
         ("3.11-only: vm_boot_alert._alert_host() reads the host id and ssh target from the "

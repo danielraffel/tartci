@@ -481,6 +481,22 @@ are stuck the pass stops probing: it takes no action, keeps the episode open
 and says a reboot is needed. A `mount` that does not answer counts as unknown,
 never healthy. `TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
 
+The pass also alarms on free space. The floors are the fleet manifest's
+`kind = "disk_floor_gb"` keys under `[hosts.<host.id>]`, read from the file
+named by `TARTCI_FLEET_MANIFEST` or the profile's `[disk_watch] fleet_manifest`
+(nothing is hardcoded). A work volume once fell to 96 GiB free against a
+200 GiB floor while only the slow-write alarm fired. Below a floor the pass
+opens one `disk_free_low` episode and one GitHub issue per volume, naming the
+free space, the floor and the five largest directories (depth-1 `du`, bounded
+by `TARTCI_DISK_DU_TIMEOUT_S`, 20 s, per root) under the work roots on that
+volume: `TARTCI_DISK_WORK_ROOTS`, else `[disk_watch] work_roots`, else the
+profile's `host.tart_home`, `host.cache_root` and `[reclaim]` worktree roots.
+Free space is read in a bounded child (`TARTCI_DISK_FREE_TIMEOUT_S`), like the
+write probe. The episode closes (`disk_free_recovered`) after three passes at or
+above the floor plus 10%. With no manifest, no entry for the host, no floors or
+no tomllib the check is off, and the pass says why on stderr once per change.
+It never deletes anything.
+
 `tartci disk status [--json]` prints each path's last probe stamped with its
 own time, its open episode and its evidence directory, and the device
 filesystem's last check. A last probe older than 10 minutes
