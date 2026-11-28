@@ -54,6 +54,14 @@ def event_class(event: Any) -> str:
     return OTHER
 
 
+def job_labels(job: Dict[str, Any]) -> List[str]:
+    """The job's labels, lowercased and sorted; a null or odd value is no labels."""
+    raw = job.get("labels") or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return sorted({str(label).lower() for label in raw if str(label)})
+
+
 def parse_short_jobs(raw: Optional[str]) -> List[Tuple[str, str]]:
     """`workflow|job` lines (TARTCI_SHORT_JOBS) as (workflow, job) pairs.
 
@@ -135,6 +143,7 @@ class DemandDetail:
             "created_at": iso(created) if created else None,
             "started_at": iso(started),
             "runner_name": runner,
+            "labels": job_labels(job),
         }
         with self._lock:
             self._started.append(row)
@@ -149,7 +158,8 @@ class DemandDetail:
             row["count"] += 1
             listed = self._listed.setdefault(cls, [])
             listed.append({"run_id": run.get("id"), "job_id": job.get("id"),
-                           "created_at": iso(stamp) if stamp else None})
+                           "created_at": iso(stamp) if stamp else None,
+                           "labels": job_labels(job)})
             listed.sort(key=lambda r: (r["created_at"] is None, r["created_at"] or ""))
             del listed[MAX_LISTED_JOBS:]
             if stamp is not None:

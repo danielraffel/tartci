@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
-from slot_demand import DemandDetail, parse_short_jobs
+from slot_demand import DemandDetail, job_labels, parse_short_jobs
 import queue_head_inversion
 from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
@@ -833,8 +833,8 @@ class QueueScanner:
             return
         if not job.get("runner_name") or not job.get("started_at"):
             return
-        job_labels = {str(label).lower() for label in job.get("labels", []) if str(label)}
-        if self.args.match_labels and (not job_labels or not job_labels.issubset(self.labels)):
+        labels = set(job_labels(job))
+        if self.args.match_labels and (not labels or not labels.issubset(self.labels)):
             return
         detail.note_started(run, job)
 

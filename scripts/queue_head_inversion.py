@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -67,6 +68,11 @@ def detect(detail: Dict[str, Any], now: dt.datetime,
                     continue
                 if row.get("job_id") == job.get("job_id"):
                     continue
+                # The runner that took the newer job could have taken this one
+                # only if it carries every label this one needs. (Runner groups
+                # are not checked: a known false-positive source.)
+                if not set(job.get("labels") or []).issubset(set(row.get("labels") or [])):
+                    continue
                 if row_created > created and row_started > created:
                     took.append(row)
             if not took:
@@ -94,7 +100,8 @@ def counted_ids(detail: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     result: Dict[str, List[Dict[str, Any]]] = {}
     for cls, row in sorted((detail.get("classes") or {}).items()):
         result[cls] = [{"run_id": j.get("run_id"), "job_id": j.get("job_id"),
-                        "created_at": j.get("created_at")}
+                        "created_at": j.get("created_at"),
+                        "labels": j.get("labels") or []}
                        for j in (row or {}).get("oldest_jobs") or []]
     return result
 
@@ -135,18 +142,25 @@ def record_scan(detail: Dict[str, Any], *, event_log: str, state_file: str,
     it persists. Returns the event names written.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
+    if detail.get("witness_only"):
+        # A witness-only scan stops at the first job found, so its ids are
+        # whichever job won, not the demand; they would flap every scan.
+        return []
     written: List[str] = []
     lines: List[str] = []
     try:
         state = _load(state_file)
         ids = counted_ids(detail)
-        if state.get("ids") != ids:
+        all_ids = state.get("ids") if isinstance(state.get("ids"), dict) else {}
+        if all_ids.get(tier) != ids:
             lines.append(_event_line(IDS_EVENT, runner, "tier=%s" % tier,
                                      {"tier": tier, "counted": ids}, now))
             written.append(IDS_EVENT)
-            state["ids"] = ids
+            all_ids[tier] = ids
+        state["ids"] = all_ids
         if detect_inversion:
-            last = state.get("emitted") if isinstance(state.get("emitted"), dict) else {}
+            every = state.get("emitted") if isinstance(state.get("emitted"), dict) else {}
+            last = every.get(tier) if isinstance(every.get(tier), dict) else {}
             kept: Dict[str, float] = {}
             for inv in detect(detail, now, threshold_secs):
                 key = str(inv["job_id"])
@@ -162,7 +176,8 @@ def record_scan(detail: Dict[str, Any], *, event_log: str, state_file: str,
                         inv["run_id"], inv["job_id"], inv["age_seconds"] // 60,
                         inv["took_count"]), inv, now))
                 written.append(EVENT)
-            state["emitted"] = kept
+            every[tier] = kept
+            state["emitted"] = every
         if lines:
             with open(event_log, "a", encoding="utf-8") as handle:
                 handle.write("\n".join(lines) + "\n")
@@ -170,6 +185,24 @@ def record_scan(detail: Dict[str, Any], *, event_log: str, state_file: str,
     except OSError:
         pass
     return written
+
+
+def threshold_from_env() -> int:
+    """TARTCI_QUEUE_INVERSION_SECS, or the default when it is unset or not a
+    positive integer (logged to stderr). It must never raise: this runs while
+    the scanner builds its parser, and a crash there fails every claim."""
+    raw = os.environ.get("TARTCI_QUEUE_INVERSION_SECS")
+    if raw is None:
+        return DEFAULT_THRESHOLD_SECS
+    try:
+        value = int(raw.strip())
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    print("queue_head_inversion: ignoring TARTCI_QUEUE_INVERSION_SECS=%r, using %d"
+          % (raw, DEFAULT_THRESHOLD_SECS), file=sys.stderr)
+    return DEFAULT_THRESHOLD_SECS
 
 
 def add_cli_args(parser: Any) -> None:
@@ -189,7 +222,7 @@ def add_cli_args(parser: Any) -> None:
     parser.add_argument(
         "--inversion-threshold-secs",
         type=int,
-        default=int(os.environ.get("TARTCI_QUEUE_INVERSION_SECS", str(DEFAULT_THRESHOLD_SECS))),
+        default=threshold_from_env(),
     )
 
 
@@ -207,10 +240,16 @@ def record_from_args(detail: Dict[str, Any], args: Any) -> List[str]:
 def _record_from_args(detail: Dict[str, Any], args: Any, event_log: str) -> List[str]:
     lane = str(getattr(args, "lane_id", "") or "lane")
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in lane)
+    # assignment-v2 runs every tier under one lane id; the tier is its labels
+    # plus the class label it requires.
+    tier = str(getattr(args, "labels", "") or "")
+    required = getattr(args, "require_label", None)
+    if required:
+        tier = "%s|%s" % (tier, required)
     return record_scan(
         detail, event_log=event_log,
         state_file="%s.demand-diag.%s.json" % (event_log, safe),
-        runner=lane, tier=str(getattr(args, "labels", "") or ""),
+        runner=lane, tier=tier,
         detect_inversion=bool(getattr(args, "inversion_detect", False)),
         threshold_secs=max(1, int(getattr(args, "inversion_threshold_secs",
                                            DEFAULT_THRESHOLD_SECS))))

@@ -10,12 +10,17 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
+import assignment_scan
 import pool_usage
+import queue_scan
 import queue_head_inversion as qhi
 import slot_demand
 import test_paginated_queue_scan as helpers
@@ -42,13 +47,20 @@ def run(run_id: int, event: str = "merge_group") -> dict[str, Any]:
     return {"id": run_id, "event": event}
 
 
-def queued_job(job_id: int, minutes: float) -> dict[str, Any]:
-    return {"id": job_id, "created_at": ago(minutes), "status": "queued"}
+def queued_job(job_id: int, minutes: float, labels: Any = None) -> dict[str, Any]:
+    out = {"id": job_id, "created_at": ago(minutes), "status": "queued"}
+    if labels is not None:
+        out["labels"] = labels
+    return out
 
 
-def started_job(job_id: int, created: float, started: float, runner: str) -> dict[str, Any]:
-    return {"id": job_id, "created_at": ago(created), "started_at": ago(started),
-            "status": "in_progress", "runner_name": runner}
+def started_job(job_id: int, created: float, started: float, runner: str,
+                labels: Any = None) -> dict[str, Any]:
+    out = {"id": job_id, "created_at": ago(created), "started_at": ago(started),
+           "status": "in_progress", "runner_name": runner}
+    if labels is not None:
+        out["labels"] = labels
+    return out
 
 
 def detail(queued: list[tuple[int, dict]], started: list[tuple[int, dict]]) -> dict[str, Any]:
@@ -69,7 +81,8 @@ class DiagnosticsTests(unittest.TestCase):
         classes = d.as_dict()["classes"]
         listed = classes["merge_group"]["oldest_jobs"]
         self.assertEqual(len(listed), slot_demand.MAX_LISTED_JOBS)
-        self.assertEqual(listed[0], {"run_id": 1000, "job_id": 2000, "created_at": ago(100)})
+        self.assertEqual(listed[0], {"run_id": 1000, "job_id": 2000, "created_at": ago(100),
+                                     "labels": []})
         self.assertEqual(classes["merge_group"]["count"], 15)
         self.assertEqual(classes["pull_request"]["oldest_jobs"][0]["job_id"], 8)
 
@@ -92,7 +105,7 @@ class DiagnosticsTests(unittest.TestCase):
             self.assertEqual(qhi.record_scan(d2, **kw), ["scan_demand_ids"])
             lines = [json.loads(x) for x in Path(log).read_text().splitlines()]
         self.assertEqual(lines[0]["fields"]["counted"]["merge_group"],
-                         [{"run_id": 1, "job_id": 10, "created_at": ago(5)}])
+                         [{"run_id": 1, "job_id": 10, "created_at": ago(5), "labels": []}])
         self.assertEqual(lines[0]["fields"]["tier"], "t0")
 
 
@@ -152,6 +165,80 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(len(inv), 2)
         self.assertEqual(inv[0]["fields"]["job_id"], 10)
         self.assertNotIn("queue_head_inversion", [e["event"] for e in events[:1]])
+
+
+class RobustnessTests(unittest.TestCase):
+    def test_two_steady_tiers_sharing_a_lane_id_write_nothing_after_the_first(self) -> None:
+        a = detail([(1, queued_job(10, 5))], [])
+        b = detail([(2, queued_job(11, 4))], [])
+        with tempfile.TemporaryDirectory() as tmp:
+            kw = dict(event_log=str(Path(tmp) / "e.jsonl"), state_file=str(Path(tmp) / "s.json"),
+                      runner="lane", now=NOW, detect_inversion=True)
+            first = [qhi.record_scan(a, tier="t0", **kw), qhi.record_scan(b, tier="t1", **kw)]
+            self.assertEqual(first, [["scan_demand_ids"], ["scan_demand_ids"]])
+            for _ in range(5):
+                self.assertEqual(qhi.record_scan(a, tier="t0", **kw), [])
+                self.assertEqual(qhi.record_scan(b, tier="t1", **kw), [])
+            self.assertEqual(len(Path(kw["event_log"]).read_text().splitlines()), 2)
+
+    def test_a_witness_only_scan_writes_no_ids_and_detects_nothing(self) -> None:
+        d = detail([(1, queued_job(10, 69))],
+                   [(2, started_job(20, created=60, started=50, runner="r"))])
+        d["witness_only"] = True
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "e.jsonl"
+            got = qhi.record_scan(d, event_log=str(log), state_file=str(Path(tmp) / "s.json"),
+                                  runner="lane", tier="t", now=NOW, detect_inversion=True)
+            self.assertEqual(got, [])
+            self.assertFalse(log.exists())
+
+    def test_a_bad_threshold_env_falls_back_and_does_not_kill_either_parser(self) -> None:
+        qargv = ["x", "--repo", "o/r", "--workflow", "w", "--labels", "a",
+                 "--state-file", "s", "--provider", "p"]
+        aargv = ["x", "--repo", "o/r", "--workflow", "w", "--labels", "a",
+                 "--require-label", "b", "--class-labels", "b"]
+        for value in ("30m", "", "0", "-5"):
+            for module, argv in ((queue_scan, qargv), (assignment_scan, aargv)):
+                with mock.patch.dict(os.environ, {"TARTCI_QUEUE_INVERSION_SECS": value}), \
+                        mock.patch.object(sys, "argv", argv), \
+                        mock.patch("sys.stderr"):
+                    args = module.parse_args()
+                self.assertEqual(args.inversion_threshold_secs, 1800, (module.__name__, value))
+        with mock.patch.dict(os.environ, {"TARTCI_QUEUE_INVERSION_SECS": "600"}), \
+                mock.patch.object(sys, "argv", qargv):
+            self.assertEqual(queue_scan.parse_args().inversion_threshold_secs, 600)
+
+    def test_labels_null_on_a_job_does_not_break_the_scan_note(self) -> None:
+        scanner = object.__new__(queue_scan.QueueScanner)
+        scanner.args = type("A", (), {"match_labels": 1})()
+        scanner.labels = {"self-hosted"}
+        d = slot_demand.DemandDetail()
+        job = {"id": 1, "status": "in_progress", "runner_name": "r",
+               "started_at": ago(5), "labels": None}
+        scanner._note_started(d, run(1), job)
+        self.assertEqual(d.as_dict()["started"], [])
+        d.note_started(run(1), job)
+        self.assertEqual(d.as_dict()["started"][0]["labels"], [])
+
+
+class LabelTests(unittest.TestCase):
+    GPU = ["self-hosted", "macos", "gpu"]
+    PLAIN = ["self-hosted", "macos"]
+
+    def test_gpu_job_is_not_inverted_by_newer_plain_jobs(self) -> None:
+        d = detail([(1, queued_job(10, 90, self.GPU))],
+                   [(2, started_job(20, 60, 50, "r", self.PLAIN))])
+        self.assertEqual(qhi.detect(d, NOW), [])
+
+    def test_plain_job_is_inverted_by_a_newer_gpu_job(self) -> None:
+        d = detail([(1, queued_job(10, 90, self.PLAIN))],
+                   [(2, started_job(20, 60, 50, "r", self.GPU))])
+        self.assertEqual(len(qhi.detect(d, NOW)), 1)
+
+    def test_gpu_job_is_inverted_by_a_newer_gpu_job(self) -> None:
+        d = detail([(1, queued_job(10, 90, self.GPU))],
+                   [(2, started_job(20, 60, 50, "r", self.GPU))])
+        self.assertEqual(len(qhi.detect(d, NOW)), 1)
 
 
 class ScanIntegrationTests(unittest.TestCase):

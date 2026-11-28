@@ -1111,6 +1111,11 @@ off; `TARTCI_QUEUE_INVERSION_SECS`, default 1800) a queued `merge_group` job
 older than the threshold, while a newer job with the same labels started on a
 runner, also logs `queue_head_inversion` (run, job, age, the jobs that took
 runners, and a `next_action`). `tartci pool status` and `--usage` show it.
+Detection reads only `queue_scan.py` scans (the assignment-v2 scanner stops at
+its first witness and logs neither ids nor inversions in that mode). A queued
+job counts as starved only when its labels are a subset of the newer job's
+labels; runner groups are not checked and are a known false-positive source.
+A bad `TARTCI_QUEUE_INVERSION_SECS` falls back to 1800 with a stderr note.
 This is detection only: cancelling and re-running the run ejects the merge
 queue entry, which is an admission action owned by the steward.
 
