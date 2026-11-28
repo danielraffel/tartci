@@ -3973,28 +3973,28 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   300) in a row. Intents live in `slot-intents.json` beside `leases.json`
   (`scripts/slot_priority.py status`). Full rules and limits:
   `docs/assignment-v2-rollout.md`, "Slot priority".
-- **PR-class cap while the merge group is queued (per lane, opt-in)**:
-  `[[lane]] pr_class_cap_while_merge_group_queued = N` (1 or 2, env
-  `TARTCI_PR_CLASS_CAP_WHILE_MG`; unset leaves behavior unchanged) on a
-  `[[lane.tier]]` lane with one `*-merge-group` tier and at least one tier
-  after it. The tiers after the merge-group tier are the PR class. When that
-  merge-group tier's own scan (its slot-demand detail file) counted queued
-  `merge_group` jobs, a lane does not START a PR-class VM on a host that
-  already holds N or more live VM leases labelled with the lane's PR-class
-  tiers. Merge-group, other tiers and other repositories are never capped, a
-  running VM is never touched, and it makes no GitHub call. The cap yields
-  (claims first-come) when the detail file is missing, unreadable or older
-  than 300 s, when the lease store cannot be read, and when the oldest queued
-  merge-group job is older than `TARTCI_PR_CLASS_CAP_MAX_WAIT_SECS` (default
-  3600), so a run that can never run (`docs/stale-merge-group-demand.md`)
-  cannot cap forever. Each capped poll logs `pr_class_capped` (repo, host,
-  running, cap, `mg_queued`, `mg_oldest_queued_at`) and a `demand_waiting`
-  sample with `reason=pr_class_cap`. Set it on every lane of the repository
-  that should honor it: each lane gates its own claims. A host that runs one
-  supervisor for the repository never holds a PR-class VM at claim time, so
-  N=1 changes nothing there; it bites on hosts with two. Scope and limits:
-  `docs/assignment-v2-rollout.md`, "PR-class cap while the merge group is
-  queued".
+- **PR-class yield to a queued merge group (per lane, opt-in)**:
+  `[[lane]] pr_class_yield_to_merge_group = true`, optionally
+  `merge_group_grace_secs = N` (30 to 600, default 120), on a `[[lane.tier]]`
+  lane with one `*-merge-group` tier and at least one tier after it (the PR
+  class). Before the lane starts a PR-class VM into a free slot it makes one
+  fresh `gh api` read (`TARTCI_GH_CLI`, no cache) of the repository's queued
+  `merge_group` runs of the merge-group tier's workflows. If one is queued it
+  yields and holds the slot for the grace period with a placeholder reservation
+  (`resv.yield.<repo>` in the reservation directory) that every lane's slot
+  claim counts; the placeholder carries a backdated stamp, so it stops counting
+  at the end of the grace period on its own. The hold ends early when the run is
+  no longer queued (the next PR-class poll's read sees it claimed on any host)
+  or when the repository's merge-group tier is claimed on this host. A run id
+  holds at most once per host (`~/.tartci/state/pr-class-yield/<repo>.json`),
+  so a run that is never claimed cannot starve PR work. Any read error,
+  timeout or rate limit claims as before. Events: `pr_class_yield` (repo, host,
+  run_id, job_ids, grace), `pr_class_yield_served`, `pr_class_yield_expired`,
+  and `demand_waiting reason=pr_class_yield` per held poll. Cost: about one
+  call per PR-class claim attempt that finds a free slot, up to grace/poll more
+  while a hold is active, and one for job ids when a hold starts. Set it on
+  every lane of the repository that should honor it. Details:
+  `docs/assignment-v2-rollout.md`, "PR-class yield to a queued merge group".
 - **Short job first (per lane; needs slot priority)**: `[[lane]] short_jobs =
   [{ workflow = "...", job = "..." }]` names a lane's short jobs (today only
   Vellum's `sterile-consumer`, about 1.5 min); the lane's queue scan counts
