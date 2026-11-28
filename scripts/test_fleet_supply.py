@@ -115,11 +115,13 @@ class VerifySupplyTests(unittest.TestCase):
         self.assertEqual(result["state"], "match")
         self.assertEqual(result["host_id"], "studio")
         # One row per registration: pulp-gate's four classes (two gate, two
-        # release), the spectr and forge lanes, and vellum's three classes.
-        self.assertEqual(len(result["lanes"]), 9)
-        self.assertEqual(
-            sorted(row["class_label"] for row in result["lanes"] if row["lane"] == "vellum-gate"),
-            ["vellum-build-macos", "vellum-build-macos-merge-group", "vellum-sterile-consumer"])
+        # release), the spectr and forge lanes, and three classes on each of
+        # vellum's two lanes (merge-group first and PR first).
+        self.assertEqual(len(result["lanes"]), 12)
+        for vellum_lane in ("vellum-gate", "vellum-gate-pr"):
+            self.assertEqual(
+                sorted(row["class_label"] for row in result["lanes"] if row["lane"] == vellum_lane),
+                ["vellum-build-macos", "vellum-build-macos-merge-group", "vellum-sterile-consumer"])
         self.assertEqual(
             sorted(row["class_label"] for row in result["lanes"] if row["lane"] == "pulp-gate"),
             ["pulp-build-merge-group", "pulp-build-pr-head",

@@ -321,8 +321,10 @@ priority = "vm"
 vm_cores = 4
 # Two supervisors: the 12-core non-gate budget holds two 4-core Vellum guests
 # and a 4-core agent build; 6 merge-queue GPU proofs queued
-# 2-4h behind one slot on 2026-11-15. Rollback: set back to 1 and re-render.
-supervisors = 2
+# 2-4h behind one slot on 2026-11-15. One of the two slots now lives in
+# lane vellum-gate-pr below, which serves the PR class before merge groups.
+# Rollback: see lane vellum-gate-pr (a plain revert fails self-update).
+supervisors = 1
 min_queued_age_seconds = 0
 # Vellum's merge-group sterile job appears only when its GPU job ends, long
 # after the run was created, so the scan reads the newest 2 merge_group runs'
@@ -388,6 +390,56 @@ runner_group_id = 8
 
 [[lane.tier]]
 label = "vellum-build-macos"
+workflow = "Locked macOS GPU proof"
+runner_group_id = 8
+
+# Vellum's second slot, PR class first. vellum-gate serves merge groups before
+# PR heads on its one slot, and the queue rebuilds groups constantly, so with
+# both slots in that order PR-head proofs (the required gpu-macos-arm64 check)
+# queued 1-4 h with no runner on 2026-11-28. This lane is identical to
+# vellum-gate except its tier order: sterile-consumer first (short journeys,
+# unchanged), then PR, then merge group, so it still serves merge groups
+# whenever no PR proof waits.
+# It replaces vellum-gate's old slot-2 LaunchAgent, which this generation no
+# longer renders: self-update fails closed on a stopped label that pool on does
+# not enable unless the install receipt retires it.
+# Rollback: delete this lane, set vellum-gate's supervisors back to 2 AND add
+# replaces_launchd_labels = ["com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate-pr"]
+# on vellum-gate (a plain revert fails self-update the same way), or roll back
+# by hand with pool off, fleet-macos install, pool on.
+[[lane]]
+id = "vellum-gate-pr"
+repo = "Generous-Corp/vellum"
+runner_group_id = 8
+golden = "pulp-build-runner:latest"
+ccache_write_isolation = true
+priority = "vm"
+vm_cores = 4
+supervisors = 1
+min_queued_age_seconds = 0
+queue_merge_group_quota = 2
+refresh_after_every_serve = true
+forced_discoveries_per_hour = 8
+short_jobs = [{ workflow = "Locked macOS GPU proof", job = "sterile-consumer" }]
+labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
+assignment_fleet_claim_peers = true
+job_claim_labels = ["self-hosted", "macOS", "ARM64"]
+runner_idle_timeout_seconds = 60
+replaces_launchd_labels = ["com.danielraffel.tartci.tart-runner-macos-fleet.studio.vellum-gate.slot2"]
+guest_heartbeat_stale_seconds = 600
+
+[[lane.tier]]
+label = "vellum-sterile-consumer"
+workflow = "Locked macOS GPU proof"
+runner_group_id = 8
+
+[[lane.tier]]
+label = "vellum-build-macos"
+workflow = "Locked macOS GPU proof"
+runner_group_id = 8
+
+[[lane.tier]]
+label = "vellum-build-macos-merge-group"
 workflow = "Locked macOS GPU proof"
 runner_group_id = 8
 

@@ -3544,6 +3544,39 @@ class StallSafeUpdateTests(Base):
         run.receipt = su._recovery_receipt(self.cfg, self.sys)
         self.assertIsNone(run._demand_spawn(f"enabled {LANES[0]}\nstate: on"))
 
+    def test_m3_vellum_slot2_split_is_accepted_only_through_the_profiles_retirement(self):
+        # m3 moved vellum-gate's second supervisor into lane vellum-gate-pr: the
+        # update stops vellum-gate.slot2 and pool on never enables it again. The
+        # install receipt's retired_launchd_labels (from the checked-in profile's
+        # replaces_launchd_labels) is what lets the update through.
+        import macos_fleet_lanes
+        prefix = "com.danielraffel.tartci.tart-runner-macos-fleet.studio."
+        old = [prefix + "vellum-gate", prefix + "vellum-gate.slot2"]
+        new = [prefix + "vellum-gate", prefix + "vellum-gate-pr"]
+        for i, label in enumerate(new):
+            self.sys.lanes[label] = {"loaded": True, "running": True, "runs": 1, "pid": 900 + i}
+        run = su.Run.__new__(su.Run)
+        run.cfg, run.sys = self.cfg, self.sys
+        run.stopped_lanes = list(old)
+        run.guard_owner_before = None
+        run.spawn_failure = run.spawn_state = None
+        run.spawn_failures = []
+        run.terminating = False
+        self.sys.kick_command_fails = set()
+        on_out = "\n".join(f"enabled {label}" for label in new) + "\nstate: on"
+        # Control: without the retirement the update fails closed.
+        su._write_json(self.cfg.install_receipt, {"retired_launchd_labels": []})
+        run.receipt = su._recovery_receipt(self.cfg, self.sys)
+        result = run._demand_spawn(on_out)
+        self.assertEqual(su.LANES_DOWN, result[1])
+        self.assertIn(old[1], result[0])
+        profile = macos_fleet_lanes.load(Path(__file__).resolve().parent.parent
+                                         / "profiles" / "m3-macos-fleet.toml")
+        su._write_json(self.cfg.install_receipt,
+                       {"retired_launchd_labels": macos_fleet_lanes.replacements(profile)})
+        run.receipt = su._recovery_receipt(self.cfg, self.sys)
+        self.assertIsNone(run._demand_spawn(on_out))
+
     def test_a_host_left_off_during_a_stall_says_nothing_retries(self):
         self.guard()
         self.sys.install_rcs = [1]
