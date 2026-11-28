@@ -62,6 +62,7 @@ import denial_reclaim  # noqa: E402
 import gate_ccache_trim  # noqa: E402
 import scratch_dirs  # noqa: E402
 import tmp_checkouts  # noqa: E402
+import worktree_outputs  # noqa: E402
 
 try:
     import tomllib
@@ -92,7 +93,9 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            "boot_usage_growth_gb_per_day",
                            # read by disk_reclaim.py (checkout_outputs.py)
                            "checkout_build_outputs",
-                           "checkout_build_output_idle_hours"})
+                           "checkout_build_output_idle_hours",
+                           # read by worktree_outputs.py
+                           *worktree_outputs.SETTINGS_KEYS})
 # How long a merged worktree's build tree must sit unwritten before the worktree
 # reaper may take it (its own PULP_WORKTREE_BUILD_IDLE_HOURS gate). The ceiling
 # is a disk-arithmetic fact, not a preference. Measured on m3, 2026-09-27: one
@@ -219,6 +222,7 @@ def validate_table(table: Any) -> list[str]:
     problems.extend(boot_usage.validate(table))
     problems.extend(denial_reclaim.validate(table))
     problems.extend(checkout_outputs.validate(table))
+    problems.extend(worktree_outputs.validate(table))
     return problems
 
 

@@ -340,6 +340,9 @@ ALLOWED = {
     ("test_scratch_dirs.py",
      "Settings.test_pressure_selects_the_shorter_gate"):
         reads_profile("scratch_dirs.run()"),
+    ("test_worktree_outputs.py",
+     "Bounds.test_profile_with_roots_enables_it"):
+        reads_profile("worktree_outputs.run()"),
     ("test_state_age.py",
      "SurfaceTests.test_host_vitals_the_sensor_stopped_refreshing_reads_stale"):
         LANES,

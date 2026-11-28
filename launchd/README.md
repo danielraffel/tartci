@@ -997,6 +997,19 @@ in it changed for `scratch_idle_hours` (12; 4 while the boot volume is below its
 floor). Directories a test left read-only are made writable first, which is
 what every earlier cleanup lacked.
 
+It also reaps regenerable build output that agent lane worktrees leave behind
+(`scripts/worktree_outputs.py`, opt-in with `[reclaim] worktree_roots = [...]`,
+default empty). Under each root, to depth 4, a `target`, `build`, `.build` or
+`node_modules` directory whose parent holds a `.git` goes when nothing in it
+changed for `worktree_output_idle_days` (3; 7 under `w-*` lanes and
+`.fleet-pass-*` dirs) and no live pid or lock file or running command names it.
+Nothing is removed while the volume is at or under
+`worktree_output_target_used_pct` (85); above it the oldest go until it is back
+under; at or above `worktree_output_pressure_used_pct` (92) every eligible one
+goes. Each pass is niced and capped (`worktree_output_max_dirs` 25,
+`worktree_output_max_gib` 150, `worktree_output_budget_seconds` 900). The
+`reclaim_pass` event's `worktree_outputs` field lists what was removed and kept.
+
 This agent prevents a slow fill; it does not rescue a host that filled today.
 The age gates are the binding constraint, by design: measured against m5's real
 tree on 2026-09-10, right after the outage was cleared by hand, a 30-day pass
