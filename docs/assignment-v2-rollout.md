@@ -793,12 +793,18 @@ active):
 Fail open on every error. The hold reserves the slot against every lane on the
 host, not only the repository's: that is the point, and it is bounded by the
 grace period and the owner process's life. Releasing the placeholder just before
-the merge-group tier claims leaves a window of a few milliseconds in which
-another lane can take the slot.
+the merge-group tier claims leaves a window of about 0.1 to 0.3 s (a Python
+start and an event write) in which another lane can take the slot. Any tier
+ranked above PR-class releases a hold, not only the merge-group tier. A claim of
+the held run on ANOTHER host rarely releases a hold within 120 s: a run leaves
+`queued` when its job starts on a runner, 2.5 to 2.8 min after the claim, so
+each other enabled host that yields idles one slot for the full grace.
 
-Cost: about one read per PR-class claim attempt that finds a free slot (190 PR
--class lease starts in the 2-day window), plus up to grace/poll reads while a
-hold is active. Measure with `pr_class_yield*` counts per host and merge-group
+Cost: about one read per PR-class claim attempt that finds a free slot (190
+PR-class lease starts in the 2-day window, plus polls that find a free slot and do
+not serve: worst case 180 an hour per supervisor), plus up to grace/poll reads
+while a hold is active; one hold covers every run queued when it starts, and a
+yield forces one uncached scan of the held run. Measure with `pr_class_yield*` counts per host and merge-group
 queue wait p50/p90 before and after. Rollback: delete the keys, re-render,
 restart the lanes at an idle boundary.
 

@@ -3992,8 +3992,20 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   run_id, job_ids, grace), `pr_class_yield_served`, `pr_class_yield_expired`,
   and `demand_waiting reason=pr_class_yield` per held poll. Cost: about one
   call per PR-class claim attempt that finds a free slot, up to grace/poll more
-  while a hold is active, and one for job ids when a hold starts. Set it on
-  every lane of the repository that should honor it. Details:
+  while a hold is active, and one for job ids when a hold starts. The count
+  includes polls that find a free slot and do not serve (admission deferred,
+  job claim contended): worst case one uncached read per poll, 180 an hour per
+  supervisor, on the shared ghapp App budget; disable if `pr_class_yield`
+  reads exceed about 300 an hour fleet-wide. One hold covers every run queued
+  when it starts. A yield also asks the lane's next selection to scan uncached
+  and read the held run first (the `refresh_after_serve` path), so the lane
+  needs `forced_discoveries_per_hour` (validator-enforced) and
+  `min_queued_age_seconds = 0` (m1's Vellum lane has 600 and is refused). The
+  placeholder's lifetime encodes the writer's `TARTCI_MACOS_RESV_TTL`: a lane
+  with a larger value counts it for the difference, a smaller one never counts
+  it, so leave the TTL at its 7200 default. Failed reads log a throttled
+  `pr_class_yield_read_error`. Set it on every lane of the repository that
+  should honor it. Details:
   `docs/assignment-v2-rollout.md`, "PR-class yield to a queued merge group".
 - **Short job first (per lane; needs slot priority)**: `[[lane]] short_jobs =
   [{ workflow = "...", job = "..." }]` names a lane's short jobs (today only

@@ -79,8 +79,40 @@ _tartci_pr_class_yield_events(){
   case "$line" in
     yield\ *)
       event pr_class_yield "PR-class claim yielded to queued merge-group work: ${line#* }" \
-        ${fields[@]+"${fields[@]}"} ;;
+        ${fields[@]+"${fields[@]}"}
+      # Make the hold active: the next selection is uncached and reads the held
+      # run's jobs first (the refresh_after_serve path), so the lane's own
+      # merge-group scan sees the job inside the grace period. Set here, in the
+      # supervisor's own shell (the gate is never run in $(...)).
+      # shellcheck disable=SC2034 # read by the supervisor loop in runner.sh
+      SCAN_REFRESH_NEXT=1
+      # shellcheck disable=SC2034
+      SCAN_REFRESH_RUN="$(tartci_slot_priority_token run_id "$line")"
+      # shellcheck disable=SC2034
+      SCAN_REFRESH_CLASS=pr_class_yield
+      ;;
+    claim\ *)
+      case "$line" in
+        *" reason=read_error"*|*" reason=state_error"*|*" reason=helper_failed"*)
+          _tartci_pr_class_yield_read_error "${line#* }" ;;
+      esac ;;
   esac
+}
+
+# A feature that always fails to read must not stay inert and invisible: one
+# pr_class_yield_read_error event per TARTCI_PR_CLASS_YIELD_ERROR_LOG_SECS
+# (default 300) per lane.
+_tartci_pr_class_yield_read_error(){
+  local detail="$1" stamp now last=0
+  stamp="${STATE_DIR:-${TMPDIR:-/tmp}}/pr-class-yield-read-error.stamp"
+  now="$(date +%s)"
+  [ -r "$stamp" ] && read -r last < "$stamp" 2>/dev/null || last=0
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ $((now - last)) -ge "${TARTCI_PR_CLASS_YIELD_ERROR_LOG_SECS:-300}" ] || return 0
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  event pr_class_yield_read_error "PR-class yield could not read merge-group demand (claiming as before): $detail" \
+    repo="$REPO" host="$(hostname -s 2>/dev/null || echo unknown)" \
+    reason="$(tartci_slot_priority_token reason "claim $detail")"
 }
 
 # tartci_pr_class_yield_gate <selected_labels> <selected_tier> <cap> <running>
@@ -93,16 +125,20 @@ tartci_pr_class_yield_gate(){
   mg_label="$(tartci_pr_class_yield_mg_label)" || return 0
   tier_label="$(tartci_claim_delay_class "$tier" 2>/dev/null)" || return 0
   holder="$(_tartci_pr_class_yield_holder)"
-  if [ "$tier_label" = "$mg_label" ]; then
-    # The merge-group tier is about to claim: give the held slot back first.
+  pr_labels="$(tartci_pr_class_yield_pr_labels)"
+  case ",$pr_labels," in
+    *",$tier_label,"*) ;;
+    *)
+    # Any tier that is not PR-class (the merge-group tier, or a higher one such
+    # as a future sterile-consumer label) is about to claim: give the held slot
+    # back first.
     [ -e "$holder" ] || return 0
     line="$(python3 "$TARTCI_ROOT/scripts/pr_class_yield.py" release --repo "$REPO" \
       --resv-dir "$(dirname "$holder")" --host "$(hostname -s 2>/dev/null || echo unknown)" </dev/null 2>/dev/null)" || line=""
     _tartci_pr_class_yield_events "${line:-claim}"
     return 0
-  fi
-  pr_labels="$(tartci_pr_class_yield_pr_labels)"
-  case ",$pr_labels," in *",$tier_label,"*) ;; *) return 0 ;; esac
+    ;;
+  esac
   if [ ! -e "$holder" ]; then
     # Only a claim that would find a free slot is worth a GitHub read.
     case "$cap" in ''|*[!0-9]*) return 0 ;; esac
@@ -121,7 +157,7 @@ tartci_pr_class_yield_gate(){
     --resv-dir "$(dirname "$holder")" --resv-ttl "${TARTCI_MACOS_RESV_TTL:-7200}" --host "$(hostname -s 2>/dev/null || echo unknown)" \
     --grace-secs "$TARTCI_PR_CLASS_YIELD_GRACE_SECS" --owner-pid "$$" \
     ${args[@]+"${args[@]}"} </dev/null 2>/dev/null)" || line=""
-  [ -n "$line" ] || return 0
+  [ -n "$line" ] || line="claim reason=helper_failed:no_output"
   _tartci_pr_class_yield_events "$line"
   case "$line" in yield\ *|hold\ *) return 75 ;; esac
   return 0

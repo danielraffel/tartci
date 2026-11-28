@@ -474,6 +474,10 @@ def validate_pr_class_yield(lane_id: str, lane: dict) -> None:
     if lane.get("assignment_mode") == "event-class-v2":
         fail(f"lane {lane_id}: pr_class_yield_to_merge_group needs a tier lane, "
              "not event-class-v2")
+    if lane.get("min_queued_age_seconds", 0):
+        # A just-queued merge-group job cannot count under a minimum age, so a
+        # hold would idle the whole grace period.
+        fail(f"lane {lane_id}: pr_class_yield_to_merge_group needs min_queued_age_seconds = 0")
     labels = [str(tier.get("label", "")) for tier in (lane.get("tier") or [])
               if isinstance(tier, dict)]
     mg = [index for index, label in enumerate(labels) if label.endswith("-merge-group")]
@@ -965,12 +969,16 @@ def load(path: Path) -> dict:
             fail(f"lane {lane_id}: refresh_after_every_serve must be a boolean on a "
                  "[[lane.tier]] lane that is not event-class-v2")
         forced = lane.get("forced_discoveries_per_hour")
-        if bool(refresh) != (forced is not None) or (
+        # A yield hold forces one uncached scan of the held run, so it states a
+        # budget share exactly as a refresh lane does.
+        uses_forced = bool(refresh) or lane.get("pr_class_yield_to_merge_group") is True
+        if uses_forced != (forced is not None) or (
                 forced is not None and (type(forced) is not int or forced < 0)):
             # Each refresh lane states its own budget share; queue_scan.py adds
             # it to the fleet API budget check.
             fail(f"lane {lane_id}: forced_discoveries_per_hour is a nonnegative integer, "
-                 "required with refresh_after_every_serve and only with it")
+                 "required with refresh_after_every_serve or pr_class_yield_to_merge_group, "
+                 "and only with them")
         if refresh and lane.get("min_queued_age_seconds", 0):
             # A just-queued job cannot count under a minimum age: pure cost.
             fail(f"lane {lane_id}: refresh_after_every_serve needs min_queued_age_seconds = 0")

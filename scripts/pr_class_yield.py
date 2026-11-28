@@ -160,10 +160,19 @@ def queued_merge_group_runs(args: argparse.Namespace) -> List[Dict[str, Any]]:
     return out
 
 
+JOB_IDS_TIMEOUT_SECS = 5
+
+
 def queued_job_ids(args: argparse.Namespace, run_id: int) -> str:
-    """The run's queued job ids (one more call, only when a hold starts), or `unknown`."""
+    """The run's queued job ids (one more call, only when a hold starts), or `unknown`.
+
+    Read after the lock is released and with a short timeout: the ids only label
+    an event, so a slow API must never stall a hold or the sibling supervisor.
+    """
     try:
-        payload = gh_json(args, f"repos/{args.repo}/actions/runs/{run_id}/jobs"
+        short = argparse.Namespace(**{**vars(args), "gh_timeout": min(
+            int(args.gh_timeout), JOB_IDS_TIMEOUT_SECS)})
+        payload = gh_json(short, f"repos/{args.repo}/actions/runs/{run_id}/jobs"
                                 "?filter=latest&per_page=100")
         ids = [str(job["id"]) for job in payload.get("jobs", [])
                if isinstance(job, dict) and job.get("status") == "queued"
@@ -213,8 +222,7 @@ def check(args: argparse.Namespace) -> str:
                     out.update(run_id=run_id, hold_left_secs=int(float(active["until"]) - now))
                     return render("hold", out)
                 served = run_id not in ids
-                out.update(ended="served" if served else "expired", ended_run_id=run_id,
-                           ended_job_ids=active.get("job_ids"))
+                out.update(ended="served" if served else "expired", ended_run_id=run_id)
                 state["active"] = None
                 remove_placeholder(holder)
             fresh = [row for row in queued if str(row["id"]) not in state["held"]]
@@ -223,21 +231,25 @@ def check(args: argparse.Namespace) -> str:
                 out["reason"] = "no_unheld_merge_group_queued"
                 return render("claim", out)
             target = fresh[0]
-            job_ids = queued_job_ids(args, target["id"])
             until = now + grace
-            state["held"][str(target["id"])] = now
-            state["active"] = {"run_id": target["id"], "job_ids": job_ids, "since": now,
-                               "until": until}
+            # One hold covers every run queued right now: a burst of regrouped
+            # runs must not chain into one hold each.
+            for row in fresh:
+                state["held"][str(row["id"])] = now
+            state["active"] = {"run_id": target["id"], "since": now, "until": until}
             write_placeholder(holder, int(args.owner_pid), until,
                               int(args.resv_ttl))
             save_state(state_file, state, now)
-            out.update(run_id=target["id"], job_ids=job_ids, grace=grace,
-                       oldest_queued_at=target["created_at"])
-            return render("yield", out)
+            out.update(run_id=target["id"], grace=grace,
+                       oldest_queued_at=target["created_at"],
+                       covered_runs=",".join(str(row["id"]) for row in fresh))
+            started = (target["id"], out)
     except Exception as exc:  # noqa: BLE001
         with contextlib.suppress(Exception):
             remove_placeholder(holder)
         return render("claim", {**base, "reason": f"state_error:{type(exc).__name__}"})
+    out["job_ids"] = queued_job_ids(args, started[0])
+    return render("yield", out)
 
 
 def release(args: argparse.Namespace) -> str:
@@ -258,7 +270,6 @@ def release(args: argparse.Namespace) -> str:
             save_state(state_file, state, now)
             return render("claim", {**base, "ended": "served",
                                     "ended_run_id": active.get("run_id"),
-                                    "ended_job_ids": active.get("job_ids"),
                                     "via": "merge_group_claim"})
     except Exception as exc:  # noqa: BLE001
         with contextlib.suppress(Exception):

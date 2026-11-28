@@ -66,7 +66,7 @@ class Base(unittest.TestCase):
             f'[ -f "{self.stub}/sleep" ] && sleep "$(cat "{self.stub}/sleep")"\n'
             f'[ -f "{self.stub}/fail" ] && {{ echo "rate limited" >&2; exit 1; }}\n'
             'case "$2" in\n'
-            f'  *"/jobs"*) cat "{self.stub}/jobs.json" ;;\n'
+            f'  *"/jobs"*) [ -f "{self.stub}/jobs_sleep" ] && sleep "$(cat "{self.stub}/jobs_sleep")"; cat "{self.stub}/jobs.json" ;;\n'
             f'  *) cat "{self.stub}/runs.json" ;;\n'
             "esac\n")
         gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
@@ -222,6 +222,46 @@ class YieldTests(Base):
         self.queue(run_row(101))
         self.assertIn("grace=30", self.run_cli(grace_secs=5))
 
+    def test_one_hold_covers_every_run_queued_at_that_moment(self) -> None:
+        self.queue(run_row(101), run_row(102, created="2026-11-28T03:50:00Z"),
+                   run_row(103, created="2026-11-28T03:55:00Z"))
+        line = self.run_cli(grace_secs=120)
+        self.assertTrue(line.startswith("yield "), line)
+        self.assertIn("covered_runs=101,102,103", line)
+        # The hold runs out, and the other two queued runs do not start another.
+        self.assertIn("ended=expired", self.run_cli(now=T0 + 121))
+        for later in (T0 + 125, T0 + 250, T0 + 400):
+            line = self.run_cli(now=later)
+            self.assertTrue(line.startswith("claim "), line)
+            self.assertFalse(self.holder().exists())
+        # A run created after the hold started is new and holds once.
+        self.queue(run_row(101), run_row(104, created="2026-11-28T04:30:00Z"))
+        self.assertIn("run_id=104", self.run_cli(now=T0 + 500))
+
+    def test_the_job_id_read_is_short_and_never_blocks_the_hold(self) -> None:
+        import time
+        self.queue(run_row(101))
+        (self.stub / "jobs_sleep").write_text("30")
+        started = time.monotonic()
+        out = subprocess.run([sys.executable, str(YIELD), *self.argv(gh_timeout=25)],
+                             capture_output=True, text=True, timeout=40)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertTrue(out.stdout.startswith("yield "), out.stdout)
+        self.assertIn("job_ids=unknown", out.stdout)
+        self.assertTrue(self.holder().exists())
+
+    def test_a_dead_owner_frees_the_slot_at_once(self) -> None:
+        proc = subprocess.Popen(["sleep", "30"])
+        pid = proc.pid
+        try:
+            real_now = int(__import__("time").time())
+            pr_class_yield.write_placeholder(self.holder(), pid, real_now + 600, 7200)
+            self.assertEqual(self.reservations(real_now), 1)
+        finally:
+            proc.kill()
+            proc.wait()
+        self.assertEqual(self.reservations(int(__import__("time").time())), 0)
+
     def test_a_broken_helper_claims(self) -> None:
         out = subprocess.run([sys.executable, str(YIELD), "check"], capture_output=True, text=True)
         self.assertEqual(out.returncode, 0)
@@ -234,7 +274,7 @@ class GlueTests(Base):
     TIERS = f"vellum-sterile-consumer\nvellum-build-macos-merge-group\nvellum-build-macos"
 
     def gate(self, tier: int, *, enabled: str = "1", running: int = 1, cap: int = 2,
-             tiers: str | None = None, reserved: int = 0, now: float | None = None) -> tuple:
+             tiers: str | None = None, reserved: int = 0, root: str | None = None) -> tuple:
         log = self.root / "events.log"
         script = f"""set -euo pipefail
 TARTCI_ROOT={ROOT}
@@ -261,16 +301,22 @@ tartci_slot_priority_token(){{
   done
   printf 'unknown\\n'
 }}
+STATE_DIR={self.root}
+SCAN_REFRESH_NEXT=0; SCAN_REFRESH_RUN=""; SCAN_REFRESH_CLASS=""
 source {LIB}
 rc=0
 tartci_pr_class_yield_gate "self-hosted,x" {tier} {cap} {running} || rc=$?
 echo "rc=$rc"
+echo "refresh=$SCAN_REFRESH_NEXT run=$SCAN_REFRESH_RUN class=$SCAN_REFRESH_CLASS"
 """
         env = {**os.environ, "TARTCI_GH_CLI": str(self.gh), "TARTCI_PR_CLASS_YIELD_DIR": str(self.state),
                "TARTCI_PR_CLASS_YIELD_GRACE_SECS": "90"}
+        if root is not None:
+            script = script.replace(f"TARTCI_ROOT={ROOT}", f"TARTCI_ROOT={root}")
         out = subprocess.run([BASH32, "-c", script], capture_output=True, text=True, env=env)
         events = log.read_text() if log.exists() else ""
-        return out.stdout.strip(), out.stderr, events
+        self.refresh = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+        return out.stdout.strip().splitlines()[0] if out.stdout.strip() else "", out.stderr, events
 
     def test_a_pr_class_claim_yields_and_logs(self) -> None:
         self.queue(run_row(101))
@@ -283,6 +329,41 @@ echo "rc=$rc"
         # While held, the next PR-class poll yields without needing a free slot.
         out, _, _ = self.gate(2, running=2, reserved=2)
         self.assertEqual(out, "rc=75")
+
+    def test_a_yield_asks_for_an_uncached_scan_of_the_held_run(self) -> None:
+        self.queue(run_row(101))
+        self.assertEqual(self.gate(2)[0], "rc=75")
+        self.assertEqual(self.refresh, "refresh=1 run=101 class=pr_class_yield")
+        # A continuing hold, and a claim, leave the lane's refresh flag alone.
+        self.assertEqual(self.gate(2)[0], "rc=75")
+        self.assertEqual(self.refresh, "refresh=0 run= class=")
+        self.queue()
+        self.assertEqual(self.gate(2)[0], "rc=0")
+        self.assertEqual(self.refresh, "refresh=0 run= class=")
+
+    def test_a_failed_read_is_logged_once_per_throttle_window(self) -> None:
+        self.queue(run_row(101))
+        (self.stub / "fail").write_text("1")
+        out, _, events = self.gate(2)
+        self.assertEqual(out, "rc=0")
+        self.assertIn("pr_class_yield_read_error", events)
+        self.assertIn("reason=read_error", events)
+        before = events.count("pr_class_yield_read_error")
+        self.assertEqual(self.gate(2)[2].count("pr_class_yield_read_error"), before)
+        # A helper that dies without output is a logged failure too.
+        (self.root / "pr-class-yield-read-error.stamp").unlink()
+        events = self.gate(2, root="/nonexistent-root")[2]
+        self.assertIn("helper_failed", events)
+
+    def test_any_tier_above_pr_class_releases_a_hold(self) -> None:
+        self.queue(run_row(101))
+        self.gate(2)
+        self.assertTrue(self.holder().exists())
+        # A tier ranked ABOVE merge-group (a future sterile-consumer label).
+        out, _, events = self.gate(0)
+        self.assertEqual(out, "rc=0")
+        self.assertIn("pr_class_yield_served", events)
+        self.assertFalse(self.holder().exists())
 
     def test_off_by_default_makes_no_github_call(self) -> None:
         self.queue(run_row(101))
@@ -328,7 +409,9 @@ echo "rc=$rc"
         self.queue(run_row(101))
         (self.stub / "fail").write_text("1")
         out, _, events = self.gate(2)
-        self.assertEqual((out, events), ("rc=0", ""))
+        self.assertEqual(out, "rc=0")
+        self.assertIn("pr_class_yield_read_error", events)
+        self.assertNotIn("pr_class_yield ", events)
 
 
 class RunnerWiringTests(unittest.TestCase):
@@ -383,6 +466,22 @@ class ProfileTests(unittest.TestCase):
             env = plistlib.loads(body)["EnvironmentVariables"]
             if env.get("TARTCI_RUNNER_REPO") == VELLUM:
                 self.assertEqual(env["TARTCI_PR_CLASS_YIELD_GRACE_SECS"], "120")
+
+    def test_a_minimum_queue_age_or_a_missing_budget_share_is_refused(self) -> None:
+        m1 = (ROOT / "profiles" / "m1-macos-fleet.toml").read_text()
+        anchor = 'repo = "Generous-Corp/vellum"\n'
+        self.assertEqual(m1.count(anchor), 1)
+        aged = m1.replace(anchor, anchor + f"{self.KEY} = true\nforced_discoveries_per_hour = 8\n", 1)
+        self.assertIn("min_queued_age_seconds = 600", aged)
+        with self.assertRaisesRegex(ValueError, "needs min_queued_age_seconds = 0"):
+            self.load(aged)
+        # The budget share is required with the key (the held run is scanned uncached).
+        no_share = self.with_keys(f"{self.KEY} = true\n").replace(
+            "forced_discoveries_per_hour = 8\n", "")
+        self.assertNotEqual(no_share, self.with_keys(f"{self.KEY} = true\n"))
+        with self.assertRaisesRegex(ValueError, "forced_discoveries_per_hour"):
+            self.load(no_share)
+        self.load(self.with_keys(f"{self.KEY} = true\nmerge_group_grace_secs = 120\n"))
 
     def test_the_validator_rejects_bad_config(self) -> None:
         body = self.PATH.read_text()
