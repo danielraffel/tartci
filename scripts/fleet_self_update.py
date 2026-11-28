@@ -178,6 +178,15 @@ PEER_UNREACHABLE_MIN_READS = 4
 # measured on its own clock.
 PEER_UNREACHABLE_FRESH_SECONDS = 3600
 PEER_UNREADABLE_NAME = "peer-unreadable.json"
+# Peers an operator declared out of the fleet (a laptop that is travelling),
+# kept on each host that surveys them: {"<host_id>": {"reason": "...",
+# "since": "<ISO>"}}. A declared peer that cannot be read is left to the
+# capacity floor like an off peer, instead of blocking every other host's
+# turn: m5 travelling on 2026-11-28 held m3 and m5studio for hours, because
+# the dark-peer exclusion needs every readable peer's fresh read of it and m1,
+# already current, had stopped surveying. A declared peer that CAN be read is
+# read normally, so a stale declaration never hides a peer that is back.
+PEER_AWAY_NAME = "peers-away.json"
 # With gate demand queued, starvation is one hour past the point a dark peer
 # stops holding the turn: a single dark host must not make every other host
 # raise an issue two hours before the queue heals itself.
@@ -1626,6 +1635,31 @@ class Survey:
     excluded: list[str]             # unreachable long enough to stop holding the turn
     notes: list[str]                # why each excluded peer is excluded
     unread: list[str] = dataclasses.field(default_factory=list)  # blocking peers this host cannot read
+    away: list[str] = dataclasses.field(default_factory=list)    # declared away and unreadable
+    away_notes: list[str] = dataclasses.field(default_factory=list)
+    stale_away: list[str] = dataclasses.field(default_factory=list)  # declared away, readable
+
+
+def peers_away(cfg: Config) -> dict[str, dict]:
+    """Peers declared out of the fleet on this host. A missing or malformed
+    file declares nothing, so every peer is held to the normal reads."""
+    value = _read_json(cfg.state_dir / PEER_AWAY_NAME) or {}
+    return {peer: row for peer, row in value.items()
+            if isinstance(peer, str) and isinstance(row, dict)
+            and isinstance(row.get("reason"), str) and row["reason"].strip()}
+
+
+def declare_away(cfg: Config, host: str, reason: str | None, now: float) -> None:
+    """Record (reason) or clear (None) one peer's away declaration."""
+    current = _read_json(cfg.state_dir / PEER_AWAY_NAME) or {}
+    if reason is None:
+        current.pop(host, None)
+    else:
+        current[host] = {"reason": reason, "since": _iso(now)}
+    if current:
+        _write_json(cfg.state_dir / PEER_AWAY_NAME, current)
+    else:
+        (cfg.state_dir / PEER_AWAY_NAME).unlink(missing_ok=True)
 
 
 def peer_streaks(cfg: Config) -> dict[str, dict]:
@@ -1659,6 +1693,12 @@ def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) ->
     (`unread`) keeps its place privately, and the same bound runs on it.
     `record` persists the streaks and emits the transition events; a plan
     reads them without writing.
+
+    A peer declared away on this host (PEER_AWAY_NAME) that cannot be read is
+    `away`: it neither blocks nor holds a place, and the capacity floor counts
+    it as serving nothing. Its streak is still recorded, since other hosts
+    corroborate from it. A declared peer that can be read is surveyed as
+    usual and named in `stale_away`.
     """
     import host_off  # noqa: PLC0415 - sibling module; owns the event log format
     now = sys_.now()
@@ -1715,9 +1755,21 @@ def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) ->
     waiting: dict[str, float] = {}
     off: list[str] = []
     unread: list[str] = []
+    declared = peers_away(cfg)
+    away: list[str] = []
+    away_notes: list[str] = []
+    stale_away: list[str] = []
     for peer, info in infos.items():
         if peer in excluded:
             continue
+        if peer in declared:
+            if not info["readable"]:
+                away.append(peer)
+                row = declared[peer]
+                away_notes.append(f"{peer} declared away since {row.get('since', '?')}: "
+                                  f"{str(row['reason'])[:120]}")
+                continue
+            stale_away.append(peer)
         if info["busy"]:
             busy.append(info["evidence"])
             # Either SSH read failed on this host's route: pool status, or the
@@ -1730,7 +1782,8 @@ def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) ->
             continue
         if info["since"] is not None:
             waiting[peer] = info["since"]
-    return Survey(busy, waiting, off, excluded, notes, sorted(unread))
+    return Survey(busy, waiting, off, excluded, notes, sorted(unread),
+                  sorted(away), away_notes, sorted(stale_away))
 
 
 def queue_ahead(me: str, my_since: float, waiting: dict[str, float]) -> list[str]:
@@ -4313,7 +4366,13 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                             f"capacity floor: {', '.join(off)}" if off else "")
                          + (f"; unreachable, so no longer holding the turn and counted as "
                             f"serving nothing by the capacity floor: {'; '.join(survey.notes)}"
-                            if survey.excluded else ""))
+                            if survey.excluded else "")
+                         + (f"; declared away and unreachable, so counted as serving nothing "
+                            f"by the capacity floor: {'; '.join(survey.away_notes)}"
+                            if survey.away else ""))
+        if survey.stale_away:
+            print(f"self-update: WARNING {', '.join(survey.stale_away)} declared away but readable, "
+                  "so surveyed normally; clear it with --peer-back <host>", file=sys.stderr)
         if floor_refusal is None:
             receipt.step("capacity-floor", rule)
         elif apply:
@@ -4429,7 +4488,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
-                  helper=helper, approval=approval, excluded=survey.excluded,
+                  helper=helper, approval=approval, excluded=survey.excluded + survey.away,
                   previous_fleet_source=previous_fleet_source, auto_ack=auto_ack,
                   scheduled=scheduled)
         rc = run.execute()
@@ -6262,6 +6321,11 @@ def main(argv: list[str] | None = None) -> int:
                       help="resume scheduled self-updates")
     mode.add_argument("--peers", action="store_true",
                       help="print each published peer and the SSH target it resolves to")
+    mode.add_argument("--peer-away", metavar="HOST",
+                      help="declare a peer out of the fleet on this host (with --reason): while "
+                      "it is unreachable it no longer blocks this host's update turn")
+    mode.add_argument("--peer-back", metavar="HOST",
+                      help="clear a peer's away declaration on this host")
     mode.add_argument("--refresh-skew", action="store_true",
                       help="fetch main and record skew only (no other checks)")
     parser.add_argument("--reinstall-current", action="store_true",
@@ -6272,16 +6336,26 @@ def main(argv: list[str] | None = None) -> int:
                         help="apply after this host's stagger offset (the periodic agent)")
     parser.add_argument("--if-older", type=int, default=0,
                         help="with --refresh-skew: skip unless the cache is older (seconds)")
+    parser.add_argument("--reason", default=None, help="with --peer-away: why it is away")
     parser.add_argument("--home", default=str(Path.home()))
     parser.add_argument("--settings", type=Path, default=None,
                         help="settings TOML (default ~/.config/tartci/self-update.toml)")
     args = parser.parse_args(argv)
+    if args.peer_away and not (args.reason or "").strip():
+        parser.error("--peer-away needs --reason")
     try:
         cfg = load_config(Path(args.home), args.settings)
     except ConfigError as exc:
         print(f"self-update: REFUSED: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     sys_ = System()
+    if args.peer_away or args.peer_back:
+        host = args.peer_away or args.peer_back
+        declare_away(cfg, host, args.reason.strip() if args.peer_away else None, sys_.now())
+        print(f"self-update: {host} " + (f"declared away on this host: {args.reason.strip()}"
+                                         if args.peer_away else "no longer declared away on this host")
+              + f" ({cfg.state_dir / PEER_AWAY_NAME})")
+        return 0
     if args.status:
         print("\n".join(status_lines(cfg.state_dir)))
         return 0
