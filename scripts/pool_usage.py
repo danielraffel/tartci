@@ -223,6 +223,9 @@ class Vm:
         return "unrecorded" if self.minted else "unrecorded_pre_mint"
 
 
+SCAN_DIAGNOSTIC_EVENTS = frozenset({"scan_demand_ids", "queue_head_inversion"})
+
+
 def reconstruct_vms(events: List[Dict[str, Any]], now: float,
                     live_vm: Optional[str]) -> List[Vm]:
     """One interval per VM this lane cloned.
@@ -243,6 +246,10 @@ def reconstruct_vms(events: List[Dict[str, Any]], now: float,
 
     for ev in events:
         e, vm, t = ev["event"], ev["vm"], ev["t"]
+        if e in SCAN_DIAGNOSTIC_EVENTS:
+            # Written by the queue scan with no VM name, possibly mid-VM: not
+            # a sign that the supervisor's VM is gone.
+            continue
         if e == "clone_start":
             if cur is not None:
                 close(cur.last_t)
@@ -519,7 +526,9 @@ def host_report(root: str, host: str, since: float, until: float, now: float,
                     first_demand_waiting = ev["t"]
                 break
         for inv in queue_head_inversions(events, since, until):
-            inversions[str(inv["job_id"])] = inv
+            old = inversions.get(str(inv["job_id"]))
+            if old is None or inv["at"] >= old["at"]:
+                inversions[str(inv["job_id"])] = inv
         rep = lane_report(name, lane_dir, events, since, until, now, default_poll)
         if rep["busy_vm_seconds"] or any(since <= ev["t"] < until for ev in events):
             lanes.append(rep)

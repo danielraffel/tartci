@@ -305,6 +305,35 @@ class ScanIntegrationTests(unittest.TestCase):
 
 
 class PoolStatusTests(unittest.TestCase):
+    def test_scan_diagnostics_do_not_end_a_vm_mid_job(self) -> None:
+        def ev(t: float, name: str, vm: str = "v1") -> dict:
+            return {"t": NOW.timestamp() + t, "i": int(t), "event": name, "vm": vm,
+                    "runner": "r", "detail": "", "fields": {}}
+        events = [ev(0, "clone_start", ""), ev(1, "mint_jit"), ev(2, "job_assigned"),
+                  ev(60, "scan_demand_ids", ""), ev(61, "queue_head_inversion", ""),
+                  ev(600, "teardown")]
+        vms = pool_usage.reconstruct_vms(events, NOW.timestamp() + 700, None)
+        self.assertEqual(len(vms), 1)
+        self.assertEqual(vms[0].end - vms[0].start, 600)
+        self.assertEqual(vms[0].assigned_at, NOW.timestamp() + 2)
+
+    def test_the_newest_observation_wins_across_lanes(self) -> None:
+        d = detail([(1, queued_job(10, 69))],
+                   [(2, started_job(20, created=60, started=50, runner="r"))])
+        with tempfile.TemporaryDirectory() as tmp:
+            for lane, when in (("a-lane", NOW + dt.timedelta(minutes=30)), ("b-lane", NOW)):
+                path = Path(tmp) / lane
+                path.mkdir()
+                (path / "events.jsonl").write_text("")
+                qhi.record_scan(d, event_log=str(path / "events.jsonl"),
+                                state_file=str(path / "s.json"), runner=lane, tier="t",
+                                now=when, detect_inversion=True)
+            until = NOW.timestamp() + 3600
+            rep = pool_usage.host_report(tmp, "h", until - 86400, until, until, 2, "t", 30)
+        self.assertEqual(len(rep["queue_head_inversions"]), 1)
+        self.assertEqual(rep["queue_head_inversions"][0]["at"],
+                         slot_demand.iso(NOW + dt.timedelta(minutes=30)))
+
     def _report(self, with_event: bool) -> dict[str, Any]:
         d = detail([(1, queued_job(10, 69))],
                    [(2, started_job(20, created=60, started=50, runner="studio-slot2"))])
