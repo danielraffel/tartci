@@ -804,7 +804,7 @@ Cost: about one read per PR-class claim attempt that finds a free slot (190
 PR-class lease starts in the 2-day window, plus polls that find a free slot and do
 not serve: worst case 180 an hour per supervisor), plus up to grace/poll reads
 while a hold is active; one hold covers every run queued when it starts, and a
-yield forces one uncached scan of the held run. Measure with `pr_class_yield*` counts per host and merge-group
+yield forces one uncached scan of the held run. Measure with `pr_class_yield_read` (sum of `reads` per hour per host: the API cost) and `pr_class_yield*` counts per host and merge-group
 queue wait p50/p90 before and after. Rollback: delete the keys, re-render,
 restart the lanes at an idle boundary.
 

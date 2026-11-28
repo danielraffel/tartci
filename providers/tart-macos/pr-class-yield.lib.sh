@@ -158,6 +158,14 @@ tartci_pr_class_yield_gate(){
     --grace-secs "$TARTCI_PR_CLASS_YIELD_GRACE_SECS" --owner-pid "$$" \
     ${args[@]+"${args[@]}"} </dev/null 2>/dev/null)" || line=""
   [ -n "$line" ] || line="claim reason=helper_failed:no_output"
+  # One counted event per actual API read attempt (reads=N from the helper), so
+  # the fleet-wide read rate behind the stop rule is measurable.
+  case "$line" in
+    *" reads="*)
+      event pr_class_yield_read "merge-group queue read: $(tartci_slot_priority_token reads "$line") API call(s), outcome ${line%% *}" \
+        repo="$REPO" host="$(hostname -s 2>/dev/null || echo unknown)" \
+        reads="$(tartci_slot_priority_token reads "$line")" outcome="${line%% *}" ;;
+  esac
   _tartci_pr_class_yield_events "$line"
   case "$line" in yield\ *|hold\ *) return 75 ;; esac
   return 0

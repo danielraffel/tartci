@@ -250,6 +250,36 @@ class YieldTests(Base):
         self.assertIn("job_ids=unknown", out.stdout)
         self.assertTrue(self.holder().exists())
 
+    def test_a_read_failure_drops_the_placeholder_whatever_the_state_says(self) -> None:
+        self.queue(run_row(101))
+        state_file = self.state / "Generous-Corp_vellum.json"
+        (self.stub / "fail").write_text("1")
+        for label, write in (("missing", lambda: state_file.unlink()),
+                             ("malformed", lambda: state_file.write_text("{not json")),
+                             ("wrong shape", lambda: state_file.write_text("[1, 2]"))):
+            with self.subTest(state=label):
+                (self.stub / "fail").unlink()
+                state_file.unlink() if state_file.exists() else None
+                self.run_cli(now=T0)  # a real hold: placeholder plus state
+                (self.stub / "fail").write_text("1")
+                self.assertTrue(self.holder().exists())
+                write()
+                line = self.run_cli(now=T0 + 5)
+                self.assertIn("reason=read_error", line)
+                self.assertFalse(self.holder().exists(), label)
+                (self.stub / "fail").unlink()
+                state_file.unlink() if state_file.exists() else None
+                (self.state / "x").touch()
+                (self.stub / "fail").write_text("1")
+
+    def test_every_read_attempt_is_counted(self) -> None:
+        self.queue(run_row(101))
+        self.assertIn("reads=2", self.run_cli())  # the queue read plus the job-id read
+        self.assertIn("reads=1", self.run_cli(now=T0 + 10))  # a continuing hold: one read
+        (self.stub / "fail").write_text("1")
+        self.assertIn("reads=1", self.run_cli(now=T0 + 20))  # a failed read still counts
+        self.assertEqual(self.calls(), 4)
+
     def test_a_dead_owner_frees_the_slot_at_once(self) -> None:
         proc = subprocess.Popen(["sleep", "30"])
         pid = proc.pid
@@ -329,6 +359,18 @@ echo "refresh=$SCAN_REFRESH_NEXT run=$SCAN_REFRESH_RUN class=$SCAN_REFRESH_CLASS
         # While held, the next PR-class poll yields without needing a free slot.
         out, _, _ = self.gate(2, running=2, reserved=2)
         self.assertEqual(out, "rc=75")
+
+    def test_every_read_attempt_logs_a_counted_event(self) -> None:
+        self.queue(run_row(101))
+        events = self.gate(2)[2]
+        self.assertIn("pr_class_yield_read ", events)
+        self.assertIn("reads=2", events)
+        (self.stub / "fail").write_text("1")
+        (self.root / "events.log").unlink()
+        self.gate(2)
+        events = (self.root / "events.log").read_text()
+        self.assertIn("pr_class_yield_read ", events)
+        self.assertIn("reads=1", events)
 
     def test_a_yield_asks_for_an_uncached_scan_of_the_held_run(self) -> None:
         self.queue(run_row(101))
@@ -466,6 +508,24 @@ class ProfileTests(unittest.TestCase):
             env = plistlib.loads(body)["EnvironmentVariables"]
             if env.get("TARTCI_RUNNER_REPO") == VELLUM:
                 self.assertEqual(env["TARTCI_PR_CLASS_YIELD_GRACE_SECS"], "120")
+
+    def test_a_yield_only_lane_renders_the_forced_discovery_budget(self) -> None:
+        import macos_fleet_lanes as fleet
+        body = self.with_keys(f"{self.KEY} = true\n")
+        for drop in ("refresh_after_every_serve = true\n",):
+            self.assertIn(drop, body)
+            body = body.replace(drop, "", 1)
+        body = body.replace("forced_discoveries_per_hour = 8\n", "forced_discoveries_per_hour = 13\n")
+        data = self.load(body)
+        seen = 0
+        for plist in fleet.rendered_plists(data).values():
+            env = plistlib.loads(plist)["EnvironmentVariables"]
+            if env.get("TARTCI_RUNNER_REPO") == VELLUM:
+                seen += 1
+                self.assertEqual(env["TARTCI_PR_CLASS_YIELD"], "1")
+                self.assertNotIn("TARTCI_REFRESH_AFTER_EVERY_SERVE", env)
+                self.assertEqual(env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"], "13")
+        self.assertGreaterEqual(seen, 1)
 
     def test_a_minimum_queue_age_or_a_missing_budget_share_is_refused(self) -> None:
         m1 = (ROOT / "profiles" / "m1-macos-fleet.toml").read_text()

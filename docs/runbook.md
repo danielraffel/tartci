@@ -3995,8 +3995,9 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   while a hold is active, and one for job ids when a hold starts. The count
   includes polls that find a free slot and do not serve (admission deferred,
   job claim contended): worst case one uncached read per poll, 180 an hour per
-  supervisor, on the shared ghapp App budget; disable if `pr_class_yield`
-  reads exceed about 300 an hour fleet-wide. One hold covers every run queued
+  supervisor, on the shared ghapp App budget. Every read attempt logs a
+  `pr_class_yield_read` event (`reads=N`, `outcome`); sum `reads` per hour
+  across hosts, and disable if it exceeds about 300 an hour fleet-wide. One hold covers every run queued
   when it starts. A yield also asks the lane's next selection to scan uncached
   and read the held run first (the `refresh_after_serve` path), so the lane
   needs `forced_discoveries_per_hour` (validator-enforced) and

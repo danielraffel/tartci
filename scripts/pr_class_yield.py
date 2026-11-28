@@ -124,7 +124,11 @@ def save_state(path: pathlib.Path, state: Dict[str, Any], now: float) -> None:
     os.replace(str(tmp), str(path))
 
 
+READS = [0]
+
+
 def gh_json(args: argparse.Namespace, path: str) -> Dict[str, Any]:
+    READS[0] += 1  # every attempt counts, successful or not
     result = run_bounded([args.gh_cli, "api", path], timeout=float(args.gh_timeout),
                          operation="pr_class_yield_github_api")
     if getattr(result, "timed_out", False):
@@ -184,6 +188,8 @@ def queued_job_ids(args: argparse.Namespace, run_id: int) -> str:
 
 def render(verdict: str, fields: Dict[str, Any]) -> str:
     parts = [verdict]
+    if READS[0]:
+        fields = {**fields, "reads": READS[0]}
     for key, value in fields.items():
         if value is None or value == "":
             continue
@@ -202,12 +208,13 @@ def check(args: argparse.Namespace) -> str:
     try:
         queued = queued_merge_group_runs(args)
     except Exception as exc:  # noqa: BLE001 - fail open on anything
+        # Drop the placeholder whatever the state file says: a missing or
+        # malformed state must not leave a hold nothing will end.
+        remove_placeholder(holder)
         with contextlib.suppress(Exception), locked(state_dir, args.repo):
             state = load_state(state_file)
-            ended = state["active"]
-            if ended:
+            if state["active"]:
                 state["active"] = None
-                remove_placeholder(holder)
                 save_state(state_file, state, now)
         return render("claim", {**base, "reason": f"read_error:{type(exc).__name__}"})
     ids = {row["id"] for row in queued}

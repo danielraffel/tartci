@@ -3324,8 +3324,10 @@ def lane_plist(
         # runner.sh refresh_after_serve: after any served job, not only a
         # merge-group one, the next selection rescans uncached once.
         env["TARTCI_REFRESH_AFTER_EVERY_SERVE"] = "1"
-        # The lane's repository's post-serve discoveries an hour, fleet-wide;
-        # queue_scan.py adds them to its fleet API budget check.
+    if lane.get("refresh_after_every_serve") or lane.get("pr_class_yield_to_merge_group") is True:
+        # The lane's repository's forced discoveries an hour (post-serve refreshes,
+        # and the uncached scan each yield asks for), fleet-wide; queue_scan.py adds
+        # them to its fleet API budget check.
         env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"] = str(lane["forced_discoveries_per_hour"])
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
