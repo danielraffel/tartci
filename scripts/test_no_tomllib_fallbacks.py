@@ -29,6 +29,7 @@ import pulp_reapers  # noqa: E402
 import scratch_dirs  # noqa: E402
 import tartci_launchd_watchdog  # noqa: E402
 import tmp_checkouts  # noqa: E402
+import worktree_outputs  # noqa: E402
 
 REASON = "no tomllib (needs Python 3.11+)"
 
@@ -53,6 +54,11 @@ class NoTomllib(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         return patch
+
+    def test_worktree_outputs_reports_and_removes_nothing(self) -> None:
+        self.without(worktree_outputs)
+        self.assertEqual(worktree_outputs.run(fix=True, profile=self.profile, runner=never),
+                         {"enabled": False, "reason": REASON})
 
     def test_scratch_dirs_reports_and_removes_nothing(self) -> None:
         self.without(scratch_dirs)

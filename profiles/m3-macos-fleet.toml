@@ -137,6 +137,12 @@ tmp_checkouts = true
 # and Chrome's code-sign clones (12 h idle, nothing open, no live process
 # naming it; 4 h while the boot volume is below its floor). scripts/scratch_dirs.py
 scratch_dirs = true
+# Regenerable build output (target, build, .build, node_modules) in agent lane
+# worktrees under these roots: removed oldest first once the volume is over 85%
+# used (all eligible at 92%), only when nothing in it changed for 3 days
+# (7 under w-* lanes and .fleet-pass-* dirs), bounded per pass. m3's Workshop reached 97% on 2026-11-28 (about 350 GiB of lane build/ and target/ output in 3 days), so TartCI marked it not fleet-ready.
+# scripts/worktree_outputs.py. Rollback: delete this key.
+worktree_roots = ["/Volumes/Workshop/Code/agent-worktrees"]
 # The same checkout rules on the worktree root above (agent territory on this
 # host): 232 idle, clean, pushed worktrees there held ~143 GiB on 2026-09-29.
 # Dirty, unpushed, recent, in-use and lineage-active checkouts stay.
