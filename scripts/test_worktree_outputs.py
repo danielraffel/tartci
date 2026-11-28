@@ -250,7 +250,7 @@ class Validation(unittest.TestCase):
 
     def test_the_whole_table_validates(self):
         self.assertEqual(pr.validate_table({"pulp_worktree_builds": False,
-                                            wo.ROOTS_KEY: ["/Volumes/Workshop/x"]}), [])
+                                            wo.ROOTS_KEY: ["/Volumes/Example/x"]}), [])
 
 
 class PassSummary(unittest.TestCase):

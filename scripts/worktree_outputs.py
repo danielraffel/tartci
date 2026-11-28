@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Reap regenerable build output that agent lane worktrees leave behind.
 
-Why this exists: on 2026-11-28 m3's /Volumes/Workshop reached 97% because lane
-worktrees under /Volumes/Workshop/Code/agent-worktrees kept their `build/` and
+Why this exists: on 2026-11-28 a fleet host's /Volumes/Example reached 97% because lane
+worktrees under /Volumes/Example/agent-worktrees kept their `build/` and
 `target/` directories after the lane ended (about 350 GiB in 3 days). At over
 92% used TartCI marks the host not fleet-ready (disk_pressure), which also
 broke Pulp merge-group capacity accounting. The older tiers do not reach this:
@@ -33,7 +33,7 @@ and `..._budget_seconds` (900), so it never loads the host; the next hourly
 pass continues. Everything removed is regenerable by a build.
 
     [reclaim]
-    worktree_roots = ["/Volumes/Workshop/Code/agent-worktrees"]
+    worktree_roots = ["/Volumes/Example/agent-worktrees"]
 
 Rollback: delete the key. Nothing else depends on it.
 """
