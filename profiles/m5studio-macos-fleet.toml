@@ -348,13 +348,17 @@ label = "vellum-sterile-consumer"
 workflow = "Locked macOS GPU proof"
 runner_group_id = 8
 
+# Owner decision 2026-11-28 (Daniel): m5studio serves Vellum PR-class proofs
+# before merge-group, so PR proofs are not starved behind continuous
+# merge-group demand; m3 and m1 stay merge-group-first. Rollback: put the
+# merge-group tier back above the PR tier and re-install.
 [[lane.tier]]
-label = "vellum-build-macos-merge-group"
+label = "vellum-build-macos"
 workflow = "Locked macOS GPU proof"
 runner_group_id = 8
 
 [[lane.tier]]
-label = "vellum-build-macos"
+label = "vellum-build-macos-merge-group"
 workflow = "Locked macOS GPU proof"
 runner_group_id = 8
 
