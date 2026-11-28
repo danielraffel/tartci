@@ -381,6 +381,7 @@ class UnreachableConcurrencyTests(unittest.TestCase):
     def test_the_previous_m3_vellum_sizing_is_refused(self) -> None:
         data = profile("m3")
         vellum = next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")
+        vellum["supervisors"] = 2  # m3's second slot now lives in lane vellum-gate-pr
         vellum["vm_cores"] = 8  # 2 slots x 8 = 16 against the 12-core non-gate budget
         self.assertEqual(
             grf.unreachable_lines(grf.unreachable_concurrency(data, self.host("m3"))),
@@ -410,7 +411,9 @@ class UnreachableConcurrencyTests(unittest.TestCase):
     def test_validate_check_reserve_exits_nonzero(self) -> None:
         import macos_fleet_lanes
         data = profile("m3")
-        next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")["vm_cores"] = 8
+        vellum = next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")
+        vellum["supervisors"] = 2  # 2 x 8 = 16 > 12, as in the test above
+        vellum["vm_cores"] = 8
         with tempfile.TemporaryDirectory() as tmp:
             host_json = Path(tmp) / "host.json"
             host_json.write_text(json.dumps(self.host("m3")))
