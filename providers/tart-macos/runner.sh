@@ -561,6 +561,8 @@ source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/claim-delay.lib.sh"
 # shellcheck source=providers/tart-macos/slot-priority.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/slot-priority.lib.sh"
+# shellcheck source=providers/tart-macos/pr-class-yield.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/pr-class-yield.lib.sh"
 # shellcheck source=providers/tart-macos/vm-dhcp.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/vm-dhcp.lib.sh"
 # shellcheck source=providers/tart-macos/lease-fit.lib.sh
@@ -1417,7 +1419,8 @@ tier_queued_work(){
     scan_cmd+=(--priority-run "$SCAN_PRIORITY_RUN")
   fi
   if [ "$ASSIGNMENT_MODE" != event-class-v2 ] \
-     && declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
+     && declare -F tartci_slot_priority_enabled >/dev/null \
+     && tartci_slot_priority_enabled; then
     scan_cmd+=(--detail-file "$(tartci_slot_priority_detail_file "$tier_labels")")
   fi
   run_scan_capture ${scan_cmd[@]+"${scan_cmd[@]}"} --match-labels 1
@@ -3973,12 +3976,21 @@ if [ "$LOOP" = 1 ]; then
        && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ -z "$WARM_VM" ]; then
       tartci_slot_priority_gate "$cap" "$r" "$selected_labels" "$selected_tier" || sp=1
     fi
+    # PR-class yield (opt-in, pr-class-yield.lib.sh): a PR-class claim makes one
+    # fresh read for the repository's queued merge-group runs and, when one is
+    # queued, yields and holds the free slot for a grace period. Unset, the gate
+    # returns at once and nothing is read. The merge-group tier releases a hold.
+    pc=0
+    if [ "$sp" -eq 0 ] && [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
+       && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ -z "$WARM_VM" ]; then
+      tartci_pr_class_yield_gate "$selected_labels" "$selected_tier" "$cap" "$r" || pc=1
+    fi
     # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
     # (3) no higher-priority lane is waiting/running, and (4) the host is healthy.
     # (3) is always satisfied when the priority feature is off (priority_demand
     # returns 0) and (4) when host-health yield is off (host_health_yield returns
     # 0), so this is a no-op for a runner with neither feature enabled.
-    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$sp" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$pc" -eq 0 ] && [ "$sp" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
       # Holding a slot now; this lane no longer competes for one.
       tartci_slot_priority_withdraw
@@ -4102,6 +4114,18 @@ if [ "$LOOP" = 1 ]; then
       note "deferring ${POLL}s (queued=$q running_macos_vms=$r/$cap reserved=$reserved) — slot priority: a higher-ranked lane on this host takes the free slot"
       event demand_waiting "queued=$q running=$r/$cap reserved=$reserved reason=slot_priority" \
         queued="$q" running="$r" cap="$cap" poll="$POLL" reason=slot_priority reserved="$reserved"
+      heartbeat waiting
+      sleep "$POLL"
+    elif [ "$pc" -eq 1 ]; then
+      # Yielded: a merge-group run is queued, so this PR-class claim waits out
+      # the grace hold. Not a place for a lease waiter or a slot intent, which
+      # would defer the merge-group lane it is protecting.
+      tartci_slot_priority_withdraw
+      tartci_vm_lease_waiter_withdraw
+      reserved="$(tartci_count_reservations)"
+      note "deferring ${POLL}s (queued=$q running_macos_vms=$r/$cap) — PR-class yield: merge-group work is queued for $REPO (holding the slot)"
+      event demand_waiting "queued=$q running=$r/$cap reserved=$reserved reason=pr_class_yield" \
+        queued="$q" running="$r" cap="$cap" poll="$POLL" reason=pr_class_yield reserved="$reserved"
       heartbeat waiting
       sleep "$POLL"
     elif [ "$ws" -eq 1 ]; then
