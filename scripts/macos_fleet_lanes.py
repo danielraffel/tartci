@@ -137,6 +137,8 @@ LANE_KEYS = {
     "forced_discoveries_per_hour",
     # Slot priority's short-job-first rule (scripts/slot_priority.py).
     "short_jobs", "short_job_first",
+    # PR-class claims yield to a queued merge-group run (scripts/pr_class_yield.py).
+    "pr_class_yield_to_merge_group", "merge_group_grace_secs",
 }
 # A short job is named, never guessed: `job` is the job's name, `workflow` (when
 # given) its workflow's. Neither may hold the `|` or newline of the rendered
@@ -448,6 +450,40 @@ def validate_short_jobs(lane_id: str, lane: dict, data: dict) -> None:
     leases_table = data.get("leases") if isinstance(data.get("leases"), dict) else {}
     if leases_table.get("slot_priority", "off") == "off":
         fail(f"lane {lane_id}: short_jobs needs [leases] slot_priority shadow or on")
+
+
+def validate_pr_class_yield(lane_id: str, lane: dict) -> None:
+    """`pr_class_yield_to_merge_group` / `merge_group_grace_secs`: a switch on a lane with the tiers.
+
+    The PR class is the tiers ranked below the lane's one `*-merge-group` tier,
+    so the lane needs exactly one such tier and at least one tier after it. The
+    gate lives in the tier loop only (not event-class-v2).
+    """
+    switch = lane.get("pr_class_yield_to_merge_group")
+    grace = lane.get("merge_group_grace_secs")
+    if switch is None:
+        if grace is not None:
+            fail(f"lane {lane_id}: merge_group_grace_secs needs pr_class_yield_to_merge_group")
+        return
+    if type(switch) is not bool:
+        fail(f"lane {lane_id}: pr_class_yield_to_merge_group must be a boolean")
+    if grace is not None and (type(grace) is not int or not 30 <= grace <= 600):
+        fail(f"lane {lane_id}: merge_group_grace_secs must be an integer from 30 to 600")
+    if not switch:
+        return
+    if lane.get("assignment_mode") == "event-class-v2":
+        fail(f"lane {lane_id}: pr_class_yield_to_merge_group needs a tier lane, "
+             "not event-class-v2")
+    if lane.get("min_queued_age_seconds", 0):
+        # A just-queued merge-group job cannot count under a minimum age, so a
+        # hold would idle the whole grace period.
+        fail(f"lane {lane_id}: pr_class_yield_to_merge_group needs min_queued_age_seconds = 0")
+    labels = [str(tier.get("label", "")) for tier in (lane.get("tier") or [])
+              if isinstance(tier, dict)]
+    mg = [index for index, label in enumerate(labels) if label.endswith("-merge-group")]
+    if len(mg) != 1 or mg[0] == len(labels) - 1:
+        fail(f"lane {lane_id}: pr_class_yield_to_merge_group needs exactly one "
+             "[[lane.tier]] label ending -merge-group and at least one tier after it")
 
 
 def validate_lane_cache_roots(host: dict, lanes: list) -> None:
@@ -933,16 +969,21 @@ def load(path: Path) -> dict:
             fail(f"lane {lane_id}: refresh_after_every_serve must be a boolean on a "
                  "[[lane.tier]] lane that is not event-class-v2")
         forced = lane.get("forced_discoveries_per_hour")
-        if bool(refresh) != (forced is not None) or (
+        # A yield hold forces one uncached scan of the held run, so it states a
+        # budget share exactly as a refresh lane does.
+        uses_forced = bool(refresh) or lane.get("pr_class_yield_to_merge_group") is True
+        if uses_forced != (forced is not None) or (
                 forced is not None and (type(forced) is not int or forced < 0)):
             # Each refresh lane states its own budget share; queue_scan.py adds
             # it to the fleet API budget check.
             fail(f"lane {lane_id}: forced_discoveries_per_hour is a nonnegative integer, "
-                 "required with refresh_after_every_serve and only with it")
+                 "required with refresh_after_every_serve or pr_class_yield_to_merge_group, "
+                 "and only with them")
         if refresh and lane.get("min_queued_age_seconds", 0):
             # A just-queued job cannot count under a minimum age: pure cost.
             fail(f"lane {lane_id}: refresh_after_every_serve needs min_queued_age_seconds = 0")
         validate_short_jobs(lane_id, lane, data)
+        validate_pr_class_yield(lane_id, lane)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
@@ -3270,6 +3311,11 @@ def lane_plist(
             f"{row.get('workflow', '')}|{row['job']}" for row in lane["short_jobs"]
         )
         env["TARTCI_SHORT_JOB_FIRST"] = lane.get("short_job_first", "shadow")
+    if lane.get("pr_class_yield_to_merge_group") is True:
+        # providers/tart-macos/pr-class-yield.lib.sh: before a PR-class VM starts,
+        # one fresh read for queued merge-group runs; yield and hold if any.
+        env["TARTCI_PR_CLASS_YIELD"] = "1"
+        env["TARTCI_PR_CLASS_YIELD_GRACE_SECS"] = str(lane.get("merge_group_grace_secs", 120))
     if "queue_merge_group_quota" in lane:
         # queue_scan.py reads the newest N merge_group runs' jobs on every
         # refresh; absent, the lane keeps the plain newest-then-rotation order.
@@ -3278,8 +3324,10 @@ def lane_plist(
         # runner.sh refresh_after_serve: after any served job, not only a
         # merge-group one, the next selection rescans uncached once.
         env["TARTCI_REFRESH_AFTER_EVERY_SERVE"] = "1"
-        # The lane's repository's post-serve discoveries an hour, fleet-wide;
-        # queue_scan.py adds them to its fleet API budget check.
+    if lane.get("refresh_after_every_serve") or lane.get("pr_class_yield_to_merge_group") is True:
+        # The lane's repository's forced discoveries an hour (post-serve refreshes,
+        # and the uncached scan each yield asks for), fleet-wide; queue_scan.py adds
+        # them to its fleet API budget check.
         env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"] = str(lane["forced_discoveries_per_hour"])
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
