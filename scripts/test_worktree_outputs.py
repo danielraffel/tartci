@@ -165,6 +165,130 @@ class Selection(Fixture):
                 measure=lambda _r: 97.0)
         self.assertTrue(out.exists())
 
+    def test_unreadable_marker_keeps_output(self):
+        out = self.output("lane-a")
+        marker = out.parent / "build.pid"
+        marker.write_text("2147483646")
+        real_open = open
+
+        def deny(file, *a, **k):
+            if str(file) == str(marker):
+                raise PermissionError("denied")
+            return real_open(file, *a, **k)
+        wo.open = deny  # module-level shadow of the builtin
+        self.addCleanup(delattr, wo, "open")
+        report = self.scan()
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("marker_unreadable"), 1)
+
+    def test_unreadable_marker_after_scan_keeps_output(self):
+        out = self.output("lane-a")
+        calls = []
+        orig = wo.marker_state
+
+        def flaky(path):
+            calls.append(1)
+            return None if len(calls) == 1 else "marker_unreadable"
+        wo.marker_state = flaky
+        self.addCleanup(setattr, wo, "marker_state", orig)
+        report = self.scan()
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("marker_unreadable"), 1)
+
+    def test_unlistable_marker_dir_keeps_output(self):
+        out = self.output("lane-a")
+        real = os.listdir
+
+        def deny(d):
+            if str(d) == str(out.parent):
+                raise PermissionError("denied")
+            return real(d)
+        orig = wo.os.listdir
+        wo.os.listdir = deny
+        self.addCleanup(setattr, wo.os, "listdir", orig)
+        report = self.scan()
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("marker_unreadable"), 1)
+
+    def test_directory_named_lock_is_not_a_marker(self):
+        out = self.output("lane-a")
+        (out.parent / "x.lock").mkdir()
+        self.scan()
+        self.assertFalse(out.exists())
+
+    def test_process_list_failure_keeps_output(self):
+        out = self.output("lane-a")
+
+        def runner(cmd, *a, **k):
+            if cmd[0] == "ps":
+                raise OSError("no ps")
+            return subprocess.run(cmd, *a, **k)
+        report = wo.scan(self.settings(), fix=True, runner=runner,
+                         log=lambda _l: None, measure=lambda _r: 97.0)
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("process_scan_failed"), 1)
+
+    def test_process_list_failure_before_delete_keeps_output(self):
+        out = self.output("lane-a")
+        calls = []
+
+        def runner(cmd, *a, **k):
+            if cmd[0] == "ps":
+                calls.append(1)
+                if len(calls) > 1:
+                    raise OSError("no ps")
+                return type("P", (), {"returncode": 0, "stdout": ""})()
+            return subprocess.run(cmd, *a, **k)
+        report = wo.scan(self.settings(), fix=True, runner=runner,
+                         log=lambda _l: None, measure=lambda _r: 97.0)
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("process_scan_failed"), 1)
+
+    def test_idle_check_failure_before_delete_keeps_output(self):
+        out = self.output("lane-a")
+        calls = []
+
+        def runner(cmd, *a, **k):
+            if cmd[0] == "nice":
+                calls.append(1)
+                if len(calls) > 1:
+                    raise OSError("find died")
+            if cmd[0] == "ps":
+                return type("P", (), {"returncode": 0, "stdout": ""})()
+            return subprocess.run(cmd, *a, **k)
+        report = wo.scan(self.settings(), fix=True, runner=runner,
+                         log=lambda _l: None, measure=lambda _r: 97.0)
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("idle_check_failed"), 1)
+
+    def test_lstat_failure_keeps_output(self):
+        out = self.output("lane-a")
+        real = os.lstat
+
+        def deny(p, *a, **k):
+            if str(p) == str(out):
+                raise PermissionError("denied")
+            return real(p, *a, **k)
+        orig = wo.os.lstat
+        wo.os.lstat = deny
+        self.addCleanup(setattr, wo.os, "lstat", orig)
+        report = self.scan()
+        self.assertTrue(out.exists())
+        self.assertEqual(report["kept"].get("stat_failed"), 1)
+
+    def test_usage_unreadable_after_remove_stops_the_pass(self):
+        first = self.output("lane-a", age=12)
+        second = self.output("lane-b", age=10)
+        seen = []
+
+        def measure(_root):
+            seen.append(1)
+            return 97.0 if len(seen) == 1 else None
+        report = wo.scan(self.settings(), fix=True, log=lambda _l: None, measure=measure)
+        self.assertEqual(report["removed"], 1)
+        self.assertEqual(sum(p.exists() for p in (first, second)), 1)
+        self.assertEqual(report["roots"][0]["state"], "unknown_usage")
+
     def test_dry_run_removes_nothing_but_reports(self):
         out = self.output("lane-a")
         report = self.scan(fix=False)

@@ -346,7 +346,16 @@ refresh_after_every_serve = true
 # queue_scan.py's API budget check: Vellum served about 130 proofs a day over
 # 2026-11-15..17 (under 6 an hour). The check's headroom is 136 calls, about 9
 # discoveries, shared by every repository that sets this.
-forced_discoveries_per_hour = 8
+forced_discoveries_per_hour = 13
+# Merge-group yield (Daniel, 2026-11-28): before starting a PR-class VM, one
+# fresh read for queued Vellum merge_group runs; if any, hold the slot for
+# merge_group_grace_secs so the merge-group job takes it. The forced share
+# above rose from 8 to 13 to cover peak holds. Stop rule: turn off if
+# pr_class_yield_read reads pass about 300 an hour fleet-wide, or
+# pr_class_yield_expired outnumbers pr_class_yield_served.
+# Rollback: delete these two lines, restore 8 above, and re-render.
+pr_class_yield_to_merge_group = true
+merge_group_grace_secs = 120
 # sterile-consumer runs about 1.5 min after the GPU proof, on the same runner
 # class, and waited a median 5.3 min (mean 16.7) for a VM slot behind 30-minute
 # GPU jobs. Named here, slot priority lets it take the next free slot ahead of

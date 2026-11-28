@@ -24,6 +24,10 @@ removes one only when:
   * no live process owns it: a pid or lock file naming a live pid, in the
     directory or its parent, or a running command naming either path.
 
+Any error reading evidence (a marker, the process list, a modification time,
+a size, the volume usage) keeps the directory, with the reason counted in the
+report's `kept`. Nothing is deleted on missing evidence.
+
 Removal is oldest first and bounded. While the volume is under
 `worktree_output_target_used_pct` (default 85) nothing is removed. Above it,
 directories go until the volume is back under the target. At or above
@@ -43,6 +47,7 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -211,23 +216,35 @@ def live_pid(value: str) -> bool:
     return True
 
 
-def has_live_marker(path: pathlib.Path) -> bool:
-    """A pid or lock file, in the directory or its parent, naming a live pid."""
+def marker_state(path: pathlib.Path) -> Optional[str]:
+    """Why `path` must be kept because of its pid or lock files, else None.
+
+    A pid or lock file, in the directory or its parent, naming a live pid
+    gives "live_pid_or_lock". Any error listing those directories or reading
+    a marker gives "marker_unreadable": missing evidence keeps the directory.
+    """
     for directory in (path, path.parent):
         try:
             names = os.listdir(directory)
         except OSError:
-            return True  # cannot tell, so keep
+            return "marker_unreadable"
         for name in names:
             if not (name.endswith((".pid", ".lock")) or name in ("pid", "lock", ".lock")):
                 continue
+            full = os.path.join(directory, name)
             try:
-                with open(os.path.join(directory, name), "r", errors="replace") as handle:
+                if stat.S_ISDIR(os.lstat(full).st_mode):
+                    continue  # a directory is not a marker file
+                with open(full, "r", errors="replace") as handle:
                     if live_pid(handle.read(64)):
-                        return True
+                        return "live_pid_or_lock"
             except OSError:
-                continue
-    return False
+                return "marker_unreadable"
+    return None
+
+
+def has_live_marker(path: pathlib.Path) -> bool:
+    return marker_state(path) is not None
 
 
 def command_lines(runner: Runner = subprocess.run) -> Optional[str]:
@@ -315,11 +332,17 @@ def scan(settings: dict[str, Any], *, fix: bool, runner: Runner = subprocess.run
                 break
             days = PROTECTED_IDLE_DAYS if protected(path, root) else settings["idle_days"]
             days = max(days, settings["idle_days"])
-            if path.is_symlink():
+            try:
+                is_link = stat.S_ISLNK(os.lstat(path).st_mode)
+            except OSError:
+                keep("stat_failed")
+                continue
+            if is_link:
                 keep("symlink")
                 continue
-            if has_live_marker(path):
-                keep("live_pid_or_lock")
+            reason = marker_state(path)
+            if reason:
+                keep(reason)
                 continue
             if commands is None:
                 keep("process_scan_failed")
@@ -344,7 +367,15 @@ def scan(settings: dict[str, Any], *, fix: bool, runner: Runner = subprocess.run
                 continue
             if fix:
                 # Re-read just before the delete: a build may have started.
-                if idle_for(path, days, runner) is not True or has_live_marker(path):
+                reason = marker_state(path)
+                if reason:
+                    keep(reason)
+                    continue
+                recheck = idle_for(path, days, runner)
+                if recheck is None:
+                    keep("idle_check_failed")
+                    continue
+                if not recheck:
                     keep("recent")
                     continue
                 fresh = command_lines(runner)
@@ -368,8 +399,12 @@ def scan(settings: dict[str, Any], *, fix: bool, runner: Runner = subprocess.run
                 f"idle >= {days}d, {entry['state']})")
             if fix:
                 after = measure(root)
-                if after is not None:
-                    current = after
+                if after is None:
+                    # Cannot tell whether the target is met: stop, do not guess.
+                    entry["state"] = "unknown_usage"
+                    keep("usage_unknown_after_remove")
+                    break
+                current = after
             elif size:
                 # A dry run cannot re-measure; estimate with the volume size.
                 try:
