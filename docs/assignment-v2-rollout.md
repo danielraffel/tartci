@@ -758,6 +758,56 @@ the lane-event slot wait (first `demand_waiting` to the next `job_claim`).
 Rollback: set `slot_priority = "off"` (or delete the key), re-render, restart
 the supervisors at an idle boundary; stale intents expire on their own.
 
+### PR-class yield to a queued merge group
+
+A running VM cannot be preempted, so a merge-group job that arrives while PR-head
+proofs hold a host's slots waits for them. Measured over 35 Vellum merge-group
+waits (2026-11-26..28), PR-head jobs held 621 slot-minutes overlapping those
+waits against 557 for merge-group. A first design capped PR-class VMs while the
+merge-group tier's scan counted queued work; the counterfactual showed it would
+never fire (0 of 28 PR-class starts inside a wait had counted demand), because
+a lane selects the PR tier exactly when its last snapshot counted no
+merge-group work, and the first evidence of a merge-group job came a median
+5.1 min after it was created. Owner decision (Daniel, via the Vellum lead,
+2026-11-28): a fresh read at claim time, and a grace hold.
+
+`[[lane]] pr_class_yield_to_merge_group = true` and
+`merge_group_grace_secs` (30 to 600, default 120); default off
+(`scripts/pr_class_yield.py`, `providers/tart-macos/pr-class-yield.lib.sh`).
+The gate runs after slot priority at the claim point, for the tiers ranked below
+the lane's `*-merge-group` tier, and only when a slot is free (or a hold is
+active):
+
+1. One fresh `GET repos/<repo>/actions/runs?event=merge_group&status=queued`
+   through the lane's `TARTCI_GH_CLI`, no cache, filtered to the merge-group
+   tier's workflow names. The runs list does not carry job labels; the workflow
+   filter stands in for them.
+2. Any queued run not yet held on this host: the claim yields, a placeholder
+   reservation holds the slot for the grace period, `pr_class_yield` is logged.
+3. The hold ends on `pr_class_yield_served` (the run left the queue, or the
+   merge-group tier is being claimed here) or `pr_class_yield_expired` (grace
+   over, run still queued). After either, that run id never holds again on this
+   host. The key is the run id: Vellum's merge-group run carries one queued GPU
+   job, and job ids are logged on the event.
+
+Fail open on every error. The hold reserves the slot against every lane on the
+host, not only the repository's: that is the point, and it is bounded by the
+grace period and the owner process's life. Releasing the placeholder just before
+the merge-group tier claims leaves a window of about 0.1 to 0.3 s (a Python
+start and an event write) in which another lane can take the slot. Any tier
+ranked above PR-class releases a hold, not only the merge-group tier. A claim of
+the held run on ANOTHER host rarely releases a hold within 120 s: a run leaves
+`queued` when its job starts on a runner, 2.5 to 2.8 min after the claim, so
+each other enabled host that yields idles one slot for the full grace.
+
+Cost: about one read per PR-class claim attempt that finds a free slot (190
+PR-class lease starts in the 2-day window, plus polls that find a free slot and do
+not serve: worst case 180 an hour per supervisor), plus up to grace/poll reads
+while a hold is active; one hold covers every run queued when it starts, and a
+yield forces one uncached scan of the held run. Measure with `pr_class_yield_read` (sum of `reads` per hour per host: the API cost) and `pr_class_yield*` counts per host and merge-group
+queue wait p50/p90 before and after. Rollback: delete the keys, re-render,
+restart the lanes at an idle boundary.
+
 ## Fair share between repositories (on every macOS fleet host)
 
 Every VM lane leases at its repository's priority: Pulp's gate derives 100 (PR
