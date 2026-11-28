@@ -291,13 +291,17 @@ ccache_write_isolation = true
 # event-class leases derive 100 (PR head) / 110 (merge group).
 priority = "vm"
 supervisors = 1
-min_queued_age_seconds = 600
+# Beefy hosts first (Daniel, 2026-11-28): m1 takes a Vellum job only once it
+# has queued 20 min. A GPU proof takes a median 73 min on m1 against 45-56 on
+# m3 and m5studio, so m1 shortens a job's total time only when a faster slot
+# is about 20 min away or more. Rollback: set back to 600 and re-render.
+min_queued_age_seconds = 1200
 # Vellum's merge-group sterile job appears only when its GPU job ends, long
 # after the run was created, so the scan reads the newest 2 merge_group runs'
 # jobs on every refresh (queue_scan.py --merge-group-quota). Pulp keeps the
 # default 0. Rollback: delete this line and re-render.
 queue_merge_group_quota = 2
-# No refresh_after_every_serve here: min_queued_age_seconds = 600 means a
+# No refresh_after_every_serve here: min_queued_age_seconds = 1200 means a
 # just-queued journey cannot count on the post-serve scan, so it would only
 # spend an uncached discovery.
 # sterile-consumer runs about 1.5 min after the GPU proof, on the same runner

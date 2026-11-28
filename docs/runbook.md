@@ -3127,6 +3127,23 @@ fleet`), and check GitHub's job history against it with
   self-updates and once sat idle 25 minutes while gate jobs waited.
   `pool status` reports the host as `stepped aside, holding no update turn`.
   It exits 0 when a peer was also out of service, otherwise 3.
+- **A peer declared away stops holding the turn while it is unreachable.**
+  For a host that leaves the fleet on purpose (a travelling laptop with its
+  pool off), declare it on every host that surveys it:
+  `tartci fleet-macos self-update --peer-away m5 --reason "travelling"`, and
+  `--peer-back m5` when it returns. The declaration lives in
+  `~/.tartci/state/self-update/peers-away.json`
+  (`{"m5": {"reason": "travelling", "since": "2026-11-28T15:00:00Z"}}`); a
+  host whose CLI predates the flags honours the same file written by hand
+  once it runs this code as its update orchestrator. A declared peer that
+  cannot be read is left to the capacity floor like an off peer, and its
+  unreadable streak is still recorded for other hosts. A declared peer that
+  answers is read normally, and the run warns that the declaration is stale.
+  A peer that is not declared, a missing or malformed file, or an entry
+  without a `reason` keeps the fail-closed rule below. The automatic
+  exclusion below needs a fresh read of the dark peer from every readable
+  peer, so it cannot fire once a host is current and has stopped surveying
+  (m1 on 2026-11-28 left m3 and m5studio stepped aside on m5 for hours).
 - **A peer that stays unreachable stops holding the turn.** An unreadable
   peer counts as busy, because it may be mid-update. Each survey records the
   peers it could not read in `~/.tartci/state/self-update/peer-unreadable.json`
