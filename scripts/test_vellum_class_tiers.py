@@ -61,11 +61,11 @@ class ProfileTests(unittest.TestCase):
                 for label in (STERILE, MERGE_GROUP, PR_HEAD):
                     self.assertNotIn(label, lane["labels"])
                 # Every proof queues a journey as it ends: rescan after any serve,
-                # except on m1, whose 600 s minimum queue age hides a fresh journey.
+                # except on m1, whose 1200 s minimum queue age hides a fresh journey.
                 if host in REFRESH_HOSTS:
                     self.assertIs(lane["refresh_after_every_serve"], True)
                 else:
-                    self.assertEqual(lane["min_queued_age_seconds"], 600)
+                    self.assertEqual(lane["min_queued_age_seconds"], 1200)
                     self.assertNotIn("refresh_after_every_serve", lane)
                 self.assertEqual(lane["labels"][-1], f"vellum-host-{host}")
                 self.assertEqual(lane["job_claim_labels"], ["self-hosted", "macOS", "ARM64"])
