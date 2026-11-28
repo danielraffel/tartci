@@ -31,6 +31,8 @@ import macos_fleet_lanes as fleet  # noqa: E402
 PROFILES = {h: ROOT / "profiles" / f"{h}-macos-fleet.toml" for h in ("m1", "m3", "m5", "m5studio")}
 RUNNER = ROOT / "providers/tart-macos/runner.sh"
 REFRESH_HOSTS = ("m3", "m5", "m5studio")
+# Owner decision 2026-11-28: m5studio serves PR-class before merge-group.
+PR_FIRST_HOSTS = ("m5studio",)
 STERILE = "vellum-sterile-consumer"
 MERGE_GROUP = "vellum-build-macos-merge-group"
 PR_HEAD = "vellum-build-macos"
@@ -53,10 +55,12 @@ class ProfileTests(unittest.TestCase):
         for host in PROFILES:
             with self.subTest(host=host):
                 lane = vellum_lane(host)
+                classes = ((PR_HEAD, MERGE_GROUP) if host in PR_FIRST_HOSTS
+                           else (MERGE_GROUP, PR_HEAD))
                 self.assertEqual([(t["label"], t["workflow"], t["runner_group_id"])
                                   for t in lane["tier"]],
-                                 [(STERILE, WORKFLOW, 8), (MERGE_GROUP, WORKFLOW, 8),
-                                  (PR_HEAD, WORKFLOW, 8)])
+                                 [(STERILE, WORKFLOW, 8)]
+                                 + [(c, WORKFLOW, 8) for c in classes])
                 # No class label in the base: a runner carries exactly one.
                 for label in (STERILE, MERGE_GROUP, PR_HEAD):
                     self.assertNotIn(label, lane["labels"])
@@ -79,8 +83,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(env["TARTCI_RUNNER_LABELS"],
                          "self-hosted,macOS,ARM64,vellum-host-m5studio")
         self.assertEqual(env["TARTCI_RUNNER_WORKFLOW_TIERS"].splitlines(),
-                         [f"{STERILE}|{WORKFLOW}", f"{MERGE_GROUP}|{WORKFLOW}",
-                          f"{PR_HEAD}|{WORKFLOW}"])
+                         [f"{STERILE}|{WORKFLOW}", f"{PR_HEAD}|{WORKFLOW}",
+                          f"{MERGE_GROUP}|{WORKFLOW}"])
         self.assertEqual(env["TARTCI_JOB_CLAIM_LABELS"], "self-hosted,macOS,ARM64")
         self.assertEqual(env["TARTCI_REFRESH_AFTER_EVERY_SERVE"], "1")
 

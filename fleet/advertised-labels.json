@@ -9,7 +9,7 @@
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
     ],
-    "profiles_sha256": "5aadac39a4525fe2d17a354556178c8ba565ad90748e0868509b5a7fb1b4c1f1"
+    "profiles_sha256": "8100238a738bd36784c81a6771ae884fb882b8c52b92cdf19a3fc662865a9ba2"
   },
   "registrations": [
     {
@@ -685,13 +685,13 @@
       "lane": "vellum-gate",
       "repo": "Generous-Corp/vellum",
       "assignment_mode": "legacy",
-      "class_label": "vellum-build-macos-merge-group",
+      "class_label": "vellum-build-macos",
       "labels": [
         "self-hosted",
         "macOS",
         "ARM64",
         "vellum-host-m5studio",
-        "vellum-build-macos-merge-group"
+        "vellum-build-macos"
       ],
       "workflows": [
         "Locked macOS GPU proof"
@@ -703,13 +703,13 @@
       "lane": "vellum-gate",
       "repo": "Generous-Corp/vellum",
       "assignment_mode": "legacy",
-      "class_label": "vellum-build-macos",
+      "class_label": "vellum-build-macos-merge-group",
       "labels": [
         "self-hosted",
         "macOS",
         "ARM64",
         "vellum-host-m5studio",
-        "vellum-build-macos"
+        "vellum-build-macos-merge-group"
       ],
       "workflows": [
         "Locked macOS GPU proof"
