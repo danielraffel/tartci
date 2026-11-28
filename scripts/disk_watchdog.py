@@ -931,6 +931,7 @@ def watch_free(directory: pathlib.Path, now: float, *, issue: Any = None, close:
         need = floor["floor_gb"] * (1 + FREE_MARGIN)
         if free is None:
             status = "unknown"
+            state["ok_streak"] = 0  # an unread pass is not a valid reading
         elif free < floor["floor_gb"]:
             status = "low"
             state["ok_streak"] = 0

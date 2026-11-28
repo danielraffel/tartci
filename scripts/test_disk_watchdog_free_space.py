@@ -183,6 +183,19 @@ class FreeFloorTests(unittest.TestCase):
         self.assertEqual(f.closed, [])
         self.assertEqual(len(f.opened), 1)
 
+    def test_an_unread_pass_resets_the_recovery_streak(self) -> None:
+        f = Fakes(self)
+        f.data(96)
+        f.data(230)
+        f.data(230)
+        f.free.pop("/Volumes/Data")
+        self.assertEqual(f.pass_()["volumes"][0]["status"], "unknown")
+        f.data(230)
+        self.assertEqual(f.closed, [])
+        f.data(230)
+        f.data(230)
+        self.assertEqual(f.closed, ["101"])
+
     def test_a_du_that_times_out_still_reports_what_it_read(self) -> None:
         f = Fakes(self)
         f.du_outcome = "timed out after 20 s"
