@@ -31,6 +31,9 @@ import macos_fleet_lanes as fleet  # noqa: E402
 PROFILES = {h: ROOT / "profiles" / f"{h}-macos-fleet.toml" for h in ("m1", "m3", "m5", "m5studio")}
 RUNNER = ROOT / "providers/tart-macos/runner.sh"
 REFRESH_HOSTS = ("m3", "m5", "m5studio")
+# Owner decision 2026-11-28: m3 yields PR-class slots to merge-group and carries
+# the larger forced-discovery share that covers its peak holds.
+YIELD_HOSTS = ("m3",)
 STERILE = "vellum-sterile-consumer"
 MERGE_GROUP = "vellum-build-macos-merge-group"
 PR_HEAD = "vellum-build-macos"
@@ -317,7 +320,8 @@ class RefreshAfterEveryServeTests(unittest.TestCase):
             env = next(plistlib.loads(body)["EnvironmentVariables"]
                        for name, body in fleet.rendered_plists(fleet.load(PROFILES[host])).items()
                        if name.endswith(".vellum-gate.plist"))
-            self.assertEqual(env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"], "8", host)
+            self.assertEqual(env["TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR"],
+                             "13" if host in YIELD_HOSTS else "8", host)
 
     def test_the_runner_refuses_it_off_the_tier_loop(self) -> None:
         """A hand-set env on a single-label or event-class-v2 lane stays off."""

@@ -484,9 +484,17 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(body.count(anchor), 1)
         return body.replace(anchor, anchor + lines, 1)
 
-    def test_no_shipped_profile_enables_it(self) -> None:
-        for path in (ROOT / "profiles").glob("*-macos-fleet.toml"):
-            self.assertNotIn(self.KEY, path.read_text(), path.name)
+    # Owner decision 2026-11-28: only m3 enables it.
+    ENABLED_PROFILES = ("m3-macos-fleet.toml",)
+
+    def test_only_the_approved_profiles_enable_it(self) -> None:
+        paths = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertTrue(paths)
+        for path in paths:
+            if path.name in self.ENABLED_PROFILES:
+                self.assertIn(f"{self.KEY} = true", path.read_text(), path.name)
+            else:
+                self.assertNotIn(self.KEY, path.read_text(), path.name)
 
     def test_the_lane_renders_the_env_and_others_do_not(self) -> None:
         import macos_fleet_lanes as fleet
