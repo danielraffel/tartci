@@ -176,6 +176,16 @@ def lane_log_lines(path: str, cutoff: str) -> List[bytes]:
     return lines
 
 
+# Written by the queue scan with no VM name and the scan's lane id as runner,
+# possibly mid-VM or mid-wait. They are not supervisor state transitions, so
+# every reader of the event stream below drops them first.
+SCAN_DIAGNOSTIC_EVENTS = frozenset({"scan_demand_ids", "queue_head_inversion"})
+
+
+def without_diagnostics(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [ev for ev in events if ev["event"] not in SCAN_DIAGNOSTIC_EVENTS]
+
+
 def load_events(path: str, cutoff: str) -> List[Dict[str, Any]]:
     out = []
     for i, line in enumerate(lane_log_lines(path, cutoff)):
@@ -241,7 +251,7 @@ def reconstruct_vms(events: List[Dict[str, Any]], now: float,
             vms.append(cur)
             cur = None
 
-    for ev in events:
+    for ev in without_diagnostics(events):
         e, vm, t = ev["event"], ev["vm"], ev["t"]
         if e == "clone_start":
             if cur is not None:
@@ -290,7 +300,7 @@ def demand_spans(events: List[Dict[str, Any]], default_poll: int) -> List[Dict[s
     """Each demand sample covers [t, end): up to the next sample when the lane
     kept waiting (next sample within two polls), else until the lane did
     something else, bounded by one poll (the sleep that followed the sample)."""
-    flow = [ev for ev in events if ev["event"] not in WAIT_NOISE]
+    flow = [ev for ev in without_diagnostics(events) if ev["event"] not in WAIT_NOISE]
     spans = []
     for k, ev in enumerate(flow):
         if ev["event"] not in DEMAND_EVENTS:
@@ -329,7 +339,7 @@ def lease_fit_holds(events: List[Dict[str, Any]], now: float) -> List[Tuple[floa
     """[lease_unfit_now, lane proceeds) intervals: the lane could not lease its
     VM and so did not scan for work."""
     spans, start = [], None
-    for ev in events:
+    for ev in without_diagnostics(events):
         e = ev["event"]
         if e in ("lease_unfit_now", "lease_never_fits"):
             if start is None:
@@ -347,7 +357,10 @@ def lease_fit_holds(events: List[Dict[str, Any]], now: float) -> List[Tuple[floa
 # ── report ───────────────────────────────────────────────────────────────────
 def lane_report(lane: str, lane_dir: str, events: List[Dict[str, Any]], since: float,
                 until: float, now: float, default_poll: int) -> Dict[str, Any]:
-    runner = next((ev["runner"] for ev in reversed(events) if ev["runner"]), lane)
+    # The runner name comes from a supervisor event: a scan diagnostic carries
+    # the scan's lane id, which can differ and would point read_state_vm astray.
+    runner = next((ev["runner"] for ev in reversed(without_diagnostics(events))
+                   if ev["runner"]), lane)
     live_vm = read_state_vm(lane_dir, runner)
     vms = reconstruct_vms(events, now, live_vm)
     window = until - since
@@ -476,6 +489,21 @@ def lifecycle_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def queue_head_inversions(events: List[Dict[str, Any]], since: float,
+                          until: float) -> List[Dict[str, Any]]:
+    """Latest queue_head_inversion event per job in the window (detection only)."""
+    latest: Dict[str, Dict[str, Any]] = {}
+    for ev in events:
+        if ev["event"] != "queue_head_inversion" or not (since <= ev["t"] < until):
+            continue
+        f = ev["fields"]
+        latest[str(f.get("job_id"))] = {
+            "at": fmt_ts(ev["t"]), "run_id": f.get("run_id"), "job_id": f.get("job_id"),
+            "age_seconds": f.get("age_seconds"), "took": f.get("took") or [],
+            "took_count": f.get("took_count"), "next_action": f.get("next_action")}
+    return sorted(latest.values(), key=lambda r: r["at"])
+
+
 def host_report(root: str, host: str, since: float, until: float, now: float,
                 slots: int, slots_source: str, default_poll: int) -> Dict[str, Any]:
     root = os.path.expanduser(root)
@@ -487,6 +515,7 @@ def host_report(root: str, host: str, since: float, until: float, now: float,
         names = []
         errors.append(f"cannot list {root}: {exc.strerror}")
     first_demand_waiting = None
+    inversions: Dict[str, Dict[str, Any]] = {}
     for name in names:
         lane_dir = os.path.join(root, name)
         path = os.path.join(lane_dir, "events.jsonl")
@@ -502,6 +531,10 @@ def host_report(root: str, host: str, since: float, until: float, now: float,
                 if first_demand_waiting is None or ev["t"] < first_demand_waiting:
                     first_demand_waiting = ev["t"]
                 break
+        for inv in queue_head_inversions(events, since, until):
+            old = inversions.get(str(inv["job_id"]))
+            if old is None or inv["at"] >= old["at"]:
+                inversions[str(inv["job_id"])] = inv
         rep = lane_report(name, lane_dir, events, since, until, now, default_poll)
         if rep["busy_vm_seconds"] or any(since <= ev["t"] < until for ev in events):
             lanes.append(rep)
@@ -559,6 +592,7 @@ def host_report(root: str, host: str, since: float, until: float, now: float,
         "job_results": dict(sorted(results.items())),
         "lifecycle": lifecycle,
         "vm_cpu_io": None,
+        "queue_head_inversions": sorted(inversions.values(), key=lambda r: r["at"]),
         "notes": notes,
         "errors": errors,
         "lanes": lanes,
@@ -661,6 +695,7 @@ def render_host(h: Dict[str, Any]) -> List[str]:
                f"{h['lease_fit_holds']} ({mins(h['lease_fit_hold_seconds'])} lane-min)")
     out += render_lifecycle(h.get("lifecycle") or {})
     out.append(f"  per-job VM CPU/IO: {CPU_IO_NOTE}")
+    out += render_inversions(h.get("queue_head_inversions") or [])
     for n in h["notes"]:
         out.append(f"  note: {n}")
     for e in h["errors"]:
@@ -712,6 +747,18 @@ def render(rep: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def render_inversions(rows: List[Dict[str, Any]]) -> List[str]:
+    out = []
+    for r in rows:
+        who = ", ".join(f"run {t.get('run_id')} job {t.get('job_id')} on {t.get('runner_name')}"
+                        for t in r.get("took") or [])
+        out.append(f"  QUEUE-HEAD INVERSION: run {r['run_id']} job {r['job_id']} queued "
+                   f"{mins(float(r.get('age_seconds') or 0))} min; newer jobs took runners: "
+                   f"{who or 'unknown'}")
+        out.append(f"    next action: {r.get('next_action')}")
+    return out
+
+
 def span(seconds: int) -> str:
     for unit, size in (("h", 3600), ("m", 60)):
         if seconds % size == 0:
@@ -721,11 +768,13 @@ def span(seconds: int) -> str:
 
 def summary_line(h: Dict[str, Any], seconds: int) -> str:
     lower = " (lower bound)" if h["notes"] and "demand_waiting" in h["notes"][0] else ""
+    inv = len(h.get("queue_head_inversions") or [])
+    flag = (f", QUEUE-HEAD INVERSION x{inv} (see tartci pool status --usage)" if inv else "")
     return (f"usage ({span(seconds)}): occupancy {pct(h['occupancy'])} of {h['slots']} slot(s), "
             f"{h['jobs_served']} job(s) served, {h['vms_discarded']} VM(s) discarded, "
             f"idle-with-demand {mins(h['idle_with_demand_seconds'])} min{lower}, "
             f"lease denials {sum(h['lease_denials_by_axis'].values())} "
-            f"(details: tartci pool status --usage)")
+            f"(details: tartci pool status --usage){flag}")
 
 
 def parse_peers(values: List[str]) -> List[Tuple[str, str]]:

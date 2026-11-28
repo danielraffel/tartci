@@ -1350,6 +1350,7 @@ queued_work(){
     --repo "$REPO" \
     ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} \
     ${detail_args[@]+"${detail_args[@]}"} \
+    --event-log "${EVENT_LOG:-}" \
     --labels "$LABELS" \
     --provider tart-macos \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
@@ -1405,6 +1406,7 @@ tier_queued_work(){
     --repo "$REPO" \
     ${tier_args[@]+"${tier_args[@]}"} \
     --labels "$LABELS,$tier_labels" \
+    --event-log "${EVENT_LOG:-}" \
     --provider tart-macos-tier \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-$tier_labels" \
     --state-file "$STATE_DIR/queue-scan.json" \

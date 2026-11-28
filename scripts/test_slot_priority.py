@@ -815,6 +815,26 @@ class ScannerDetailTests(unittest.TestCase):
         self.assertTrue(data["witness_only"])
         self.assertEqual(sum(row["count"] for row in data["classes"].values()), 1)
 
+    def test_assignment_scan_event_log_writes_ids_only_for_an_exhaustive_scan(self) -> None:
+        witness_log = self.root / "witness-events.jsonl"
+        witness, _ = self.assignment_scan("--event-log", str(witness_log), "--detail-file",
+                                          str(self.root / "w.json"))
+        self.assertEqual(witness.returncode, 0, witness.stderr)
+        self.assertFalse(witness_log.exists(), "a witness-only scan logs no ids")
+        full_log = self.root / "full-events.jsonl"
+        full, _ = self.assignment_scan("--event-log", str(full_log), "--exhaustive-count")
+        self.assertEqual(full.returncode, 0, full.stderr)
+        events = [json.loads(x) for x in full_log.read_text().splitlines()]
+        self.assertEqual([e["event"] for e in events], ["scan_demand_ids"])
+        self.assertIn("pulp-build-merge-group", events[0]["fields"]["tier"])
+        counted = events[0]["fields"]["counted"]
+        self.assertEqual(sum(len(v) for v in counted.values()), 2, counted)
+        self.assertIn("pulp-build-merge-group", counted["merge_group"][0]["labels"])
+        # Steady queue, same lane id: a second scan writes nothing.
+        again, _ = self.assignment_scan("--event-log", str(full_log), "--exhaustive-count")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(full_log.read_text().splitlines()), 1)
+
 
 class Bash32GateTests(Base):
     """The lane glue under macOS /bin/bash 3.2, `set -euo pipefail`, empty arrays."""

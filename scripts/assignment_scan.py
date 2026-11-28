@@ -66,6 +66,7 @@ from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
 from slot_demand import DemandDetail
+import queue_head_inversion
 from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     CLI_REFUSED,
@@ -1149,6 +1150,7 @@ def parse_args() -> argparse.Namespace:
         help="count only runs whose head_repository.full_name is this exact OWNER/REPO",
     )
     parser.add_argument("--min-age-seconds", type=int, default=0)
+    queue_head_inversion.add_cli_args(parser)
     parser.add_argument(
         "--detail-file",
         help="also write the counted jobs' event classes and oldest created_at here "
@@ -1333,6 +1335,7 @@ def main() -> int:
         count = scanner.scan()
         if args.detail_file:
             scanner.detail.write(args.detail_file)
+        queue_head_inversion.record_from_args(scanner.detail.as_dict(), args)
         print(count)
     except AuthPreflightError as error:
         print(f"assignment scan failed closed: {error}", file=sys.stderr)

@@ -1102,6 +1102,23 @@ audit, but registers with a unique per-boot GitHub name and reclaims only an
 offline registration belonging to its own slot. This avoids zombie collisions
 without losing fleet observability.
 
+### Queue-head inversion diagnostics
+
+Each lane's event log gets a `scan_demand_ids` event whenever the run and job
+ids a tier scan counted as demand change (the oldest 10 per event class, so a
+missing job is visible in the log). With `TARTCI_QUEUE_INVERSION=1` (default
+off; `TARTCI_QUEUE_INVERSION_SECS`, default 1800) a queued `merge_group` job
+older than the threshold, while a newer job with the same labels started on a
+runner, also logs `queue_head_inversion` (run, job, age, the jobs that took
+runners, and a `next_action`). `tartci pool status` and `--usage` show it.
+Detection reads only `queue_scan.py` scans (the assignment-v2 scanner stops at
+its first witness and logs neither ids nor inversions in that mode). A queued
+job counts as starved only when its labels are a subset of the newer job's
+labels; runner groups are not checked and are a known false-positive source.
+A bad `TARTCI_QUEUE_INVERSION_SECS` falls back to 1800 with a stderr note.
+This is detection only: cancelling and re-running the run ejects the merge
+queue entry, which is an admission action owned by the steward.
+
 ### Queue admission is per pull request
 
 Routing readiness must never be implemented by globally holding the merge queue
