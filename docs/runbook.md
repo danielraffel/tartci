@@ -3973,6 +3973,28 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   300) in a row. Intents live in `slot-intents.json` beside `leases.json`
   (`scripts/slot_priority.py status`). Full rules and limits:
   `docs/assignment-v2-rollout.md`, "Slot priority".
+- **PR-class cap while the merge group is queued (per lane, opt-in)**:
+  `[[lane]] pr_class_cap_while_merge_group_queued = N` (1 or 2, env
+  `TARTCI_PR_CLASS_CAP_WHILE_MG`; unset leaves behavior unchanged) on a
+  `[[lane.tier]]` lane with one `*-merge-group` tier and at least one tier
+  after it. The tiers after the merge-group tier are the PR class. When that
+  merge-group tier's own scan (its slot-demand detail file) counted queued
+  `merge_group` jobs, a lane does not START a PR-class VM on a host that
+  already holds N or more live VM leases labelled with the lane's PR-class
+  tiers. Merge-group, other tiers and other repositories are never capped, a
+  running VM is never touched, and it makes no GitHub call. The cap yields
+  (claims first-come) when the detail file is missing, unreadable or older
+  than 300 s, when the lease store cannot be read, and when the oldest queued
+  merge-group job is older than `TARTCI_PR_CLASS_CAP_MAX_WAIT_SECS` (default
+  3600), so a run that can never run (`docs/stale-merge-group-demand.md`)
+  cannot cap forever. Each capped poll logs `pr_class_capped` (repo, host,
+  running, cap, `mg_queued`, `mg_oldest_queued_at`) and a `demand_waiting`
+  sample with `reason=pr_class_cap`. Set it on every lane of the repository
+  that should honor it: each lane gates its own claims. A host that runs one
+  supervisor for the repository never holds a PR-class VM at claim time, so
+  N=1 changes nothing there; it bites on hosts with two. Scope and limits:
+  `docs/assignment-v2-rollout.md`, "PR-class cap while the merge group is
+  queued".
 - **Short job first (per lane; needs slot priority)**: `[[lane]] short_jobs =
   [{ workflow = "...", job = "..." }]` names a lane's short jobs (today only
   Vellum's `sterile-consumer`, about 1.5 min); the lane's queue scan counts

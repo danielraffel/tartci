@@ -137,6 +137,8 @@ LANE_KEYS = {
     "forced_discoveries_per_hour",
     # Slot priority's short-job-first rule (scripts/slot_priority.py).
     "short_jobs", "short_job_first",
+    # PR-class cap while the lane's merge group is queued (scripts/pr_class_cap.py).
+    "pr_class_cap_while_merge_group_queued",
 }
 # A short job is named, never guessed: `job` is the job's name, `workflow` (when
 # given) its workflow's. Neither may hold the `|` or newline of the rendered
@@ -448,6 +450,30 @@ def validate_short_jobs(lane_id: str, lane: dict, data: dict) -> None:
     leases_table = data.get("leases") if isinstance(data.get("leases"), dict) else {}
     if leases_table.get("slot_priority", "off") == "off":
         fail(f"lane {lane_id}: short_jobs needs [leases] slot_priority shadow or on")
+
+
+def validate_pr_class_cap(lane_id: str, lane: dict) -> None:
+    """`pr_class_cap_while_merge_group_queued`: a count, on a lane that has the tiers to cap.
+
+    The PR class is the tiers ranked below the lane's one `*-merge-group` tier,
+    so the lane needs exactly one such tier and at least one tier after it. The
+    gate lives in the tier loop only (not event-class-v2).
+    """
+    cap = lane.get("pr_class_cap_while_merge_group_queued")
+    if cap is None:
+        return
+    if type(cap) is not int or not 1 <= cap <= 2:
+        fail(f"lane {lane_id}: pr_class_cap_while_merge_group_queued must be 1 or 2 "
+             "(the PR-class VMs one host may start while merge-group work is queued)")
+    if lane.get("assignment_mode") == "event-class-v2":
+        fail(f"lane {lane_id}: pr_class_cap_while_merge_group_queued needs a tier lane, "
+             "not event-class-v2")
+    labels = [str(tier.get("label", "")) for tier in (lane.get("tier") or [])
+              if isinstance(tier, dict)]
+    mg = [index for index, label in enumerate(labels) if label.endswith("-merge-group")]
+    if len(mg) != 1 or mg[0] == len(labels) - 1:
+        fail(f"lane {lane_id}: pr_class_cap_while_merge_group_queued needs exactly one "
+             "[[lane.tier]] label ending -merge-group and at least one tier after it")
 
 
 def validate_lane_cache_roots(host: dict, lanes: list) -> None:
@@ -943,6 +969,7 @@ def load(path: Path) -> dict:
             # A just-queued job cannot count under a minimum age: pure cost.
             fail(f"lane {lane_id}: refresh_after_every_serve needs min_queued_age_seconds = 0")
         validate_short_jobs(lane_id, lane, data)
+        validate_pr_class_cap(lane_id, lane)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
@@ -3270,6 +3297,10 @@ def lane_plist(
             f"{row.get('workflow', '')}|{row['job']}" for row in lane["short_jobs"]
         )
         env["TARTCI_SHORT_JOB_FIRST"] = lane.get("short_job_first", "shadow")
+    if "pr_class_cap_while_merge_group_queued" in lane:
+        # providers/tart-macos/pr-class-cap.lib.sh: with the merge-group tier
+        # queued, no new PR-class VM once the host runs this many.
+        env["TARTCI_PR_CLASS_CAP_WHILE_MG"] = str(lane["pr_class_cap_while_merge_group_queued"])
     if "queue_merge_group_quota" in lane:
         # queue_scan.py reads the newest N merge_group runs' jobs on every
         # refresh; absent, the lane keeps the plain newest-then-rotation order.

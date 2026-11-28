@@ -758,6 +758,40 @@ the lane-event slot wait (first `demand_waiting` to the next `job_claim`).
 Rollback: set `slot_priority = "off"` (or delete the key), re-render, restart
 the supervisors at an idle boundary; stale intents expire on their own.
 
+### PR-class cap while the merge group is queued
+
+A running VM cannot be preempted, so a merge-group job that arrives while PR-head
+proofs hold a host's slots waits for them. Measured over 31 Vellum merge-group
+waits (2026-11-26..28), PR-head jobs held 621 slot-minutes overlapping those
+waits against 557 for merge-group. Owner decision (Daniel, via the Vellum lead,
+2026-11-28): while a repository has merge-group work queued, cap that
+repository's PR-class VMs per host, so a freed slot can only go to a landing.
+
+`[[lane]] pr_class_cap_while_merge_group_queued = N` (1 or 2; default unset, so
+nothing changes; `scripts/pr_class_cap.py`,
+`providers/tart-macos/pr-class-cap.lib.sh`). The gate runs after slot priority at
+the claim point and applies to the tiers ranked below the lane's `*-merge-group`
+tier. It caps only when all three hold: the merge-group tier's detail file (the
+scan that tier's selection used) is no older than 300 s and counted queued
+`merge_group` jobs; the oldest of them was queued no longer than
+`TARTCI_PR_CLASS_CAP_MAX_WAIT_SECS` (default 3600) ago; and the host holds N or
+more live VM leases labelled with the PR-class tiers. Every failure to read
+claims. It never withdraws a running VM, so it only shortens the next wait.
+
+Limits to know before enabling it:
+
+- On a tiered lane the selection serves the merge-group tier first, so the cap
+  fires only when a PR-class claim is selected while the merge-group tier's last
+  scan still counts queued work. It bites on a host that runs two supervisors for
+  the repository (m3, m5); on a one-supervisor host (m1, m5studio) the lane holds
+  no PR-class VM when it claims, so N=1 changes nothing.
+- A merge-group job that has not been created yet (Vellum's sterile-consumer
+  appears when its GPU job ends) is not demand the cap can see.
+
+Measure with `pr_class_capped` and `demand_waiting reason=pr_class_cap` counts
+per host, and merge-group job queue wait p50/p90 for the repository before and
+after. Rollback: delete the key, re-render, restart the lanes at an idle boundary.
+
 ## Fair share between repositories (on every macOS fleet host)
 
 Every VM lane leases at its repository's priority: Pulp's gate derives 100 (PR
